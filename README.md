@@ -1,7 +1,13 @@
 # Multi-Camera 3D People Tracking — on your laptop
 
-**Watch multiple cameras agree on who is who.** This repo is a small,
-readable implementation of the technique behind NVIDIA DeepStream's
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Runs on Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-MPS-black.svg)](#performance)
+[![YOLO26](https://img.shields.io/badge/detector-YOLO26-orange.svg)](https://docs.ultralytics.com/models/yolo26/)
+[![Rerun](https://img.shields.io/badge/viewer-Rerun%200.34-purple.svg)](https://rerun.io)
+
+**Watch multiple cameras agree on who is who.** A small, readable
+implementation of the technique behind NVIDIA DeepStream's
 [Multi-View 3D Tracking (MV3DT)](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html):
 people are detected and tracked in every camera, projected onto a shared
 ground plane, and **fused into one global identity per person** — rendered
@@ -13,6 +19,22 @@ laptop (Apple Silicon included).
 *Same color = same person, in every camera and on the map. The data is
 NVIDIA's synthetic warehouse ([PhysicalAI-SmartSpaces](https://huggingface.co/datasets/nvidia/PhysicalAI-SmartSpaces),
 CC-BY-4.0) — the same scenery NVIDIA uses to demo MV3DT.*
+
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [Quickstart](#quickstart)
+- [The live viewer](#the-live-viewer)
+- [Architecture](#architecture)
+- [Pipeline deep dive](#pipeline-deep-dive)
+- [This repo vs. NVIDIA DeepStream MV3DT](#this-repo-vs-nvidia-deepstream-mv3dt)
+- [Evaluation](#evaluation)
+- [Performance](#performance)
+- [Repository layout](#repository-layout)
+- [Configuration reference](#configuration-reference)
+- [Limitations & where to take it](#limitations--where-to-take-it)
+- [Dataset & licenses](#dataset--licenses)
+- [References](#references)
 
 ## Why this exists
 
@@ -28,7 +50,7 @@ commented Python so you can read, run, and modify every stage yourself.
 Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/) (or plain pip).
 
 ```bash
-git clone <this-repo> && cd <this-repo>
+git clone https://github.com/alexandergg/multicam-3d-tracking && cd multicam-3d-tracking
 uv sync                  # install pinned dependencies
 uv run download-data     # ~1.1 GB: 4 cameras + calibration + ground truth
 uv run demo              # opens the live Rerun viewer
@@ -45,18 +67,104 @@ uv run evaluate                        # metrics vs. ground truth
 uv run render-preview --gif out.gif    # composite MP4/GIF like the one above
 ```
 
-## How it works
+## The live viewer
+
+One command gives you a fully interactive session — pause, scrub the
+timeline, orbit the 3D world, and inspect any entity:
+
+![Rerun viewer: 3D bird's-eye world with camera frusta and track trails, next to four synchronized camera feeds with global-ID-colored boxes](docs/rerun-viewer.png)
+
+What you are looking at:
+
+- **Left — world view.** The shared ground plane in meters. Each pyramid is
+  a camera frustum placed from the dataset's intrinsics/extrinsics. Each
+  dot is a *fused* person with their trail; the label `#67 (2 cams)` means
+  global track 67 is currently corroborated by two cameras.
+- **Right — camera grid.** The synchronized feeds with detection boxes
+  painted in their **global** track color. When a person walks from one
+  camera into another, the color and ID follow them.
+- **Bottom — timeline.** Every entity is logged against the source frame
+  index, so you can replay and debug any moment of the run.
+
+## Architecture
+
+### System overview
 
 ```mermaid
 flowchart LR
-    subgraph "per-camera stages (run every tick, all cameras in lockstep)"
-        V["video.py<br/>synced frame batch"] --> D["detector.py<br/>YOLO26, one batched call"]
-        D --> T["bytetrack.py<br/>per-camera tracking<br/>(local IDs)"]
-        T --> C["calibration.py<br/>foot pixel → world meters<br/>(homography)"]
+    subgraph tick ["per tick — all cameras in lockstep"]
+        V["<b>SyncedVideoReader</b><br/>video.py<br/><i>N BGR frames</i>"]
+        D["<b>PersonDetector</b><br/>detector.py<br/><i>YOLO26n, one batched call</i>"]
+        T["<b>ByteTracker × N</b><br/>bytetrack.py<br/><i>local IDs per camera</i>"]
+        P["<b>CameraCalibration</b><br/>calibration.py<br/><i>foot pixel → world meters</i>"]
+        F["<b>GlobalTrackManager</b><br/>fusion.py<br/><i>global IDs on ground plane</i>"]
+        V --> D --> T --> P --> F
     end
-    C --> F["fusion.py<br/>cross-camera association<br/>(global IDs)"]
-    F --> R["viz.py<br/>Rerun: camera grid + 3D bird's-eye view"]
+
+    DS[("PhysicalAI-SmartSpaces<br/>4-10 synced MP4s +<br/>calibration + GT")] -->|download.py| V
+    F --> RL["<b>RerunLogger</b><br/>viz.py"]
+    RL --> RV(["Rerun viewer / .rrd"])
+    F -.-> EV["evaluate.py<br/><i>metrics vs GT</i>"]
+    F -.-> RP["render_preview.py<br/><i>MP4 / GIF</i>"]
 ```
+
+### Data flow per tick
+
+```mermaid
+sequenceDiagram
+    participant R as SyncedVideoReader
+    participant Y as PersonDetector
+    participant B as ByteTracker per camera
+    participant C as CameraCalibration
+    participant G as GlobalTrackManager
+    participant Z as RerunLogger
+
+    R->>Y: {cam: frame} — N synchronized BGR frames
+    Y->>B: per-cam detections (M, 5) [x1 y1 x2 y2 conf]
+    Note over B: KF predict → IoU Hungarian →<br/>low-conf rescue → lifecycle
+    B->>C: confirmed Tracks (local_id, bbox)
+    C->>G: CameraObservation(cam, local_id, world_xy)
+    Note over G: sticky affinity → clustering →<br/>gated Hungarian → KF fusion
+    G->>Z: GlobalTracks (gid, world_xy, trail, #cams)
+    Z-->>Z: images, Boxes2D, Points3D,<br/>LineStrips3D, frusta
+```
+
+### Data contracts
+
+| Type | Producer | Shape / fields | Meaning |
+|---|---|---|---|
+| detections | `PersonDetector` | `(M, 5)` float32 `[x1, y1, x2, y2, conf]` | people found in one frame |
+| `Track` | `ByteTracker` | `track_id`, Kalman box, `hits`, `misses`, `confirmed` | one person, one camera, stable local ID |
+| `CameraObservation` | `demo.run_pipeline` | `camera`, `local_id`, `world_xy` (m), `bbox_xyxy`, `conf` | a confirmed track projected to the floor |
+| `GlobalTrack` | `GlobalTrackManager` | `gid`, fused Kalman `world_xy`, `trail`, supporting `cameras` | one *physical person* across all cameras |
+| `affinity` | `GlobalTrackManager` | `(camera, local_id) → gid` | fusion output that lets the viewer color per-camera boxes globally |
+
+### Key design decisions
+
+| Decision | Choice | Rationale / trade-off |
+|---|---|---|
+| Fusion strategy | **Late fusion** (fuse tracks, not pixels) | Matches DeepStream MV3DT; modular, camera dropout degrades gracefully. Early fusion (BEV feature projection) is more accurate on dense scenes but monolithic. |
+| Fusion topology | **Centralized** manager | One readable class. MV3DT distributes this over MQTT peers — great production property, unnecessary complexity for learning. |
+| Association cost | **Geometry only** (world-plane distance) | The calibrated dataset makes geometry strong enough (RMSE 0.28 m). ReID embeddings are a documented extension, not a v1 dependency. |
+| Per-camera tracker | **Vendored ~200-line ByteTrack** | The tracker *is* course material; a dependency would hide it. Also lets one batched detector feed N trackers (libraries typically tie tracker state to model instances). |
+| Detection | **One batched YOLO26n call** for all cameras | Amortizes per-call overhead exactly like DeepStream's `nvinfer` stream batching; NMS-free architecture removes a postprocessing stage. |
+| Time base | **Tick = synchronized frame index** | The dataset is frame-synced, so no timestamp alignment is needed; `stride` trades temporal resolution for throughput. |
+| Visualization | **Rerun** | Camera grid + 3D world + timeline scrubbing in one dependency; a custom web UI would cost hundreds of lines and lose replay. |
+| State estimation | **One generic constant-velocity Kalman class** | Reused at two altitudes: pixel boxes (`bytetrack.py`) and world meters (`fusion.py`) — one motion model to learn, two applications. |
+
+### Coordinate systems
+
+Three frames of reference, two conversions:
+
+1. **Image plane** (pixels, per camera) — where detection and IoU tracking live.
+2. **World ground plane** (meters, shared) — where fusion lives. Reached via
+   each camera's 3×3 homography `H` (floor → pixels), inverted to map a
+   person's *foot point* (bbox bottom-center) into meters.
+3. **Full 3D world** (meters) — used only for visualization: camera frusta
+   are placed from `K` (intrinsics) and `[R|t]` (extrinsics, world→camera,
+   inverted to get camera pose).
+
+## Pipeline deep dive
 
 ### 1. Synchronized ingest (`video.py`)
 
@@ -70,11 +178,9 @@ decoders (NVDEC) and its stream batcher (`nvstreammux`).
 ### 2. Detection (`detector.py`)
 
 [YOLO26](https://docs.ultralytics.com/models/yolo26/)-nano detects people
-in **all cameras with one batched inference call** per tick — the same
-trick DeepStream's `nvinfer` uses to amortize per-call overhead across
-streams. YOLO26 is end-to-end (no NMS postprocessing), and runs on Apple's
-GPU via PyTorch MPS. On an M-series laptop this pipeline runs ~2.5× faster
-than real time.
+in **all cameras with one batched inference call** per tick. YOLO26 is
+end-to-end (no NMS postprocessing) and runs on Apple's GPU via PyTorch
+MPS, or on CPU with `--device cpu`.
 
 ### 3. Single-camera tracking (`bytetrack.py`)
 
@@ -160,10 +266,12 @@ debugging trackers.
 | Output | Kafka protobuf + OSD + BEV visualizer | Rerun viewer / .rrd / MP4 |
 | Scale | 10s–100s of cameras, production | 4–10 cameras, education |
 
-## Does it actually work? (measured)
+## Evaluation
 
 `uv run evaluate` Hungarian-matches fused tracks to ground truth (1 m gate)
-per frame. On the default 4-camera subset, first 1,200 frames:
+per frame — the pipeline under test is byte-identical to the live demo
+(both consume `demo.run_pipeline`). Default 4-camera subset, first 1,200
+frames:
 
 | Metric | Value |
 |---|---|
@@ -176,22 +284,54 @@ Recall losses concentrate at FOV edges and behind the racks — with only 4
 of the 10 cameras there are blind spots. Download `--full` and re-run to
 see coverage (and fusion quality) improve.
 
-## Repo tour
+## Performance
 
-| File | What it teaches |
+Measured on an Apple Silicon laptop (M-series, MPS), 4×1080p streams,
+`imgsz=640`, `stride=2`:
+
+| Stage | Throughput |
 |---|---|
-| `config.py` | Every tunable in one place |
-| `download.py` | Fetching a subset of a HF dataset |
-| `calibration.py` | Homographies, projection matrices, world↔image |
-| `video.py` | Synchronized multi-stream reading, stride tricks |
-| `detector.py` | Batched multi-camera inference |
-| `bytetrack.py` | Kalman filters + Hungarian matching + ByteTrack |
-| `fusion.py` | Cross-camera association — the core idea |
-| `viz.py` | Rerun blueprints, entity paths, consistent ID colors |
-| `demo.py` | The whole pipeline as one readable loop |
-| `evaluate.py` | Honest metrics against ground truth |
-| `check_calibration.py` | Verifying dataset geometry before trusting it |
-| `render_preview.py` | Compositing shareable MP4/GIF clips |
+| Detection only (batched, incl. decode) | ~78 ticks/s |
+| Full pipeline incl. Rerun logging | ~37 ticks/s |
+| Real-time requirement at stride 2 | 15 ticks/s |
+
+Scaling behavior: decode cost grows linearly with camera count (CPU),
+detection is one batched GPU call (sub-linear in N), fusion is
+O(tracks × observations) Hungarian on a handful of entities — negligible.
+The first knob to turn on slower machines is `--stride`.
+
+## Repository layout
+
+```
+src/multicam_tracker/
+├── config.py             # every tunable, one dataclass
+├── download.py           # HF dataset subset fetcher
+├── calibration.py        # homographies, K/[R|t], ground truth parsing
+├── video.py              # synchronized N-stream reader
+├── detector.py           # batched YOLO26 wrapper
+├── bytetrack.py          # Kalman filter + simplified ByteTrack
+├── fusion.py             # cross-camera association — the core idea
+├── viz.py                # Rerun blueprint + logging
+├── demo.py               # the pipeline as one readable loop + CLI
+├── evaluate.py           # metrics vs ground truth
+├── check_calibration.py  # dataset geometry sanity checks
+└── render_preview.py     # composite MP4/GIF clips
+```
+
+## Configuration reference
+
+All knobs live in `config.py` (`PipelineConfig`); the important ones:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `stride` | 2 | process every Nth frame; throughput ↔ temporal resolution |
+| `conf_threshold` | 0.25 | detection floor; low values feed ByteTrack's rescue stage |
+| `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
+| `track_max_age` | 30 ticks | how long a camera track survives occlusion (~2 s) |
+| `fusion_gate_m` | 2.0 m | max world distance for cross-camera association |
+| `fusion_merge_m` | 1.0 m | cluster radius when grouping new observations |
+| `fusion_max_age` | 45 ticks | global track memory through total occlusion (~3 s) |
+| `fusion_min_hits` | 3 | ticks of support before a global track is shown |
 
 ## Limitations & where to take it
 
@@ -224,3 +364,8 @@ see coverage (and fusion quality) improve.
 - Chavdarova et al., [WILDTRACK: A Multi-camera HD Dataset for Dense Unscripted Pedestrian Detection](https://openaccess.thecvf.com/content_cvpr_2018/papers/Chavdarova_WILDTRACK_A_Multi-Camera_CVPR_2018_paper.pdf), CVPR 2018
 - Hou et al., [Multiview Detection with Feature Perspective Transformation](https://arxiv.org/abs/2007.07247) (MVDet), ECCV 2020
 - Teepe et al., [EarlyBird: Early-Fusion for Multi-View Tracking in the Bird's Eye View](https://arxiv.org/abs/2310.13350), WACVW 2024
+
+---
+
+Built by [Alexander Gonzalez](https://github.com/alexandergg). If this
+helped you understand multi-camera tracking, a ⭐ helps others find it.

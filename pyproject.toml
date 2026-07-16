@@ -5,7 +5,7 @@ description = "Educational multi-camera 3D people tracking — DeepStream MV3DT 
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Alex Gonzalez" }]
+authors = [{ name = "Alexander Gonzalez" }]
 keywords = ["multi-camera", "tracking", "computer-vision", "bird-eye-view", "rerun", "yolo"]
 dependencies = [
     "ultralytics==8.4.96",
@@ -15,6 +15,9 @@ dependencies = [
     "scipy>=1.13",
     "numpy>=1.26",
 ]
+
+[project.urls]
+Repository = "https://github.com/alexandergg/multicam-3d-tracking"
 
 [project.scripts]
 download-data = "multicam_tracker.download:main"
