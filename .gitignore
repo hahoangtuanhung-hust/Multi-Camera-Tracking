@@ -1,0 +1,19 @@
+# Data & artifacts (downloaded at setup, never committed)
+data/
+*.rrd
+*.pt
+*.onnx
+*.mp4
+calibration_check/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
