@@ -39,6 +39,15 @@ class SyncedVideoReader:
                 raise FileNotFoundError(f"Cannot open {path} — run `download-data` first")
             self.captures[cam] = capture
 
+        #  --- BẮT ĐẦU: XỬ LÝ CẮT FRAME TẠI DATA/CUSTOM ---
+        skip_map = {"camera_0001": 30, "camera_0007": 60}
+        for cam, capture in self.captures.items():
+            if cam in skip_map:
+                 print(f"✂️ Đang tự động cắt bỏ {skip_map[cam]} frame ở đầu của {cam}...")
+                 for _ in range(skip_map[cam]):
+                     capture.grab()
+        #  --- KẾT THÚC ---
+
         first = self.captures[cameras[0]]
         self.fps = first.get(cv2.CAP_PROP_FPS)
         self.frame_count = int(first.get(cv2.CAP_PROP_FRAME_COUNT))

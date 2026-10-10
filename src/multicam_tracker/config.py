@@ -12,11 +12,11 @@ from pathlib import Path
 
 # The Hugging Face dataset the demo runs on (downloaded by `download-data`).
 HF_DATASET = "nvidia/PhysicalAI-SmartSpaces"
-SCENE_PATH = "MTMC_Tracking_2024/train/scene_001"
-
+# SCENE_PATH = "MTMC_Tracking_2024/train/scene_001"
+SCENE_PATH = "custom"
 # Default 4-camera subset: spread around the warehouse for good overlap
 # while keeping the download ~1 GB. Use `download-data --full` for all 10.
-DEFAULT_CAMERAS = ["camera_0001", "camera_0003", "camera_0006", "camera_0009"]
+DEFAULT_CAMERAS = ["camera_0001", "camera_0007", "camera_0008", "camera_0010"]
 
 
 @dataclass
