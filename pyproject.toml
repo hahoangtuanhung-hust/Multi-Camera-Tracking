@@ -16,12 +16,16 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+modal = ["modal>=1.5,<2"]
+
 [project.urls]
 Repository = "https://github.com/alexandergg/multicam-3d-tracking"
 
 [project.scripts]
 download-data = "multicam_tracker.download:main"
 demo = "multicam_tracker.demo:main"
+demo-lag = "multicam_tracker.demo_lag:main"
 evaluate = "multicam_tracker.evaluate:main"
 check-calibration = "multicam_tracker.check_calibration:main"
 render-preview = "multicam_tracker.render_preview:main"

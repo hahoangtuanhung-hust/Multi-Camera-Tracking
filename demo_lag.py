@@ -111,7 +111,7 @@ def run_lag_pipeline(cfg: PipelineConfig, max_frames: int | None,
 def main():
     parser = argparse.ArgumentParser(description="Demo multi-camera tracking với giả lập mạng lag.")
     parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--stride", type=int, default=3, help="Mức độ bỏ qua frame (default: 3)")
+    parser.add_argument("--stride", type=int, default=1, help="Xử lý mỗi frame (default: 1)")
     parser.add_argument("--device", default="cpu", choices=["mps", "cpu", "cuda"])
     
     # Tham số điều khiển Lag

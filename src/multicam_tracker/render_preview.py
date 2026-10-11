@@ -80,8 +80,15 @@ class BevRenderer:
 def composite(tick: dict, bev: BevRenderer, cameras: list[str]) -> np.ndarray:
     cells = []
     for cam in cameras:
-        src_h, src_w = tick["frames"][cam].shape[:2]
-        frame = cv2.resize(tick["frames"][cam], (CELL_W, CELL_H))
+        source = tick["frames"].get(cam)
+        if source is None:
+            frame = np.zeros((CELL_H, CELL_W, 3), dtype=np.uint8)
+            cv2.putText(frame, f"{cam}: no frame", (8, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, .5, (200, 200, 200), 1)
+            cells.append(frame)
+            continue
+        src_h, src_w = source.shape[:2]
+        frame = cv2.resize(source, (CELL_W, CELL_H))
         sx, sy = CELL_W / src_w, CELL_H / src_h
         for track in tick["camera_tracks"].get(cam, []):
             gid = tick["local_to_gid"].get((cam, track.track_id))
@@ -103,8 +110,120 @@ def composite(tick: dict, bev: BevRenderer, cameras: list[str]) -> np.ndarray:
         rows[-1] = np.hstack([cells[-1], np.zeros_like(cells[-1])])
     grid = np.vstack(rows)
     map_img = bev.render(tick["global_tracks"])
-    map_img = cv2.resize(map_img, (MAP_W, grid.shape[0]))
+    if map_img.shape[:2] != (grid.shape[0], MAP_W):
+        map_img = cv2.resize(map_img, (MAP_W, grid.shape[0]))
     return np.hstack([grid, map_img])
+
+
+def render_video(
+    *,
+    data_root: Path,
+    out: Path,
+    start: int = 0,
+    seconds: float = 20.0,
+    stride: int = 1,
+    device: str = "cpu",
+    model_name: str | None = None,
+    cameras: list[str] | None = None,
+    gif: Path | None = None,
+    gif_fps: int = 10,
+) -> Path:
+    """Run the tracking pipeline and write a camera-grid + BEV MP4.
+
+    This programmatic entrypoint is shared by the local CLI and Modal's T4
+    worker. Keeping one renderer avoids cloud/local output drift.
+    """
+    data_root = Path(data_root)
+    out = Path(out)
+    gif = Path(gif) if gif is not None else None
+    if start < 0:
+        raise ValueError("start must be >= 0")
+    if seconds <= 0:
+        raise ValueError("seconds must be > 0")
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    if gif_fps < 1:
+        raise ValueError("gif_fps must be >= 1")
+
+    cfg = PipelineConfig(data_root=data_root, stride=stride, device=device, async_ingest=False)
+    if model_name is not None:
+        cfg.model_name = model_name
+    available = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())
+    cfg.cameras = list(cameras) if cameras else available
+    missing = sorted(set(cfg.cameras) - set(available))
+    if missing:
+        raise FileNotFoundError(f"Camera folders not found: {', '.join(missing)}")
+    if not cfg.cameras:
+        raise FileNotFoundError(f"No camera folders found under {cfg.scene_dir}")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if gif is not None:
+        gif.parent.mkdir(parents=True, exist_ok=True)
+    capture = cv2.VideoCapture(str(cfg.scene_dir / cfg.cameras[0] / "video.mp4"))
+    try:
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if not capture.isOpened() or not np.isfinite(source_fps) or source_fps <= 0:
+            raise RuntimeError("Cannot determine source video FPS")
+    finally:
+        capture.release()
+    fps = source_fps / cfg.stride
+    end_frame = start + int(round(seconds * source_fps))
+
+    writer = None
+    gif_stream = None
+    next_gif_s = 0.0
+    bev = None
+    tick_count = 0
+    try:
+        for tick in run_pipeline(cfg, max_frames=end_frame):
+            if tick["frame_index"] < start:
+                continue
+            tick_count += 1
+            if bev is None:
+                grid_h = CELL_H * ((len(cfg.cameras) + 1) // 2)
+                bev = BevRenderer(tick["calibrations"], grid_h)
+            frame = composite(tick, bev, cfg.cameras)
+            if writer is None:
+                writer = cv2.VideoWriter(
+                    str(out), cv2.VideoWriter_fourcc(*"mp4v"), fps,
+                    (frame.shape[1], frame.shape[0]),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"OpenCV could not open MP4 writer for {out}")
+            writer.write(frame)
+            if gif is not None and (tick_count - 1) / fps + 1e-9 >= next_gif_s:
+                # Encode one GIF frame at a time: no clip-sized image list.
+                from PIL import GifImagePlugin, Image
+                rgb = cv2.cvtColor(
+                    cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2)),
+                    cv2.COLOR_BGR2RGB,
+                )
+                paletted = Image.fromarray(rgb).quantize(colors=256)
+                if gif_stream is None:
+                    gif_stream = gif.open("wb")
+                    header, _ = GifImagePlugin.getheader(paletted, info={"loop": 0})
+                    for chunk in header:
+                        gif_stream.write(chunk)
+                for chunk in GifImagePlugin.getdata(
+                    paletted, duration=round(1000 / min(gif_fps, fps)),
+                    include_color_table=True,
+                ):
+                    gif_stream.write(chunk)
+                next_gif_s += 1.0 / min(gif_fps, fps)
+    finally:
+        if writer is not None:
+            writer.release()
+        if gif_stream is not None:
+            gif_stream.write(b";")
+            gif_stream.close()
+
+    if tick_count == 0 or not out.is_file() or out.stat().st_size == 0:
+        raise RuntimeError("No output frames were rendered; check --start and input videos")
+    print(f"Wrote {out}")
+
+    if gif is not None and gif_stream is not None:
+        print(f"Wrote {gif} ({gif.stat().st_size / 1e6:.1f} MB)")
+    return out
 
 
 def main() -> None:
@@ -114,49 +233,28 @@ def main() -> None:
     parser.add_argument("--gif", type=Path, default=None, help="Also write a GIF here")
     parser.add_argument("--start", type=int, default=0, help="Skip this many source frames")
     parser.add_argument("--seconds", type=float, default=20.0, help="Length of the clip")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="Process every Nth source frame (default: 1)")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"],
+                        help="Inference device (default: cpu)")
+    parser.add_argument("--model", default=None,
+                        help="YOLO weights path/name (default from PipelineConfig)")
+    parser.add_argument("--cameras", nargs="+", default=None, metavar="CAM")
     parser.add_argument("--gif-fps", type=int, default=10)
     args = parser.parse_args()
 
-    cfg = PipelineConfig(data_root=args.data_root)
-    cfg.cameras = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())
-    end_frame = args.start + int(args.seconds * 30)
-
-    writer = None
-    gif_frames = []
-    bev = None
-    tick_count = 0
-    for tick in run_pipeline(cfg, max_frames=end_frame):
-        if tick["frame_index"] < args.start:
-            continue
-        tick_count += 1
-        if bev is None:
-            grid_h = CELL_H * ((len(cfg.cameras) + 1) // 2)
-            bev = BevRenderer(tick["calibrations"], grid_h)
-        frame = composite(tick, bev, cfg.cameras)
-        if writer is None:
-            fps = 30 / cfg.stride
-            writer = cv2.VideoWriter(
-                str(args.out), cv2.VideoWriter_fourcc(*"mp4v"), fps,
-                (frame.shape[1], frame.shape[0]),
-            )
-        writer.write(frame)
-        if args.gif and tick_count % 3 == 1:  # keep every 3rd tick for the GIF
-            gif_frames.append(cv2.cvtColor(
-                cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2)),
-                cv2.COLOR_BGR2RGB,
-            ))
-    if writer:
-        writer.release()
-        print(f"Wrote {args.out}")
-
-    if args.gif and gif_frames:
-        from PIL import Image
-        images = [Image.fromarray(f) for f in gif_frames]
-        images[0].save(
-            args.gif, save_all=True, append_images=images[1:],
-            duration=int(1000 / args.gif_fps), loop=0, optimize=True,
-        )
-        print(f"Wrote {args.gif} ({args.gif.stat().st_size / 1e6:.1f} MB)")
+    render_video(
+        data_root=args.data_root,
+        out=args.out,
+        start=args.start,
+        seconds=args.seconds,
+        stride=args.stride,
+        device=args.device,
+        model_name=args.model,
+        cameras=args.cameras,
+        gif=args.gif,
+        gif_fps=args.gif_fps,
+    )
 
 
 if __name__ == "__main__":
