@@ -12,7 +12,8 @@ implementation of the technique behind NVIDIA DeepStream's
 people are detected and tracked in every camera, projected onto a shared
 ground plane, and **fused into one global identity per person** — rendered
 live as a bird's-eye view. No NVIDIA GPU, no Linux, no SDK: Python on any
-laptop (Apple Silicon included).
+laptop (Apple Silicon included). Cross-camera identity uses only timestamped
+ground-plane trajectories: **no ReID model and no FaceID**.
 
 ![Four warehouse cameras with color-coded tracked people and a bird's-eye map showing fused trajectories](docs/preview.gif)
 
@@ -56,16 +57,49 @@ uv run download-data     # ~1.1 GB: 4 cameras + calibration + ground truth
 uv run demo              # opens the live Rerun viewer
 ```
 
+`demo` runs continuously on CPU until the input stream ends and, by default,
+detects and tracks every decoded frame (`stride=1`). `--max-frames` is only
+an optional diagnostic limit; it is not used by the normal runtime. Apple
+Silicon and NVIDIA users can opt into `--device mps` or `--device cuda`.
+
 Useful flags:
 
 ```bash
 uv run download-data --full            # all 10 cameras (~2.6 GB)
-uv run demo --stride 3 --device cpu    # slower machines
+uv run demo --stride 1 --device cpu --cpu-threads 4
 uv run demo --save session.rrd         # record instead of opening the viewer
+uv run demo --async-ingest --device cpu # independent bounded queues (default)
+uv run demo --no-async-ingest --device cpu # deterministic offline lockstep replay
+uv run demo-lag --delay-camera camera_0007 --delay-s 2 --jitter-s .15
 uv run check-calibration --save-images # sanity-check the dataset geometry
 uv run evaluate                        # metrics vs. ground truth
 uv run render-preview --gif out.gif    # composite MP4/GIF like the one above
 ```
+
+### Render MP4 on Modal T4
+
+The Modal entrypoint uploads only `data/custom` plus the local model to a persistent Volume,
+runs YOLO on a T4 (`device=cuda`), writes the camera-grid + BEV MP4 remotely,
+and downloads the completed file to the local path given by `--out`.
+
+Authenticate once, then use `--upload` only on the first run (or when local
+input files change):
+
+```bash
+uv sync --extra modal
+uv run --extra modal modal setup
+uv run --extra modal modal run modal_app.py \
+  --upload --seconds 20 --stride 1 --out modal-result.mp4
+
+# Reuse the uploaded data/model on later jobs:
+uv run --extra modal modal run modal_app.py \
+  --seconds 60 --stride 1 --out modal-result.mp4
+```
+
+Select a subset with a comma-separated list such as
+`--cameras camera_0001,camera_0007`. The persistent Modal Volume is named
+`multicam-tracker-data`; remote outputs are retained under `outputs/` and are
+also streamed back to the requested local `.mp4` path.
 
 ## The live viewer
 
@@ -92,8 +126,8 @@ What you are looking at:
 
 ```mermaid
 flowchart LR
-    subgraph tick ["per tick — all cameras in lockstep"]
-        V["<b>SyncedVideoReader</b><br/>video.py<br/><i>N BGR frames</i>"]
+    subgraph tick ["event-time pipeline — dynamic camera batches"]
+        V["<b>FramePacket readers</b><br/>video.py<br/><i>capture + arrival timestamps</i>"]
         D["<b>PersonDetector</b><br/>detector.py<br/><i>YOLO26n, one batched call</i>"]
         T["<b>ByteTracker × N</b><br/>bytetrack.py<br/><i>local IDs per camera</i>"]
         P["<b>CameraCalibration</b><br/>calibration.py<br/><i>foot pixel → world meters</i>"]
@@ -119,12 +153,12 @@ sequenceDiagram
     participant G as GlobalTrackManager
     participant Z as RerunLogger
 
-    R->>Y: {cam: frame} — N synchronized BGR frames
+    R->>Y: dynamic {cam: FramePacket}
     Y->>B: per-cam detections (M, 5) [x1 y1 x2 y2 conf]
     Note over B: KF predict → IoU Hungarian →<br/>low-conf rescue → lifecycle
     B->>C: confirmed Tracks (local_id, bbox)
-    C->>G: CameraObservation(cam, local_id, world_xy)
-    Note over G: sticky affinity → clustering →<br/>gated Hungarian → KF fusion
+    C->>G: CameraObservation(cam, local_id, capture_ts, world_xy, velocity)
+    Note over G: 5 s metadata history → offset scan →<br/>trajectory gates + Hungarian → canonical gid
     G->>Z: GlobalTracks (gid, world_xy, trail, #cams)
     Z-->>Z: images, Boxes2D, Points3D,<br/>LineStrips3D, frusta
 ```
@@ -133,9 +167,11 @@ sequenceDiagram
 
 | Type | Producer | Shape / fields | Meaning |
 |---|---|---|---|
+| `FramePacket` | `video.py` | `camera`, image, `capture_ts_s`, `arrival_ts_s`, sequence, source index, quality | separates event time from transport/processing time |
 | detections | `PersonDetector` | `(M, 5)` float32 `[x1, y1, x2, y2, conf]` | people found in one frame |
 | `Track` | `ByteTracker` | `track_id`, Kalman box, `hits`, `misses`, `confirmed` | one person, one camera, stable local ID |
-| `CameraObservation` | `demo.run_pipeline` | `camera`, `local_id`, `world_xy` (m), `bbox_xyxy`, `conf` | a confirmed track projected to the floor |
+| `CameraObservation` | `demo.run_pipeline` | `camera`, `local_id`, capture time, `world_xy`, world velocity, bbox, confidence | a confirmed track projected to the floor |
+| `TimedWorldPoint` | `TrackletStore` | timestamp, 2D position/velocity, confidence | metadata-only history; no image or appearance embedding |
 | `GlobalTrack` | `GlobalTrackManager` | `gid`, fused Kalman `world_xy`, `trail`, supporting `cameras` | one *physical person* across all cameras |
 | `affinity` | `GlobalTrackManager` | `(camera, local_id) → gid` | fusion output that lets the viewer color per-camera boxes globally |
 
@@ -145,10 +181,10 @@ sequenceDiagram
 |---|---|---|
 | Fusion strategy | **Late fusion** (fuse tracks, not pixels) | Matches DeepStream MV3DT; modular, camera dropout degrades gracefully. Early fusion (BEV feature projection) is more accurate on dense scenes but monolithic. |
 | Fusion topology | **Centralized** manager | One readable class. MV3DT distributes this over MQTT peers — great production property, unnecessary complexity for learning. |
-| Association cost | **Geometry only** (world-plane distance) | The calibrated dataset makes geometry strong enough (RMSE 0.28 m). ReID embeddings are a documented extension, not a v1 dependency. |
+| Association cost | **Trajectory only** | Position RMSE, velocity RMSE, direction, overlap and confidence. No ReID/FaceID. |
 | Per-camera tracker | **Vendored ~200-line ByteTrack** | The tracker *is* course material; a dependency would hide it. Also lets one batched detector feed N trackers (libraries typically tie tracker state to model instances). |
 | Detection | **One batched YOLO26n call** for all cameras | Amortizes per-call overhead exactly like DeepStream's `nvinfer` stream batching; NMS-free architecture removes a postprocessing stage. |
-| Time base | **Tick = synchronized frame index** | The dataset is frame-synced, so no timestamp alignment is needed; `stride` trades temporal resolution for throughput. |
+| Time base | **Capture event time in seconds** | Handles 1–3 s camera skew, irregular FPS, delayed arrival and clock drift; ticks remain a legacy fallback. |
 | Visualization | **Rerun** | Camera grid + 3D world + timeline scrubbing in one dependency; a custom web UI would cost hundreds of lines and lose replay. |
 | State estimation | **One generic constant-velocity Kalman class** | Reused at two altitudes: pixel boxes (`bytetrack.py`) and world meters (`fusion.py`) — one motion model to learn, two applications. |
 
@@ -166,14 +202,25 @@ Three frames of reference, two conversions:
 
 ## Pipeline deep dive
 
-### 1. Synchronized ingest (`video.py`)
+### 1. Timestamp-aware ingest (`video.py`, `timebase.py`)
 
-The dataset's cameras are frame-synchronized, so "time" advances by
-reading frame *N* from every video at once. Decoding is the silent
-bottleneck of multi-camera work — 4×1080p30 is ~250 Mpixels/s before any
-AI runs — so the reader skips frames cheaply (`grab()`) to hold a
-real-time budget. DeepStream solves this same problem with hardware
-decoders (NVDEC) and its stream batcher (`nvstreammux`).
+Every image enters as a `FramePacket`. `capture_ts_s` drives Kalman motion,
+timeouts and association; `arrival_ts_s` is used only to observe transport
+latency. Local MP4 timestamps are derived from source frame index/FPS and
+marked with an explicit quality. A live stream without usable PTS is marked
+`arrival_fallback`, never silently treated as a trusted capture clock.
+
+`SyncedVideoReader` is the deterministic dataset path. `AsyncVideoReader`
+starts one reader per camera with a bounded FIFO queue and emits
+dynamic micro-batches, so one stalled camera cannot block healthy streams.
+The CLI enables this reader by default. A full queue pauses only its own
+producer: decoded frames are never dropped to mask CPU overload. File replay
+therefore runs at the measured processing throughput. Live sources can still
+lose data in the upstream transport; recording the source is necessary when
+every captured frame must be retained on a CPU slower than the input rate.
+Known camera clock offset/scale and source-frame trims live in `PipelineConfig`.
+A frame trim starts a new logical capture epoch at zero; actual residual clock
+skew must be expressed separately through `camera_clock_offsets_s`.
 
 ### 2. Detection (`detector.py`)
 
@@ -220,21 +267,20 @@ ground truth (median error ≈ 0.2 m).
 
 ### 5. Cross-camera fusion (`fusion.py`) — the interesting part
 
-Once all tracks live on one ground plane, "is camera A's track 7 the same
-person as camera B's track 3?" becomes *"are they standing in the same
-spot?"* Each tick:
+Once all tracks live on one ground plane, each local track receives a
+provisional global ID immediately. The system retains only the latest five
+seconds of `(timestamp, xy, velocity, confidence)` metadata and then:
 
-1. **Sticky re-association** — a (camera, local ID) pair that already
-   belongs to a global track keeps it while geometry agrees. Cheap and
-   handles ~95% of observations. (MV3DT analog: peers negotiate a global
-   ID, then keep it.)
-2. **Clustering** — remaining observations near each other on the floor,
-   from different cameras, are grouped: probably the same person.
-3. **Hungarian assignment** with a distance gate matches clusters to
-   predicted track positions. (MV3DT analog: tracklet matching by RMSE.)
-4. **Kalman fusion + lifecycle** — matched tracks fuse their cameras'
-   measurements; new clusters become tentative tracks (shown only after
-   `fusion_min_hits` ticks); unseen tracks age out.
+1. Scans a bounded camera-level clock correction (default ±3 s), followed
+   by a narrow search once the robust EWMA estimate is confident.
+2. Resamples candidate trajectories at 10 Hz over their common event-time
+   interval and scores position RMSE, velocity RMSE, direction and confidence.
+3. Applies minimum-duration/overlap gates, Hungarian one-to-one assignment
+   and a second-best margin. Overlapping local IDs from the same camera can
+   never merge.
+4. Merges accepted provisional IDs into the oldest canonical ID. Aliases
+   are path-compressed, merging is idempotent, and late packets may repair
+   identity without rewinding the live Kalman state.
 
 This is **late fusion** — fuse *tracks*, not pixels — which is what
 DeepStream MV3DT does, and it's why the system degrades gracefully: any
@@ -261,7 +307,7 @@ debugging trackers.
 | Ingest | GStreamer + NVDEC, `nvstreammux` | OpenCV `VideoCapture` |
 | Detection | PeopleNet Transformer / RT-DETR (TensorRT) | YOLO26n (PyTorch, batched) |
 | Per-camera tracking | NvMultiObjectTracker, SV3DT 3D human model | Simplified ByteTrack (this repo) |
-| Cross-camera | Distributed peers over MQTT, RMSE tracklet matching, visibility-weighted Kalman fusion | Centralized: sticky affinity + clustering + gated Hungarian + Kalman |
+| Cross-camera | Distributed peers over MQTT, RMSE tracklet matching, visibility-weighted Kalman fusion | Centralized event-time tracklets + camera clock estimation + gated Hungarian + canonical IDs |
 | Calibration | AutoMagicCalib (no checkerboards) | Provided by the dataset |
 | Output | Kafka protobuf + OSD + BEV visualizer | Rerun viewer / .rrd / MP4 |
 | Scale | 10s–100s of cameras, production | 4–10 cameras, education |
@@ -270,15 +316,16 @@ debugging trackers.
 
 `uv run evaluate` Hungarian-matches fused tracks to ground truth (1 m gate)
 per frame — the pipeline under test is byte-identical to the live demo
-(both consume `demo.run_pipeline`). Default 4-camera subset, first 1,200
-frames:
+(both consume `demo.run_pipeline`). Latest CPU verification on the current
+custom 4-camera scene used the first 300 source frames (150 processed ticks),
+with ground truth aligned to each configured source-frame trim:
 
 | Metric | Value |
 |---|---|
-| Precision | 0.94 |
-| Recall | 0.80 |
-| World-plane position RMSE | 0.28 m |
-| Global ID switches | ~60 over 24 people / 40 s |
+| Precision | 0.726 |
+| Recall | 0.796 |
+| World-plane position RMSE | 0.42 m |
+| Global ID switches | 80 over 22 matched people / 150 ticks |
 
 Recall losses concentrate at FOV edges and behind the racks — with only 4
 of the 10 cameras there are blind spots. Download `--full` and re-run to
@@ -296,9 +343,31 @@ Measured on an Apple Silicon laptop (M-series, MPS), 4×1080p streams,
 | Real-time requirement at stride 2 | 15 ticks/s |
 
 Scaling behavior: decode cost grows linearly with camera count (CPU),
-detection is one batched GPU call (sub-linear in N), fusion is
-O(tracks × observations) Hungarian on a handful of entities — negligible.
-The first knob to turn on slower machines is `--stride`.
+detection is one dynamic batched call (sub-linear in N). Tracklet matching
+runs at 4 Hz by default, stores metadata only, and uses pairwise Hungarian
+assignment. Its cost grows approximately with camera pairs × candidate
+tracklet pairs × offset samples; tighten a known clock offset or lower the
+match frequency for crowded CPU deployments.
+The default runtime uses `device=cpu`, `stride=1` for continuous processing.
+CPU inference uses up to four PyTorch threads, one OpenCV operation thread,
+and one FFmpeg decoder thread per camera. `--cpu-threads` changes the PyTorch
+budget without changing frames or model accuracy. Ultralytics already uses
+inference mode; its device initialization callback reapplies this thread budget.
+
+To benchmark inference, tracking and fusion separately from visualization:
+
+```bash
+uv run python benchmarks/cpu_pipeline.py --frames 300 --out data/cpu-audit/run.json
+uv run python benchmarks/cpu_pipeline.py --frames 100 --profile --out data/cpu-audit/profile.json
+uv run python benchmarks/state_retention.py
+```
+
+The benchmark uses the four configured default cameras and records actual
+tick throughput, RSS and tracking quality. The CLI demo/evaluator/renderer
+auto-discover all downloaded cameras unless `--cameras` is provided.
+Retired ID aliases and local membership metadata expire with the five-second
+history window; archival consumers can persist each tick's `gid_aliases` mapping.
+The MP4 renderer uses source FPS and streams GIF frames to disk.
 
 ## Repository layout
 
@@ -307,10 +376,13 @@ src/multicam_tracker/
 ├── config.py             # every tunable, one dataclass
 ├── download.py           # HF dataset subset fetcher
 ├── calibration.py        # homographies, K/[R|t], ground truth parsing
-├── video.py              # synchronized N-stream reader
+├── timebase.py           # FramePacket and affine camera clock contract
+├── video.py              # lockstep dataset + bounded async readers
 ├── detector.py           # batched YOLO26 wrapper
 ├── bytetrack.py          # Kalman filter + simplified ByteTrack
 ├── fusion.py             # cross-camera association — the core idea
+├── tracklets.py          # 5 s history, offset estimation, trajectory matcher
+├── faults.py             # delay/jitter/drop/clock-skew simulation
 ├── viz.py                # Rerun blueprint + logging
 ├── demo.py               # the pipeline as one readable loop + CLI
 ├── evaluate.py           # metrics vs ground truth
@@ -324,24 +396,54 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 
 | Knob | Default | Effect |
 |---|---|---|
-| `stride` | 2 | process every Nth frame; throughput ↔ temporal resolution |
+| `stride` | 1 | detect/track every decoded frame; values >1 explicitly skip frames |
 | `conf_threshold` | 0.25 | detection floor; low values feed ByteTrack's rescue stage |
 | `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
-| `track_max_age` | 30 ticks | how long a camera track survives occlusion (~2 s) |
+| `track_max_age` | 60 ticks | legacy no-timestamp fallback (~2 s at 30 fps) |
+| `track_max_age_s` | 2.0 s | timestamp-mode local-track timeout |
 | `fusion_gate_m` | 2.0 m | max world distance for cross-camera association |
 | `fusion_merge_m` | 1.0 m | cluster radius when grouping new observations |
-| `fusion_max_age` | 45 ticks | global track memory through total occlusion (~3 s) |
+| `fusion_max_age` | 90 ticks | legacy no-timestamp fallback (~3 s at 30 fps) |
+| `fusion_max_age_s` | 3.0 s | timestamp-mode identity retention timeout |
+| `fusion_output_grace_s` | 0.25 s | publish freshness; retained IDs are not emitted as stale people |
+| `fusion_event_time_gate_s` | 0.15 s | simultaneous-geometry gate after clock correction |
+| `fusion_local_reconnect_gate_m` | 1.0 m | reconnect a fragmented local ID to a retained same-camera global track |
 | `fusion_min_hits` | 3 | ticks of support before a global track is shown |
+| `tracklet_history_s` | 5.0 s | bounded metadata history per local ID |
+| `max_camera_offset_s` | 3.0 s | coarse residual clock-offset search radius |
+| `tracklet_min_duration_s` / `tracklet_min_overlap_s` | 1.0 / 0.8 s | evidence required before cross-camera merge |
+| `tracklet_position_gate_m` | 0.85 m | maximum accepted trajectory position RMSE |
+| `tracklet_velocity_gate_mps` | 0.90 m/s | maximum accepted trajectory velocity RMSE |
+| `tracklet_match_interval_s` | 0.25 s | CPU cost/repair-latency trade-off |
+| `single_person_mode` | false | optional deployment hint; safety gates remain enabled |
+
+All timeout values with an `_s` suffix are seconds, not processed-frame
+counts. The older tick knobs are used only by callers that omit timestamps.
+
+### Fault simulation and tests
+
+`demo-lag` delays one camera's packet arrival without changing its capture
+timestamp. It can independently add timestamp offset/drift, Gaussian arrival
+jitter and packet loss. This is the recommended way to validate a deployment:
+
+```bash
+uv run demo-lag --delay-camera camera_0007 --delay-s 2.0 \
+  --jitter-s 0.15 --drop-rate 0.05 --clock-offset-s 1.2 --clock-drift-ppm 500
+python -m unittest discover -s tests -v
+python benchmarks/tracklet_matching.py
+```
 
 ## Limitations & where to take it
 
-- **No appearance features (ReID).** Fusion is purely geometric. Add a
-  ReID embedding (e.g. OSNet, or Ultralytics' `yolo26n-reid` weights) to
-  the association cost for crowded scenes where geometry is ambiguous.
+- **Intentionally no ReID or FaceID.** Two people following an indistinguishable
+  path with the same time separation are not always identifiable from geometry
+  alone. One-to-one assignment, direction gates and ambiguity margins prefer
+  no merge over a risky merge.
 - **Foot-point occlusion.** A cut-off bounding box projects wrongly;
   SV3DT's 3D human model is the principled fix.
-- **Offline files, not live streams.** Swap `SyncedVideoReader` for RTSP
-  readers with timestamp alignment to go live.
+- **RTSP timestamp quality varies.** `AsyncVideoReader` supports independent
+  sources, but production should supply hardware/NTP/PTP capture timestamps;
+  arrival-time fallback is explicitly marked as lower quality.
 - **Centralized fusion.** MV3DT runs fusion distributed on the cameras
   themselves (MQTT peer-to-peer) — a great systems exercise.
 
