@@ -13,6 +13,8 @@ On Apple Silicon it runs on the GPU via PyTorch's MPS backend.
 from __future__ import annotations
 
 import numpy as np
+import cv2
+import torch
 from ultralytics import YOLO
 
 from .config import PipelineConfig
@@ -21,13 +23,30 @@ from .config import PipelineConfig
 class PersonDetector:
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
+        if cfg.cpu_threads < 1 or cfg.opencv_threads < 1:
+            raise ValueError("CPU and OpenCV thread counts must be >= 1")
+        if cfg.device == "cpu":
+            cv2.setNumThreads(cfg.opencv_threads)
+            torch.set_num_threads(cfg.cpu_threads)
         self.model = YOLO(cfg.model_name)
+        if cfg.device == "cpu":
+            # Ultralytics select_device resets the process thread count when
+            # the predictor is first created. Restore our budget before each
+            # inference, without initializing a second model or dummy batch.
+            self.model.add_callback("on_predict_start", self._configure_cpu)
+
+    def _configure_cpu(self, _predictor) -> None:
+        if torch.get_num_threads() != self.cfg.cpu_threads:
+            torch.set_num_threads(self.cfg.cpu_threads)
 
     def detect_batch(self, frames: list[np.ndarray]) -> list[np.ndarray]:
         """Detect people in a batch of BGR frames.
 
         Returns one ``(N, 5)`` array per frame: ``[x1, y1, x2, y2, conf]``.
         """
+        if not frames:
+            return []
+        # Ultralytics already wraps prediction in smart_inference_mode.
         results = self.model(
             frames,
             imgsz=self.cfg.imgsz,
@@ -42,7 +61,7 @@ class PersonDetector:
             if boxes is None or len(boxes) == 0:
                 detections.append(np.empty((0, 5), dtype=np.float32))
                 continue
-            xyxy = boxes.xyxy.cpu().numpy()
-            conf = boxes.conf.cpu().numpy()[:, None]
-            detections.append(np.hstack([xyxy, conf]).astype(np.float32))
+            # predict (not model.track) returns xyxy/conf/cls. Transfer once,
+            # and copy only the compact metadata so results/images can expire.
+            detections.append(boxes.data[:, :5].cpu().numpy().astype(np.float32, copy=True))
         return detections

@@ -43,8 +43,6 @@ class ConstantVelocityKalman:
         self.m = m
         self.x = np.concatenate([initial, np.zeros(m)])  # [positions, velocities]
 
-        self.F = np.eye(2 * m)                # transition: z += ż * dt (dt = 1 tick)
-        self.F[:m, m:] = np.eye(m)
         self.H = np.hstack([np.eye(m), np.zeros((m, m))])  # we only measure z
 
         # Discrete white-noise-acceleration model: unknown accelerations are
@@ -52,19 +50,33 @@ class ConstantVelocityKalman:
         #   Q = q * [[dt⁴/4, dt³/2],
         #            [dt³/2, dt²  ]]   (per measured dimension)
         # and with dt = 1 tick those factors become 0.25, 0.5 and 1.
-        q = process_noise
-        self.Q = np.block([
-            [np.eye(m) * q * 0.25, np.eye(m) * q * 0.5],
-            [np.eye(m) * q * 0.5,  np.eye(m) * q],
-        ])
+        self.process_noise = process_noise
         self.R = np.eye(m) * measurement_noise
 
         self.P = np.eye(2 * m) * measurement_noise
         self.P[m:, m:] *= 100.0  # initial velocity is unknown
+        self._transition = np.eye(2 * m)
+        self._process_cov = np.zeros((2 * m, 2 * m))
+        self._indices = np.arange(m)
+        self._identity = np.eye(2 * m)
 
-    def predict(self) -> np.ndarray:
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
+    def predict(self, dt: float = 1.0) -> np.ndarray:
+        """Predict by an actual time delta (seconds or legacy ticks)."""
+        if not np.isfinite(dt) or dt < 0:
+            raise ValueError(f"Kalman dt must be non-negative, got {dt}")
+        if dt == 0:
+            return self.position
+        transition = self._transition
+        index = self._indices
+        transition[index, index + self.m] = dt
+        q = self.process_noise
+        process_cov = self._process_cov
+        process_cov[index, index] = q * dt**4 / 4
+        process_cov[index, index + self.m] = q * dt**3 / 2
+        process_cov[index + self.m, index] = q * dt**3 / 2
+        process_cov[index + self.m, index + self.m] = q * dt**2
+        self.x = transition @ self.x
+        self.P = transition @ self.P @ transition.T + process_cov
         return self.x[: self.m]
 
     def update(self, z: np.ndarray) -> None:
@@ -72,7 +84,7 @@ class ConstantVelocityKalman:
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ innovation
-        self.P = (np.eye(2 * self.m) - K @ self.H) @ self.P
+        self.P = (self._identity - K @ self.H) @ self.P
 
     @property
     def position(self) -> np.ndarray:
@@ -100,7 +112,10 @@ def match_by_iou(tracks_xyxy: np.ndarray, dets_xyxy: np.ndarray, min_iou: float)
     if len(tracks_xyxy) == 0 or len(dets_xyxy) == 0:
         return [], list(range(len(tracks_xyxy))), list(range(len(dets_xyxy)))
     iou = iou_matrix(tracks_xyxy, dets_xyxy)
-    rows, cols = linear_sum_assignment(-iou)  # maximize total IoU
+    # Preserve maximum total overlap before rejecting weak pairs. Forcing
+    # maximum match count can replace one strong identity match with two
+    # ambiguous weak matches, increasing ID switches in crossing tracks.
+    rows, cols = linear_sum_assignment(-iou)
     pairs = [(r, c) for r, c in zip(rows, cols) if iou[r, c] >= min_iou]
     matched_t = {r for r, _ in pairs}
     matched_d = {c for _, c in pairs}
@@ -128,6 +143,7 @@ class Track:
     conf: float
     hits: int = 1
     misses: int = 0
+    missed_seconds: float = 0.0
     confirmed: bool = False
 
     @property
@@ -143,18 +159,40 @@ class ByteTracker:
         self.cfg = cfg
         self.tracks: list[Track] = []
         self._next_id = 1
+        self._last_timestamp_s: float | None = None
 
-    def update(self, detections: np.ndarray) -> list[Track]:
+    def update(self, detections: np.ndarray, timestamp_s: float | None = None) -> list[Track]:
         """Advance one tick with (N, 5) [x1, y1, x2, y2, conf] detections.
 
         Returns the confirmed tracks (stable IDs, Kalman-smoothed boxes).
         """
         cfg = self.cfg
+        detections = np.asarray(detections, dtype=float).reshape((-1, 5))
+        if timestamp_s is not None and not np.isfinite(timestamp_s):
+            raise ValueError("ByteTracker timestamp must be finite")
+        if timestamp_s is None:
+            dt = 1.0
+        elif self._last_timestamp_s is None:
+            dt = 0.0
+        else:
+            dt = float(timestamp_s) - self._last_timestamp_s
+            if dt < -1e-9:
+                raise ValueError(
+                    f"ByteTracker timestamps must be monotonic: "
+                    f"{timestamp_s} < {self._last_timestamp_s}"
+                )
+            dt = max(0.0, dt)
+        if timestamp_s is not None:
+            self._last_timestamp_s = float(timestamp_s)
+            # A camera may be absent for many ticks. Expire before matching,
+            # otherwise its first returning detection resurrects an old ID.
+            self.tracks = [track for track in self.tracks
+                           if track.missed_seconds + dt <= cfg.track_max_age_s]
 
         # 1. Predict where every known track should be this tick. Until a
         #    track is matched and updated, `track.xyxy` is this prediction.
         for track in self.tracks:
-            track.kf.predict()
+            track.kf.predict(dt)
 
         high = detections[detections[:, 4] >= cfg.track_high_conf]
         low = detections[detections[:, 4] < cfg.track_high_conf]
@@ -188,9 +226,13 @@ class ByteTracker:
         #    confirmed ones survive up to max_age ticks (occlusion tolerance).
         for t_idx in unmatched_tracks:
             self.tracks[t_idx].misses += 1
+            self.tracks[t_idx].missed_seconds += dt
         self.tracks = [
             t for t in self.tracks
-            if t.misses <= (cfg.track_max_age if t.confirmed else 0)
+            if (
+                (t.missed_seconds <= cfg.track_max_age_s if timestamp_s is not None else t.misses <= cfg.track_max_age)
+                if t.confirmed else t.misses <= 0
+            )
         ]
 
         # 5. Every unmatched high-confidence detection births a new track.
@@ -204,6 +246,7 @@ class ByteTracker:
                     measurement_noise=cfg.track_kf_measurement_noise,
                 ),
                 conf=float(det[4]),
+                confirmed=cfg.track_min_hits <= 1,
             ))
             self._next_id += 1
 
@@ -214,5 +257,6 @@ class ByteTracker:
         track.conf = float(det[4])
         track.hits += 1
         track.misses = 0
+        track.missed_seconds = 0.0
         if track.hits >= self.cfg.track_min_hits:
             track.confirmed = True
