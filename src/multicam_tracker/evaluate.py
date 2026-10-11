@@ -16,6 +16,7 @@ Run: ``uv run evaluate --max-frames 1200``
 from __future__ import annotations
 
 import argparse
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,7 +31,9 @@ MATCH_GATE_M = 1.0
 
 
 def ground_truth_by_frame(
-    scene_dir: Path, cameras: list[str]
+    scene_dir: Path,
+    cameras: list[str],
+    camera_frame_offsets: dict[str, int] | None = None,
 ) -> dict[int, dict[int, np.ndarray]]:
     """frame -> {person_id: world_xy}, deduplicated across cameras.
 
@@ -39,12 +42,30 @@ def ground_truth_by_frame(
     the ones that were downloaded.
     """
     camera_ids = {float(cam.split("_")[1]) for cam in cameras}
+    offsets_by_id = {
+        float(camera.split("_")[1]): int(offset)
+        for camera, offset in (camera_frame_offsets or {}).items()
+    }
     gt = load_ground_truth(scene_dir)
-    by_frame: dict[int, dict[int, np.ndarray]] = defaultdict(dict)
+    accumulators: dict[int, dict[int, tuple[np.ndarray, int]]] = defaultdict(dict)
     for camera_id, person_id, frame, *_bbox, wx, wy in gt:
         if camera_id in camera_ids:
-            by_frame[int(frame)][int(person_id)] = np.array([wx, wy])
-    return by_frame
+            logical_frame = int(frame) - offsets_by_id.get(camera_id, 0)
+            if logical_frame < 0:
+                continue
+            person_id = int(person_id)
+            xy = np.array([wx, wy])
+            total, count = accumulators[logical_frame].get(
+                person_id, (np.zeros(2, dtype=float), 0)
+            )
+            accumulators[logical_frame][person_id] = (total + xy, count + 1)
+    return {
+        frame: {
+            person_id: total / count
+            for person_id, (total, count) in people.items()
+        }
+        for frame, people in accumulators.items()
+    }
 
 
 def main() -> None:
@@ -52,25 +73,32 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--max-frames", type=int, default=1200)
     parser.add_argument("--device", default=None, choices=["mps", "cpu", "cuda"])
+    parser.add_argument("--cameras", nargs="+", default=None, metavar="CAM")
     args = parser.parse_args()
 
-    cfg = PipelineConfig(data_root=args.data_root)
+    cfg = PipelineConfig(data_root=args.data_root, async_ingest=False)
     available = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())
     if not available:
         raise SystemExit("No cameras found — run `uv run download-data` first.")
-    cfg.cameras = available
+    cfg.cameras = args.cameras or available
     if args.device:
         cfg.device = args.device
 
-    gt_frames = ground_truth_by_frame(cfg.scene_dir, cfg.cameras)
-    print(f"Evaluating {len(available)} cameras over {args.max_frames} frames...")
+    gt_frames = ground_truth_by_frame(
+        cfg.scene_dir, cfg.cameras, cfg.camera_start_frame_offsets
+    )
+    print(f"Evaluating {len(cfg.cameras)} cameras over {args.max_frames} frames (stride={cfg.stride})...", flush=True)
 
     predictions: list[tuple[int, dict[int, np.ndarray]]] = []
+    started = time.perf_counter()
     for tick in run_pipeline(cfg, max_frames=args.max_frames):
         predictions.append((
             tick["frame_index"],
             {t.gid: t.world_xy.copy() for t in tick["global_tracks"]},
         ))
+        if len(predictions) % 50 == 0:
+            print(f"Evaluated {len(predictions)} ticks in {time.perf_counter() - started:.1f}s", flush=True)
+    elapsed = time.perf_counter() - started
 
     # The GT frame column is 1-based-ish; find the constant offset to our
     # 0-based video frame index that minimizes error (0, 1, or 2).
@@ -119,6 +147,7 @@ def main() -> None:
     print(f"Position RMSE         : {rmse:.2f} m")
     print(f"Global ID switches    : {id_switches} "
           f"(over {len(gt_id_history)} people, {len(predictions)} ticks)")
+    print(f"CPU pipeline          : {len(predictions) / max(elapsed, 1e-6):.3f} ticks/s ({elapsed:.2f}s)")
 
 
 def _match_errors(predictions, gt_frames, offset: int) -> list[float]:
