@@ -1,7 +1,12 @@
 import numpy as np
 import unittest
 
-from multicam_tracker.bytetrack import ByteTracker, ConstantVelocityKalman
+from multicam_tracker.bytetrack import (
+    ByteTracker,
+    ConstantVelocityKalman,
+    _box_state_to_xyxy,
+    _xyxy_to_box_state,
+)
 from multicam_tracker.config import PipelineConfig
 from multicam_tracker.timebase import ClockModel
 
@@ -41,6 +46,35 @@ class TimebaseTrackingTests(unittest.TestCase):
         self.assertAlmostEqual(kf.predict(dt=0.25)[0], 0.5)
         self.assertAlmostEqual(kf.predict(dt=1.5)[0], 3.5)
 
+    def test_box_kalman_state_round_trips_xyxy(self) -> None:
+        box = np.array([10.0, 20.0, 50.0, 120.0])
+        state = _xyxy_to_box_state(box)
+        self.assertEqual(state[1], 70.0)
+        np.testing.assert_allclose(_box_state_to_xyxy(state), box)
+
+    def test_robust_kalman_update_downweights_bbox_outlier(self) -> None:
+        regular = ConstantVelocityKalman(
+            np.zeros(4), process_noise=2.0, measurement_noise=10.0
+        )
+        robust = ConstantVelocityKalman(
+            np.zeros(4), process_noise=2.0, measurement_noise=10.0
+        )
+        measurement = np.array([120.0, 80.0, 40.0, 100.0])
+        regular.update(measurement)
+        robust.update(measurement, nis_threshold=13.28)
+        self.assertLess(np.linalg.norm(robust.position), np.linalg.norm(regular.position))
+
+    def test_adaptive_process_noise_scales_covariance(self) -> None:
+        low = ConstantVelocityKalman(
+            np.zeros(2), process_noise=2.0, measurement_noise=10.0
+        )
+        high = ConstantVelocityKalman(
+            np.zeros(2), process_noise=2.0, measurement_noise=10.0
+        )
+        low.predict(dt=0.5, process_noise_scale=0.25)
+        high.predict(dt=0.5, process_noise_scale=4.0)
+        self.assertGreater(high.P[0, 0], low.P[0, 0])
+
     def test_tracker_timeout_is_seconds_with_irregular_frames(self) -> None:
         cfg = PipelineConfig(track_min_hits=2, track_max_age_s=1.0)
         tracker = ByteTracker(cfg)
@@ -67,3 +101,30 @@ class TimebaseTrackingTests(unittest.TestCase):
         tracker.update(np.empty((0, 5)))
         tracker.update(np.empty((0, 5)))
         self.assertEqual(tracker.tracks, [])
+
+    def test_crossing_tracks_keep_motion_identity_through_one_frame_occlusion(self) -> None:
+        cfg = PipelineConfig(track_min_hits=1, track_min_iou=0.05)
+        tracker = ByteTracker(cfg)
+
+        def person_box(center_x: float) -> list[float]:
+            return [center_x - 25.0, 40.0, center_x + 25.0, 140.0, 0.95]
+
+        for index in range(13):
+            moving_right = 90.0 + 10.0 * index
+            moving_left = 210.0 - 10.0 * index
+            if index == 6:  # detector sees one merged box at exact overlap
+                detections = np.asarray([person_box(moving_right)])
+            else:
+                detections = np.asarray([
+                    person_box(moving_right), person_box(moving_left)
+                ])
+                if index >= 5:  # detector result ordering is not identity-stable
+                    detections = detections[::-1]
+            tracker.update(detections, timestamp_s=index / 10.0)
+
+        by_id = {track.track_id: track for track in tracker.tracks}
+        center_1 = float((by_id[1].xyxy[0] + by_id[1].xyxy[2]) / 2.0)
+        center_2 = float((by_id[2].xyxy[0] + by_id[2].xyxy[2]) / 2.0)
+        self.assertGreater(center_1, center_2)
+        self.assertGreater(by_id[1].kf.velocity[0], 0.0)
+        self.assertLess(by_id[2].kf.velocity[0], 0.0)

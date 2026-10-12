@@ -76,7 +76,7 @@ uv run evaluate                        # metrics vs. ground truth
 uv run render-preview --gif out.gif    # composite MP4/GIF like the one above
 ```
 
-### Render MP4 on Modal T4
+### Render MP4 or evaluate MOT metrics on Modal T4
 
 The Modal entrypoint uploads only `data/custom` plus the local model to a persistent Volume,
 runs YOLO on a T4 (`device=cuda`), writes the camera-grid + BEV MP4 remotely,
@@ -100,6 +100,29 @@ Select a subset with a comma-separated list such as
 `--cameras camera_0001,camera_0007`. The persistent Modal Volume is named
 `multicam-tracker-data`; remote outputs are retained under `outputs/` and are
 also streamed back to the requested local `.mp4` path.
+
+The same uploaded `data/custom` contains `ground_truth.txt`, so it can also
+run IDF1/IDP/IDR, MOTA/MOTP and HOTA evaluation without another dataset
+upload. Camera names must remain one comma-separated CLI argument:
+
+```bash
+# 1 minute at 30 FPS; saves the full result locally as JSON.
+uv run --extra modal modal run modal_app.py \
+  --evaluate --max-frames 1800 \
+  --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
+  --metrics-out mot-metrics-1800.json
+
+# A longer 10-minute evaluation (subject to the available source length).
+uv run --extra modal modal run modal_app.py \
+  --evaluate --max-frames 18000 \
+  --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
+  --metrics-out mot-metrics-18000.json
+```
+
+The evaluation worker has a six-hour timeout, uses `stride=1`, prints progress
+every 250 processed ticks, and keeps an additional JSON copy in the Modal
+Volume under `outputs/`. Use `--upload` again only when the scene or model has
+changed.
 
 ## The live viewer
 
@@ -314,18 +337,41 @@ debugging trackers.
 
 ## Evaluation
 
-`uv run evaluate` Hungarian-matches fused tracks to ground truth (1 m gate)
-per frame — the pipeline under test is byte-identical to the live demo
-(both consume `demo.run_pipeline`). Latest CPU verification on the current
-custom 4-camera scene used the first 300 source frames (150 processed ticks),
-with ground truth aligned to each configured source-frame trim:
+`uv run evaluate` evaluates fused world-plane tracks against ground truth.
+The pipeline under test is byte-identical to the live demo (both consume
+`demo.run_pipeline`). It reports three standard MOT metric families plus the
+existing position diagnostics:
+
+- Identity: IDF1, ID precision (IDP), ID recall (IDR), IDTP, IDFP and IDFN.
+- CLEAR MOT: MOTA, MOTP and global ID switches (IDSW).
+- HOTA: HOTA, DetA, AssA, LocA, AssPr and AssRe, averaged over the standard
+  19 alpha thresholds from 0.05 through 0.95.
+- World-plane detection precision/recall and position RMSE.
+
+For point tracks, distance is converted to similarity as
+`max(0, 1 - distance / match_gate_m)`. The default match gate is 1 m and can
+be changed with `--match-gate-m`. Both MOTP similarity (higher is better) and
+mean matched distance in metres (lower is better) are printed.
+
+```bash
+uv run evaluate --max-frames 60 --device cpu \
+  --cameras camera_0001 camera_0007 camera_0008 camera_0010
+```
+
+Latest CPU verification on the current custom 4-camera scene used 60 source
+frames (50 evaluated ticks), with ground truth aligned to each configured
+source-frame trim:
 
 | Metric | Value |
 |---|---|
-| Precision | 0.726 |
-| Recall | 0.796 |
-| World-plane position RMSE | 0.42 m |
-| Global ID switches | 80 over 22 matched people / 150 ticks |
+| IDP / IDR / IDF1 | 0.772 / 0.832 / 0.801 |
+| MOTA | 0.584 |
+| MOTP similarity / distance | 0.764 / 0.236 m |
+| HOTA | 0.630 |
+| DetA / AssA / LocA | 0.488 / 0.846 / 0.829 |
+| Precision / Recall | 0.773 / 0.833 |
+| World-plane position RMSE | 0.302 m |
+| Global ID switches | 5 over 50 ticks |
 
 Recall losses concentrate at FOV edges and behind the racks — with only 4
 of the 10 cameras there are blind spots. Download `--full` and re-run to
@@ -401,6 +447,9 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
 | `track_max_age` | 60 ticks | legacy no-timestamp fallback (~2 s at 30 fps) |
 | `track_max_age_s` | 2.0 s | timestamp-mode local-track timeout |
+| `track_kf_process_noise` / `track_kf_time_process_noise` | 2.0 / 2.0 | local Kalman acceleration variance for legacy ticks / timestamped frames |
+| `track_kf_robust_nis_threshold` | 0 (off) | optionally down-weight statistically extreme bbox updates; tune against IDSW before enabling |
+| `track_kf_adaptive_noise` | false | optionally scale Kalman noise with bbox height |
 | `fusion_gate_m` | 2.0 m | max world distance for cross-camera association |
 | `fusion_merge_m` | 1.0 m | cluster radius when grouping new observations |
 | `fusion_max_age` | 90 ticks | legacy no-timestamp fallback (~3 s at 30 fps) |
@@ -408,6 +457,8 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `fusion_output_grace_s` | 0.25 s | publish freshness; retained IDs are not emitted as stale people |
 | `fusion_event_time_gate_s` | 0.15 s | simultaneous-geometry gate after clock correction |
 | `fusion_local_reconnect_gate_m` | 1.0 m | reconnect a fragmented local ID to a retained same-camera global track |
+| `fusion_instant_velocity_weight_s` | 0 (off) | optional motion re-ranking at ambiguous cross-camera merges |
+| `fusion_instant_opposite_direction_cosine` | -1.1 (off) | optional opposite-direction veto; e.g. `-0.25` for a conservative crossing guard |
 | `fusion_min_hits` | 3 | ticks of support before a global track is shown |
 | `tracklet_history_s` | 5.0 s | bounded metadata history per local ID |
 | `max_camera_offset_s` | 3.0 s | coarse residual clock-offset search radius |

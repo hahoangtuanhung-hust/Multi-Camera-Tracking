@@ -6,7 +6,13 @@ from multicam_tracker.config import PipelineConfig
 from multicam_tracker.fusion import CameraObservation, GlobalTrackManager
 
 
-def _obs(camera: str, local_id: int, timestamp: float, xy: tuple[float, float]):
+def _obs(
+    camera: str,
+    local_id: int,
+    timestamp: float,
+    xy: tuple[float, float],
+    velocity: tuple[float, float] | None = None,
+):
     return CameraObservation(
         camera=camera,
         local_id=local_id,
@@ -14,6 +20,9 @@ def _obs(camera: str, local_id: int, timestamp: float, xy: tuple[float, float]):
         bbox_xyxy=np.zeros(4, dtype=float),
         conf=0.95,
         capture_ts_s=timestamp,
+        world_velocity=(
+            None if velocity is None else np.asarray(velocity, dtype=float)
+        ),
     )
 
 
@@ -28,7 +37,7 @@ class EventTimeFusionTests(unittest.TestCase):
         values.update(overrides)
         return PipelineConfig(**values)
 
-    def test_provisional_ids_converge_to_oldest_canonical_id(self) -> None:
+    def test_provisional_ids_converge_to_published_canonical_id(self) -> None:
         manager = GlobalTrackManager(self._config())
         first_ids = None
         visible = []
@@ -41,9 +50,12 @@ class EventTimeFusionTests(unittest.TestCase):
             if first_ids is None:
                 first_ids = (manager.affinity[("a", 1)], manager.affinity[("b", 7)])
         self.assertNotEqual(first_ids[0], first_ids[1])
-        self.assertEqual(manager.affinity[("a", 1)], first_ids[0])
-        self.assertEqual(manager.affinity[("b", 7)], first_ids[0])
-        self.assertEqual(manager.resolve_gid(first_ids[1]), first_ids[0])
+        # Camera B is the only identity still fresh enough to be published
+        # before delayed trajectory matching converges. Preserve that public
+        # ID instead of visibly renaming it to the numerically smaller GID.
+        self.assertEqual(manager.affinity[("a", 1)], first_ids[1])
+        self.assertEqual(manager.affinity[("b", 7)], first_ids[1])
+        self.assertEqual(manager.resolve_gid(first_ids[0]), first_ids[1])
         self.assertEqual(len({track.gid for track in visible}), 1)
         self.assertGreaterEqual(manager.metrics["global_id_merges"], 1)
         self.assertGreater(manager.clock_estimator.estimate("b").confidence, 0.55)
@@ -89,6 +101,22 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertEqual(manager.resolve_gid(gids[2]), gids[0])
         self.assertEqual(manager.aliases[gids[2]], gids[0])
 
+    def test_merge_preserves_the_id_already_published_to_consumers(self) -> None:
+        manager = GlobalTrackManager(self._config())
+        manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0)),
+            _obs("b", 1, 0.0, (5.0, 0.0)),
+        ])
+        first = manager.affinity[("a", 1)]
+        second = manager.affinity[("b", 1)]
+        manager.tracks[first].emitted = False
+        manager.tracks[second].emitted = True
+
+        self.assertTrue(manager.merge_gids(first, second))
+        self.assertEqual(manager.resolve_gid(first), second)
+        self.assertEqual(manager.affinity[("a", 1)], second)
+        self.assertEqual(manager.metrics["published_id_preserved_on_merge"], 1)
+
     def test_late_packet_is_kept_for_matching_but_does_not_rewind_kf(self) -> None:
         manager = GlobalTrackManager(self._config())
         for timestamp in (0.0, 1.0, 2.0):
@@ -128,6 +156,96 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 7)])
         self.assertEqual(manager.metrics["instant_geometry_merges"], 1)
 
+    def test_crossing_defers_opposite_motion_then_merges_after_separation(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_crossing_guard_m=0.0,
+            fusion_instant_opposite_direction_cosine=-0.25,
+            fusion_instant_margin_m=0.1,
+            tracklet_min_duration_s=10.0,
+        ))
+        # Projection noise puts each camera-B observation closer to the wrong
+        # person at the crossing. Their velocity directions remain distinct.
+        for timestamp, shift in ((0.0, 0.0), (0.1, 0.1)):
+            manager.step([
+                _obs("a", 1, timestamp, (-0.6 + shift, 0.0), (1.0, 0.0)),
+                _obs("a", 2, timestamp, (0.6 - shift, 0.0), (-1.0, 0.0)),
+                _obs("b", 11, timestamp, (0.1 + shift, 0.0), (1.0, 0.0)),
+                _obs("b", 12, timestamp, (-0.1 - shift, 0.0), (-1.0, 0.0)),
+            ])
+
+        self.assertNotEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
+        self.assertGreater(manager.metrics["instant_opposite_direction_vetoes"], 0)
+
+        manager.step([
+            _obs("a", 1, 0.2, (0.2, 0.0), (1.0, 0.0)),
+            _obs("a", 2, 0.2, (-0.2, 0.0), (-1.0, 0.0)),
+            _obs("b", 11, 0.2, (0.25, 0.0), (1.0, 0.0)),
+            _obs("b", 12, 0.2, (-0.25, 0.0), (-1.0, 0.0)),
+        ])
+        self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
+        self.assertEqual(manager.affinity[("a", 2)], manager.affinity[("b", 12)])
+        self.assertNotEqual(manager.affinity[("a", 1)], manager.affinity[("a", 2)])
+
+    def test_crossing_ignores_one_frame_velocity_reversal(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_crossing_guard_m=0.0,
+            fusion_instant_opposite_direction_cosine=-0.25,
+            fusion_instant_margin_m=0.1,
+            fusion_instant_merge_enabled=False,
+            tracklet_min_duration_s=10.0,
+        ))
+        for timestamp, shift in ((0.0, 0.0), (0.2, 0.2)):
+            manager.step([
+                _obs("a", 1, timestamp, (-0.6 + shift, 0.0), (1.0, 0.0)),
+                _obs("a", 2, timestamp, (0.6 - shift, 0.0), (-1.0, 0.0)),
+                _obs("b", 11, timestamp, (-0.6 + shift, 0.0), (1.0, 0.0)),
+                _obs("b", 12, timestamp, (0.6 - shift, 0.0), (-1.0, 0.0)),
+            ])
+        manager.cfg.fusion_instant_merge_enabled = True
+        # Camera-B position noise favours the wrong spatial pairing and its
+        # supplied one-frame velocities are reversed. The 0.4 s path history
+        # still has the correct direction.
+        manager.step([
+            _obs("a", 1, 0.4, (-0.2, 0.0), (-1.0, 0.0)),
+            _obs("a", 2, 0.4, (0.2, 0.0), (1.0, 0.0)),
+            _obs("b", 11, 0.4, (0.1, 0.0), (-1.0, 0.0)),
+            _obs("b", 12, 0.4, (-0.1, 0.0), (1.0, 0.0)),
+        ])
+        self.assertNotEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
+        manager.step([
+            _obs("a", 1, 0.6, (0.2, 0.0), (1.0, 0.0)),
+            _obs("a", 2, 0.6, (-0.2, 0.0), (-1.0, 0.0)),
+            _obs("b", 11, 0.6, (0.25, 0.0), (1.0, 0.0)),
+            _obs("b", 12, 0.6, (-0.25, 0.0), (-1.0, 0.0)),
+        ])
+
+        self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
+        self.assertEqual(manager.affinity[("a", 2)], manager.affinity[("b", 12)])
+        self.assertGreater(manager.metrics["stable_motion_estimates_used"], 0)
+
+    def test_ambiguous_merge_can_require_repeated_confirmation(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_crossing_guard_m=0.75,
+            fusion_instant_confirmations=2,
+            tracklet_min_duration_s=10.0,
+        ))
+        manager.step([
+            _obs("a", 1, 0.0, (-0.2, 0.0), (0.0, 0.0)),
+            _obs("a", 2, 0.0, (0.2, 0.0), (0.0, 0.0)),
+            _obs("b", 11, 0.0, (0.15, 0.0), (0.0, 0.0)),
+            _obs("b", 12, 0.0, (-0.15, 0.0), (0.0, 0.0)),
+        ])
+
+        self.assertNotEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
+        self.assertNotEqual(manager.affinity[("a", 2)], manager.affinity[("b", 12)])
+        self.assertEqual(manager.metrics["instant_geometry_merges"], 0)
+        self.assertGreater(
+            manager.metrics["instant_merges_deferred_for_confirmation"], 0
+        )
+
     def test_fragmented_local_id_reconnects_to_retained_same_camera_track(self) -> None:
         manager = GlobalTrackManager(self._config())
         for timestamp in (0.0, 0.2, 0.4):
@@ -136,6 +254,33 @@ class EventTimeFusionTests(unittest.TestCase):
         manager.step([_obs("a", 2, 0.6, (0.6, 0.0))])
         self.assertEqual(manager.affinity[("a", 2)], original_gid)
         self.assertEqual(manager.metrics["local_fragments_reconnected"], 1)
+
+    def test_crossing_fragments_reconnect_by_motion_not_nearest_position(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_local_reconnect_velocity_weight_s=0.25,
+        ))
+        manager.step([
+            _obs("a", 1, 0.0, (-0.6, 0.0), (1.0, 0.0)),
+            _obs("a", 2, 0.0, (0.6, 0.0), (-1.0, 0.0)),
+        ])
+        manager.step([
+            _obs("a", 1, 0.2, (-0.4, 0.0), (1.0, 0.0)),
+            _obs("a", 2, 0.2, (0.4, 0.0), (-1.0, 0.0)),
+        ])
+        first_gid = manager.affinity[("a", 1)]
+        second_gid = manager.affinity[("a", 2)]
+
+        # New local IDs appear around the crossing. Position alone favours
+        # the wrong retained GID; direction continuity favours the right one.
+        manager.step([
+            _obs("a", 3, 0.4, (0.1, 0.0), (1.0, 0.0)),
+            _obs("a", 4, 0.4, (-0.1, 0.0), (-1.0, 0.0)),
+        ])
+
+        self.assertEqual(manager.affinity[("a", 3)], first_gid)
+        self.assertEqual(manager.affinity[("a", 4)], second_gid)
+        self.assertGreater(manager.metrics["local_reconnect_motion_penalties"], 0)
 
     def test_simultaneous_same_camera_tracks_do_not_reconnect(self) -> None:
         manager = GlobalTrackManager(self._config())

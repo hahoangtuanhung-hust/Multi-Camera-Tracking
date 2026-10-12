@@ -63,7 +63,16 @@ class PipelineConfig:
     track_max_age_s: float = 2.0    # used when capture timestamps are supplied
     track_min_hits: int = 3         # detections before a track is confirmed
     track_kf_process_noise: float = 2.0       # box motion uncertainty (px² units)
+    track_kf_time_process_noise: float = 2.0  # separately tunable timestamped px/s variance
     track_kf_measurement_noise: float = 10.0  # detector box jitter (px² units)
+    # Optional experimental controls. Real-scene evaluation keeps them neutral
+    # by default: aggressive adaptation/outlier damping reduced IoU continuity.
+    track_kf_adaptive_noise: bool = False
+    track_kf_reference_height_px: float = 100.0
+    track_kf_noise_scale_min: float = 0.25
+    track_kf_noise_scale_max: float = 4.0
+    track_kf_confidence_noise_gain: float = 0.0
+    track_kf_robust_nis_threshold: float = 0.0  # 0 disables robust down-weighting
 
     # --- cross-camera fusion (fusion.py) ---
     fusion_gate_m: float = 2.0      # max world-plane distance (meters) to match
@@ -74,7 +83,24 @@ class PipelineConfig:
     fusion_instant_merge_enabled: bool = True
     fusion_event_time_gate_s: float = 0.15
     fusion_instant_margin_m: float = 0.20
+    # Optional crossing controls. The bundled scene evaluates best with
+    # position assignment; enable motion/confirmation only after camera-specific
+    # tuning with ``evaluate`` or ``benchmarks/evaluate_thresholds.py``.
+    fusion_crossing_guard_m: float = 0.75
+    fusion_instant_min_speed_mps: float = 0.15
+    fusion_instant_velocity_gate_mps: float = 1.50
+    fusion_instant_direction_cosine: float = 0.20
+    # Default to geometry assignment plus a strong opposite-direction veto.
+    # A positive weight opts into soft motion re-ranking (useful for tuning,
+    # but less stable with noisy local IDs in the bundled real scene).
+    fusion_instant_velocity_weight_s: float = 0.0
+    fusion_instant_opposite_direction_cosine: float = -1.1  # disabled by default
+    fusion_motion_window_s: float = 0.60
+    fusion_motion_min_span_s: float = 0.20
+    fusion_instant_confirmations: int = 1
+    fusion_instant_confirmation_window_s: float = 0.30
     fusion_local_reconnect_gate_m: float = 1.0
+    fusion_local_reconnect_velocity_weight_s: float = 0.0
     fusion_min_hits: int = 3        # observations before a global track shows
     fusion_kf_process_noise: float = 0.05      # walking-speed changes (m² units)
     fusion_kf_measurement_noise: float = 0.05  # projected foot-point jitter (m² units)

@@ -74,6 +74,7 @@ class GlobalTrackManager:
         self._max_event_ts_s = float("-inf")
         self._max_arrival_ts_s = float("-inf")
         self._last_match_run_s = float("-inf")
+        self._instant_merge_votes: dict[tuple[int, int], tuple[int, float]] = {}
 
     def resolve_gid(self, gid: int) -> int:
         """Resolve and path-compress a possibly retired alias."""
@@ -218,7 +219,7 @@ class GlobalTrackManager:
     def _find_local_reconnect(self, obs: CameraObservation) -> int | None:
         """Reconnect a new local ID to a recently ended track in that camera."""
         event_ts = float(obs.capture_ts_s)
-        candidates: list[tuple[float, int]] = []
+        spatial_candidates: list[tuple[float, int, np.ndarray]] = []
         for gid, track in self.tracks.items():
             gid = self.resolve_gid(gid)
             if gid not in self.tracks or obs.camera in track.cameras:
@@ -239,14 +240,29 @@ class GlobalTrackManager:
             prediction_dt = max(0.0, event_ts - state_ts)
             predicted_xy = track.world_xy + track.kf.velocity * prediction_dt
             distance = float(np.linalg.norm(predicted_xy - obs.world_xy))
-            if distance <= self.cfg.fusion_local_reconnect_gate_m:
-                candidates.append((distance, gid))
+            if distance > self.cfg.fusion_local_reconnect_gate_m:
+                continue
+            spatial_candidates.append((distance, gid, track.kf.velocity.copy()))
+        candidates: list[tuple[float, float, int]] = []
+        for distance, gid, track_velocity in spatial_candidates:
+            motion_cost = self._velocity_pair_cost(
+                track_velocity,
+                obs.world_velocity,
+                require_evidence=False,
+                weight_s=self.cfg.fusion_local_reconnect_velocity_weight_s,
+            )
+            if motion_cost is None:
+                self.metrics["local_reconnect_motion_gate_failed"] += 1
+                continue
+            if motion_cost > 0:
+                self.metrics["local_reconnect_motion_penalties"] += 1
+            candidates.append((distance + motion_cost, distance, gid))
         if not candidates:
             return None
         candidates.sort()
-        best_distance, best_gid = candidates[0]
+        best_cost, _best_distance, best_gid = candidates[0]
         if len(candidates) > 1:
-            margin = candidates[1][0] - best_distance
+            margin = candidates[1][0] - best_cost
             if margin + 1e-9 < self.cfg.fusion_instant_margin_m:
                 self.metrics["local_reconnect_ambiguous"] += 1
                 return None
@@ -364,13 +380,15 @@ class GlobalTrackManager:
         for left_camera, right_camera in combinations(sorted(by_camera), 2):
             left_items = by_camera[left_camera]
             right_items = by_camera[right_camera]
+            left_near_peer = self._near_same_camera_peer(left_items)
+            right_near_peer = self._near_same_camera_peer(right_items)
             left_clock = self.clock_estimator.estimate(left_camera)
             right_clock = self.clock_estimator.estimate(right_camera)
             clocks_known = (
                 left_clock.confidence >= self.cfg.offset_min_confidence
                 and right_clock.confidence >= self.cfg.offset_min_confidence
             )
-            distance = np.full((len(left_items), len(right_items)), 1e6, dtype=float)
+            spatial = np.full((len(left_items), len(right_items)), 1e6, dtype=float)
             for row, left in enumerate(left_items):
                 for column, right in enumerate(right_items):
                     left_ts = float(left.capture_ts_s)
@@ -381,29 +399,96 @@ class GlobalTrackManager:
                     if abs(left_ts - right_ts) > self.cfg.fusion_event_time_gate_s:
                         continue
                     world_distance = float(np.linalg.norm(left.world_xy - right.world_xy))
-                    if world_distance <= self.cfg.fusion_merge_m:
-                        distance[row, column] = world_distance
-            rows, columns = linear_sum_assignment(distance)
+                    if world_distance > self.cfg.fusion_merge_m:
+                        continue
+                    spatial[row, column] = world_distance
+
+            # Motion is mandatory only where position offers competing
+            # assignments. Clear one-to-one pairs still merge immediately;
+            # this prevents provisional IDs from being displayed and renamed
+            # later merely because another person is nearby in the scene.
+            row_candidates = np.sum(spatial < 1e6, axis=1)
+            column_candidates = np.sum(spatial < 1e6, axis=0)
+            cost = np.full_like(spatial, 1e6)
+            ambiguous_assignment = np.zeros_like(spatial, dtype=bool)
+            for row, left in enumerate(left_items):
+                for column, right in enumerate(right_items):
+                    if spatial[row, column] >= 1e6:
+                        continue
+                    requires_motion = bool(
+                        left_near_peer[row]
+                        or right_near_peer[column]
+                        or row_candidates[row] > 1
+                        or column_candidates[column] > 1
+                    )
+                    ambiguous_assignment[row, column] = requires_motion
+                    motion_cost = 0.0
+                    if self.cfg.fusion_instant_velocity_weight_s > 0:
+                        motion_cost = self._velocity_pair_cost(
+                            self._stable_observation_velocity(left),
+                            self._stable_observation_velocity(right),
+                            require_evidence=False,
+                        )
+                        if motion_cost is None:
+                            self.metrics["instant_motion_gate_failed"] += 1
+                            continue
+                        if motion_cost > 0:
+                            self.metrics["instant_motion_penalties"] += 1
+                    cost[row, column] = spatial[row, column] + motion_cost
+            rows, columns = linear_sum_assignment(cost)
             for row, column in zip(rows, columns):
-                value = distance[row, column]
+                value = cost[row, column]
                 if value >= 1e6:
                     continue
                 alternatives = [
-                    distance[row, other]
-                    for other in range(distance.shape[1]) if other != column
+                    cost[row, other]
+                    for other in range(cost.shape[1]) if other != column
                 ] + [
-                    distance[other, column]
-                    for other in range(distance.shape[0]) if other != row
+                    cost[other, column]
+                    for other in range(cost.shape[0]) if other != row
                 ]
                 margin = min(alternatives, default=float("inf")) - value
                 if margin + 1e-9 < self.cfg.fusion_instant_margin_m:
                     self.metrics["instant_geometry_ambiguous"] += 1
                     continue
+                if ambiguous_assignment[row, column] and self._strongly_opposite_motion(
+                    left_items[row], right_items[column]
+                ):
+                    # Do not immediately try the second-best spatial pairing.
+                    # Waiting until the people separate is safer than making an
+                    # irreversible cross-person merge during this frame.
+                    self.metrics["instant_opposite_direction_vetoes"] += 1
+                    continue
                 left_key = left_camera, left_items[row].local_id
                 right_key = right_camera, right_items[column].local_id
                 left_gid = self.resolve_gid(self.affinity[left_key])
                 right_gid = self.resolve_gid(self.affinity[right_key])
-                if left_gid != right_gid and self.merge_gids(left_gid, right_gid):
+                if left_gid == right_gid:
+                    continue
+                pair = tuple(sorted((left_gid, right_gid)))
+                evidence_ts = max(
+                    float(left_items[row].capture_ts_s),
+                    float(right_items[column].capture_ts_s),
+                )
+                count, previous_ts = self._instant_merge_votes.get(
+                    pair, (0, float("-inf"))
+                )
+                if evidence_ts - previous_ts > self.cfg.fusion_instant_confirmation_window_s:
+                    count = 0
+                count += 1
+                self._instant_merge_votes[pair] = (count, evidence_ts)
+                confirmations = (
+                    max(1, self.cfg.fusion_instant_confirmations)
+                    if ambiguous_assignment[row, column]
+                    else 1
+                )
+                if count < confirmations:
+                    self.metrics["instant_merges_deferred_for_confirmation"] += 1
+                    continue
+                if self.merge_gids(left_gid, right_gid):
+                    for candidate in list(self._instant_merge_votes):
+                        if left_gid in candidate or right_gid in candidate:
+                            del self._instant_merge_votes[candidate]
                     canonical = self.tracks[self.resolve_gid(left_gid)]
                     # Late geometry can repair identity, but must not apply an
                     # older measurement to the current Kalman state.
@@ -414,6 +499,141 @@ class GlobalTrackManager:
                             (left_items[row].world_xy + right_items[column].world_xy) / 2.0
                         )
                     self.metrics["instant_geometry_merges"] += 1
+
+        if np.isfinite(self._max_event_ts_s):
+            cutoff = (
+                self._max_event_ts_s
+                - self.cfg.fusion_instant_confirmation_window_s
+            )
+            for pair, (_, seen_ts) in list(self._instant_merge_votes.items()):
+                if seen_ts < cutoff:
+                    del self._instant_merge_votes[pair]
+
+    def _near_same_camera_peer(
+        self, observations: list[CameraObservation]
+    ) -> list[bool]:
+        """Mark observations whose identity is position-ambiguous right now."""
+        count = len(observations)
+        if count < 2 or self.cfg.fusion_crossing_guard_m <= 0:
+            return [False] * count
+        xy = np.stack([np.asarray(obs.world_xy, dtype=float) for obs in observations])
+        distance = np.linalg.norm(xy[:, None] - xy[None, :], axis=2)
+        np.fill_diagonal(distance, np.inf)
+        return list(np.min(distance, axis=1) <= self.cfg.fusion_crossing_guard_m)
+
+    def _instant_motion_cost(
+        self, left: CameraObservation, right: CameraObservation
+    ) -> float | None:
+        """Return a motion penalty, or reject a direction-incompatible pair."""
+        return self._velocity_pair_cost(
+            self._stable_observation_velocity(left),
+            self._stable_observation_velocity(right),
+        )
+
+    def _strongly_opposite_motion(
+        self, left: CameraObservation, right: CameraObservation
+    ) -> bool:
+        left_velocity = self._stable_observation_velocity(left)
+        right_velocity = self._stable_observation_velocity(right)
+        if left_velocity is None or right_velocity is None:
+            return False
+        left_velocity = np.asarray(left_velocity, dtype=float)
+        right_velocity = np.asarray(right_velocity, dtype=float)
+        if not np.all(np.isfinite(left_velocity)) or not np.all(np.isfinite(right_velocity)):
+            return False
+        left_speed = float(np.linalg.norm(left_velocity))
+        right_speed = float(np.linalg.norm(right_velocity))
+        if min(left_speed, right_speed) < self.cfg.fusion_instant_min_speed_mps:
+            return False
+        cosine = float(
+            np.dot(left_velocity, right_velocity) / (left_speed * right_speed)
+        )
+        return cosine < self.cfg.fusion_instant_opposite_direction_cosine
+
+    def _stable_observation_velocity(
+        self, observation: CameraObservation
+    ) -> np.ndarray | None:
+        """Estimate motion over a short path instead of trusting one frame.
+
+        A local ID can briefly jitter or swap at an occlusion. Its instantaneous
+        finite-difference velocity then points toward the other person exactly
+        when fusion needs motion most. The displacement over a bounded history
+        window preserves the pre-crossing direction for a few frames and acts
+        as inexpensive trajectory hysteresis.
+        """
+        history = self.tracklets.get((observation.camera, int(observation.local_id)))
+        if history is None or len(history.points) < 2:
+            return observation.world_velocity
+        event_ts = float(observation.capture_ts_s)
+        points = [
+            point for point in history.points
+            if point.timestamp_s <= event_ts + 1e-9
+        ]
+        if len(points) < 2:
+            return observation.world_velocity
+        latest = points[-1]
+        minimum_span = max(0.0, self.cfg.fusion_motion_min_span_s)
+        candidates = [
+            point for point in points[:-1]
+            if latest.timestamp_s - point.timestamp_s >= minimum_span - 1e-9
+        ]
+        if not candidates:
+            return observation.world_velocity
+        target_ts = latest.timestamp_s - max(
+            minimum_span, self.cfg.fusion_motion_window_s
+        )
+        reference = min(
+            candidates,
+            key=lambda point: abs(point.timestamp_s - target_ts),
+        )
+        span_s = latest.timestamp_s - reference.timestamp_s
+        if span_s <= 1e-9:
+            return observation.world_velocity
+        velocity = (latest.xy - reference.xy) / span_s
+        if not np.all(np.isfinite(velocity)):
+            return observation.world_velocity
+        self.metrics["stable_motion_estimates_used"] += 1
+        return velocity
+
+    def _velocity_pair_cost(
+        self,
+        left_velocity_value: np.ndarray | None,
+        right_velocity_value: np.ndarray | None,
+        *,
+        require_evidence: bool = False,
+        weight_s: float | None = None,
+    ) -> float | None:
+        if left_velocity_value is None or right_velocity_value is None:
+            return None if require_evidence else 0.0
+        left_velocity = np.asarray(left_velocity_value, dtype=float)
+        right_velocity = np.asarray(right_velocity_value, dtype=float)
+        if not np.all(np.isfinite(left_velocity)) or not np.all(np.isfinite(right_velocity)):
+            return None if require_evidence else 0.0
+        left_speed = float(np.linalg.norm(left_velocity))
+        right_speed = float(np.linalg.norm(right_velocity))
+        if min(left_speed, right_speed) < self.cfg.fusion_instant_min_speed_mps:
+            return None if require_evidence else 0.0
+        velocity_error = float(np.linalg.norm(left_velocity - right_velocity))
+        direction_cosine = float(
+            np.dot(left_velocity, right_velocity) / (left_speed * right_speed)
+        )
+        # Use motion as a soft assignment preference. A hard rejection causes
+        # fragmentation when homography-derived velocity is noisy; a capped
+        # penalty still makes the same-direction candidate win at crossings
+        # while preserving the sole spatially plausible match.
+        clipped_velocity_error = min(
+            velocity_error,
+            max(self.cfg.fusion_instant_velocity_gate_mps * 2.0, 1e-6),
+        )
+        direction_penalty = max(
+            0.0,
+            self.cfg.fusion_instant_direction_cosine - direction_cosine,
+        )
+        if weight_s is None:
+            weight_s = self.cfg.fusion_instant_velocity_weight_s
+        return weight_s * (
+            clipped_velocity_error + direction_penalty
+        )
 
     def merge_gids(self, first_gid: int, second_gid: int) -> bool:
         """Merge IDs into the oldest canonical ID; safe and idempotent."""
@@ -427,10 +647,13 @@ class GlobalTrackManager:
             self.metrics["same_camera_merge_conflicts"] += 1
             return False
 
-        canonical, retired = sorted((first, second))
+        canonical = min((first, second), key=self._canonical_merge_priority)
+        retired = second if canonical == first else first
         keep = self.tracks[canonical]
         lose = self.tracks[retired]
         was_late = keep.emitted or lose.emitted
+        if keep.emitted and not lose.emitted:
+            self.metrics["published_id_preserved_on_merge"] += 1
         if (
             lose.state_timestamp_s is not None
             and (keep.state_timestamp_s is None or lose.state_timestamp_s > keep.state_timestamp_s)
@@ -464,6 +687,21 @@ class GlobalTrackManager:
         if was_late:
             self.metrics["late_reassociations"] += 1
         return True
+
+    def _canonical_merge_priority(self, gid: int) -> tuple[bool, float, int]:
+        """Prefer an already published ID, then the oldest track.
+
+        Merging two provisional identities is internal bookkeeping. Once one
+        identity has reached an external consumer, however, renaming it causes
+        a visible Global ID jump even if the reassociation itself is correct.
+        """
+        track = self.tracks[gid]
+        created_at = (
+            float(track.created_at_s)
+            if track.created_at_s is not None
+            else float("inf")
+        )
+        return (not track.emitted, created_at, gid)
 
     def _trim_trail(self, track: GlobalTrack) -> None:
         if self.cfg.trail_length <= 0:

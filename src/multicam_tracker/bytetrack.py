@@ -60,16 +60,22 @@ class ConstantVelocityKalman:
         self._indices = np.arange(m)
         self._identity = np.eye(2 * m)
 
-    def predict(self, dt: float = 1.0) -> np.ndarray:
+    def predict(
+        self, dt: float = 1.0, process_noise_scale: float = 1.0
+    ) -> np.ndarray:
         """Predict by an actual time delta (seconds or legacy ticks)."""
         if not np.isfinite(dt) or dt < 0:
             raise ValueError(f"Kalman dt must be non-negative, got {dt}")
+        if not np.isfinite(process_noise_scale) or process_noise_scale < 0:
+            raise ValueError(
+                f"Kalman process-noise scale must be non-negative, got {process_noise_scale}"
+            )
         if dt == 0:
             return self.position
         transition = self._transition
         index = self._indices
         transition[index, index + self.m] = dt
-        q = self.process_noise
+        q = self.process_noise * process_noise_scale
         process_cov = self._process_cov
         process_cov[index, index] = q * dt**4 / 4
         process_cov[index, index + self.m] = q * dt**3 / 2
@@ -79,9 +85,33 @@ class ConstantVelocityKalman:
         self.P = transition @ self.P @ transition.T + process_cov
         return self.x[: self.m]
 
-    def update(self, z: np.ndarray) -> None:
+    def update(
+        self,
+        z: np.ndarray,
+        measurement_noise_scale: float = 1.0,
+        nis_threshold: float | None = None,
+    ) -> None:
+        """Correct the state, robustly down-weighting a statistical outlier.
+
+        ``nis_threshold`` is a normalized-innovation-squared threshold. Above
+        it, measurement covariance is inflated for this update only; the
+        observation still contributes, but a merged/partial bbox cannot pull
+        the predicted walking direction across another person in one frame.
+        """
+        if not np.isfinite(measurement_noise_scale) or measurement_noise_scale <= 0:
+            raise ValueError(
+                "Kalman measurement-noise scale must be positive, "
+                f"got {measurement_noise_scale}"
+            )
         innovation = z - self.H @ self.x
-        S = self.H @ self.P @ self.H.T + self.R
+        measurement_cov = self.R * measurement_noise_scale
+        S = self.H @ self.P @ self.H.T + measurement_cov
+        if nis_threshold is not None and nis_threshold > 0:
+            nis = float(innovation @ np.linalg.solve(S, innovation))
+            if np.isfinite(nis) and nis > nis_threshold:
+                inflation = min(nis / nis_threshold, 100.0)
+                measurement_cov = measurement_cov * inflation
+                S = self.H @ self.P @ self.H.T + measurement_cov
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ innovation
         self.P = (self._identity - K @ self.H) @ self.P
@@ -126,12 +156,13 @@ def match_by_iou(tracks_xyxy: np.ndarray, dets_xyxy: np.ndarray, min_iou: float)
     )
 
 
-def _xyxy_to_cxcywh(box: np.ndarray) -> np.ndarray:
+def _xyxy_to_box_state(box: np.ndarray) -> np.ndarray:
+    """Convert xyxy to the stable [center_x, center_y, width, height] state."""
     x1, y1, x2, y2 = box[:4]
     return np.array([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1])
 
 
-def _cxcywh_to_xyxy(box: np.ndarray) -> np.ndarray:
+def _box_state_to_xyxy(box: np.ndarray) -> np.ndarray:
     cx, cy, w, h = box
     return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
 
@@ -149,7 +180,7 @@ class Track:
     @property
     def xyxy(self) -> np.ndarray:
         """Current best box estimate — the prediction until `kf.update` runs."""
-        return _cxcywh_to_xyxy(self.kf.position)
+        return _box_state_to_xyxy(self.kf.position)
 
 
 class ByteTracker:
@@ -192,7 +223,18 @@ class ByteTracker:
         # 1. Predict where every known track should be this tick. Until a
         #    track is matched and updated, `track.xyxy` is this prediction.
         for track in self.tracks:
-            track.kf.predict(dt)
+            timebase_scale = 1.0
+            if timestamp_s is not None:
+                timebase_scale = (
+                    cfg.track_kf_time_process_noise
+                    / max(cfg.track_kf_process_noise, 1e-9)
+                )
+            track.kf.predict(
+                dt,
+                process_noise_scale=(
+                    timebase_scale * self._box_noise_scale(track.kf.position[3])
+                ),
+            )
 
         high = detections[detections[:, 4] >= cfg.track_high_conf]
         low = detections[detections[:, 4] < cfg.track_high_conf]
@@ -217,7 +259,9 @@ class ByteTracker:
             np.stack([self.tracks[t].xyxy for t in unmatched_tracks])
             if unmatched_tracks else np.empty((0, 4))
         )
-        pairs2, still_unmatched, _ = match_by_iou(leftover_boxes, low[:, :4], cfg.track_min_iou)
+        pairs2, still_unmatched, _ = match_by_iou(
+            leftover_boxes, low[:, :4], cfg.track_min_iou
+        )
         for local_t, d_idx in pairs2:
             self._mark_matched(self.tracks[unmatched_tracks[local_t]], low[d_idx])
         unmatched_tracks = [unmatched_tracks[i] for i in still_unmatched]
@@ -241,7 +285,7 @@ class ByteTracker:
             self.tracks.append(Track(
                 track_id=self._next_id,
                 kf=ConstantVelocityKalman(
-                    _xyxy_to_cxcywh(det),
+                    _xyxy_to_box_state(det),
                     process_noise=cfg.track_kf_process_noise,
                     measurement_noise=cfg.track_kf_measurement_noise,
                 ),
@@ -253,10 +297,29 @@ class ByteTracker:
         return [t for t in self.tracks if t.confirmed and t.misses == 0]
 
     def _mark_matched(self, track: Track, det: np.ndarray) -> None:
-        track.kf.update(_xyxy_to_cxcywh(det))
+        confidence_scale = 1.0 + self.cfg.track_kf_confidence_noise_gain * (
+            1.0 - float(np.clip(det[4], 0.0, 1.0))
+        )
+        measurement_scale = self._box_noise_scale(det[3] - det[1]) * confidence_scale
+        track.kf.update(
+            _xyxy_to_box_state(det),
+            measurement_noise_scale=measurement_scale,
+            nis_threshold=self.cfg.track_kf_robust_nis_threshold,
+        )
         track.conf = float(det[4])
         track.hits += 1
         track.misses = 0
         track.missed_seconds = 0.0
         if track.hits >= self.cfg.track_min_hits:
             track.confirmed = True
+
+    def _box_noise_scale(self, height_px: float) -> float:
+        if not self.cfg.track_kf_adaptive_noise:
+            return 1.0
+        reference = max(self.cfg.track_kf_reference_height_px, 1e-6)
+        scale = (max(float(height_px), 1.0) / reference) ** 2
+        return float(np.clip(
+            scale,
+            self.cfg.track_kf_noise_scale_min,
+            self.cfg.track_kf_noise_scale_max,
+        ))
