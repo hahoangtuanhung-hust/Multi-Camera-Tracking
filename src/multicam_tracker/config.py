@@ -50,12 +50,15 @@ class PipelineConfig:
     model_name: str = "yolo26n.pt"  # NMS-free end-to-end YOLO, nano size
     device: str = "cpu"             # portable default; opt into "mps"/"cuda"
     imgsz: int = 640
-    conf_threshold: float = 0.25    # low floor feeds ByteTrack's rescue stage
+    conf_threshold: float = 0.25    # low floor can feed OC-SORT's BYTE recovery stage
     person_class_id: int = 0        # COCO class 0 == person
     cpu_threads: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     opencv_threads: int = 1
 
-    # --- single-camera tracking (bytetrack.py) ---
+    # --- single-camera tracking ---
+    # OC-SORT is the default local tracker.  The old simplified ByteTrack
+    # implementation remains selectable for reproducible A/B evaluation.
+    local_tracker: str = "ocsort"
     # At the default stride=1 on 30 fps video the pipeline receives 30 ticks/s.
     track_high_conf: float = 0.5    # first-pass association + track-birth threshold
     track_min_iou: float = 0.25    # gate: reject matches with IoU below this
@@ -88,6 +91,22 @@ class PipelineConfig:
     track_association_max_size_log_change: float = 1.10
     track_motion_reactivation_s: float = 1.0
     track_motion_min_speed: float = 0.10
+    # OC-SORT uses detector observations, rather than only Kalman predictions,
+    # to preserve motion direction through crossings and repair the state after
+    # an occlusion. ``delta_t`` is the observation look-back in camera ticks.
+    ocsort_delta_t: int = 3
+    ocsort_inertia: float = 0.10
+    ocsort_use_byte: bool = True
+    # OCR is a cheap second association against the last real observation.
+    ocsort_observation_recovery_enabled: bool = True
+    # ORU is retained for explicit ablation, but this scene's 300-tick A/B
+    # showed persistent wrong ownership despite fewer raw ID switches. Keep it
+    # off until a long-sequence IDF1/HOTA evaluation proves otherwise.
+    ocsort_oru_enabled: bool = False
+    # A one-frame merged detection is common at crossings. Rebuilding the
+    # filter from it can lock in the wrong direction, so ORU starts only after
+    # a genuine multi-frame observation gap.
+    ocsort_oru_min_misses: int = 2
 
     # --- cross-camera fusion (fusion.py) ---
     fusion_gate_m: float = 2.0      # max world-plane distance (meters) to match
@@ -103,6 +122,27 @@ class PipelineConfig:
     # forcing latency/recall loss in the default real-time profile.
     fusion_provisional_buffer_enabled: bool = False
     fusion_provisional_min_age_s: float = 0.0
+    # Do not delay identities already present when a run starts. After this
+    # bootstrap interval, the normal decision buffer applies to every birth.
+    fusion_provisional_buffer_bootstrap_s: float = 0.0
+    # When enabled, a new fragment receives an internal negative identifier.
+    # A public positive GID is allocated only after the decision buffer and
+    # entry/capacity checks pass.  This prevents short false fragments from
+    # consuming externally visible identities.
+    fusion_deferred_gid_allocation_enabled: bool = False
+    # 0 keeps the population unconstrained. A positive value caps concurrently
+    # retained public identities; pending fragments remain hidden until a slot
+    # is released by a confirmed exit.
+    fusion_fixed_population_size: int = 0
+    fusion_new_gid_entry_required: bool = False
+    # During startup, people may already be inside the scene rather than at an
+    # image boundary, so seed the initial population without entry evidence.
+    fusion_new_gid_bootstrap_s: float = 0.0
+    # Public identities that disappear inside the scene stay dormant for
+    # reconnect. Boundary evidence releases them normally; the forced timeout
+    # is a bounded-memory safety valve for imperfect boundary calibration.
+    fusion_retire_requires_exit_boundary: bool = False
+    fusion_forced_retire_s: float = 30.0
     fusion_batch_reconnect_enabled: bool = False
     # Experimental. Repeated spatial confirmation after a motion-gate failure
     # increased short-horizon ID switches in the real-scene ablation.
@@ -150,6 +190,11 @@ class PipelineConfig:
     fusion_local_reconnect_velocity_weight_s: float = 0.0
     fusion_local_reconnect_velocity_gate_mps: float = 1.25
     fusion_local_reconnect_direction_cosine: float = 0.0
+    # When enabled, a new local fragment cannot take ownership of an already
+    # published GID from a single plausible observation. It must keep selecting
+    # the same canonical candidate for ``fusion_local_reconnect_confirmations``
+    # consecutive updates inside the confirmation window.
+    fusion_gid_ownership_hysteresis_enabled: bool = False
     # Long-gap reconnect is allowed only when the old fragment ended and the
     # new fragment began near an image entry/exit boundary.
     fusion_boundary_margin_ratio: float = 0.06
@@ -170,6 +215,11 @@ class PipelineConfig:
     offset_refine_window_s: float = 0.2
     offset_ewma_alpha: float = 0.15
     offset_min_confidence: float = 0.55
+    # Maximum spread between independently matched trajectory shifts in one
+    # camera-pair cycle. The selected default prevents spatial calibration
+    # bias from masquerading as a clock offset; the baseline profile restores
+    # the legacy unlimited value for exact A/B and rollback.
+    clock_max_pair_delta_spread_s: float = 0.40
     offset_max_drift_ppm: float = 5_000.0
     offset_min_drift_span_s: float = 5.0
 
@@ -185,6 +235,12 @@ class PipelineConfig:
     tracklet_confidence_weight: float = 0.05
     single_person_mode: bool = False
 
+    # --- optional bounded identity diagnostics ---
+    # JSONL is streamed directly to disk; no unbounded event list is retained.
+    identity_diagnostics_path: Path | None = None
+    identity_diagnostics_max_events: int = 250_000
+    identity_diagnostics_flush_every: int = 128
+
     # --- visualization ---
     trail_length: int = 120         # BEV trail length in ticks (~4 s at 30 fps)
     jpeg_quality: int = 70          # camera feed compression for the viewer
@@ -199,6 +255,7 @@ _IDENTITY_V2_BASE: dict[str, object] = {
     "fusion_identity_retention_s": 8.0,
     "fusion_provisional_buffer_enabled": True,
     "fusion_provisional_min_age_s": 0.0,
+    "fusion_provisional_buffer_bootstrap_s": 0.0,
     "fusion_batch_reconnect_enabled": True,
     "fusion_adaptive_hysteresis_enabled": True,
     "fusion_published_motion_gate_enabled": True,
@@ -209,6 +266,8 @@ _IDENTITY_V2_BASE: dict[str, object] = {
     "fusion_local_reconnect_covariance_enabled": True,
     "fusion_local_reconnect_confirmations": 2,
     "fusion_local_reconnect_velocity_weight_s": 0.15,
+    "fusion_gid_ownership_hysteresis_enabled": False,
+    "clock_max_pair_delta_spread_s": float("inf"),
 }
 
 
@@ -220,6 +279,7 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "track_motion_association_enabled": False,
         "fusion_identity_retention_s": 3.0,
         "fusion_provisional_buffer_enabled": False,
+        "fusion_provisional_buffer_bootstrap_s": 0.0,
         "fusion_batch_reconnect_enabled": False,
         "fusion_adaptive_hysteresis_enabled": False,
         "fusion_published_motion_gate_enabled": False,
@@ -230,6 +290,10 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "fusion_local_reconnect_covariance_enabled": False,
         "fusion_local_reconnect_confirmations": 1,
         "fusion_local_reconnect_velocity_weight_s": 0.0,
+        "fusion_gid_ownership_hysteresis_enabled": False,
+        "fusion_instant_confirmations": 1,
+        "fusion_published_merge_confirmations": 1,
+        "clock_max_pair_delta_spread_s": float("inf"),
     },
     # Experimental candidate: v1's permissive clear-pair geometry policy plus
     # the new reversible duplicate-output suppression. Irreversible duplicate
@@ -239,6 +303,7 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "track_motion_association_enabled": False,
         "fusion_identity_retention_s": 3.0,
         "fusion_provisional_buffer_enabled": False,
+        "fusion_provisional_buffer_bootstrap_s": 0.0,
         "fusion_batch_reconnect_enabled": False,
         "fusion_adaptive_hysteresis_enabled": False,
         "fusion_published_motion_gate_enabled": False,
@@ -249,6 +314,62 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "fusion_local_reconnect_covariance_enabled": False,
         "fusion_local_reconnect_confirmations": 1,
         "fusion_local_reconnect_velocity_weight_s": 0.0,
+        "fusion_gid_ownership_hysteresis_enabled": False,
+        "fusion_instant_confirmations": 1,
+        "fusion_published_merge_confirmations": 1,
+        "clock_max_pair_delta_spread_s": float("inf"),
+    },
+    # ID-drift candidate: preserve the validated v1 identity policy while
+    # rejecting camera-clock updates when independently matched people imply
+    # mutually inconsistent time shifts. This retains 1-3 s offset learning
+    # for a single/consistent path without feeding crossing ambiguity back
+    # into subsequent event-time association.
+    "identity-v1-drift-guard": {
+        "track_motion_association_enabled": False,
+        "fusion_identity_retention_s": 3.0,
+        "fusion_provisional_buffer_enabled": False,
+        "fusion_provisional_buffer_bootstrap_s": 0.0,
+        "fusion_batch_reconnect_enabled": False,
+        "fusion_adaptive_hysteresis_enabled": False,
+        "fusion_published_motion_gate_enabled": False,
+        "fusion_duplicate_suppression_enabled": False,
+        "fusion_duplicate_merge_m": 0.0,
+        "fusion_local_reconnect_long_window_s": 3.0,
+        "fusion_local_reconnect_window_s": 3.0,
+        "fusion_local_reconnect_covariance_enabled": False,
+        "fusion_local_reconnect_confirmations": 1,
+        "fusion_local_reconnect_velocity_weight_s": 0.0,
+        "fusion_gid_ownership_hysteresis_enabled": False,
+        "fusion_instant_confirmations": 1,
+        "fusion_published_merge_confirmations": 1,
+        "clock_max_pair_delta_spread_s": 0.40,
+    },
+    # Keep v1's proven geometry policy and clock guard, but protect externally
+    # visible identities. Startup tracks publish normally; later births remain
+    # hidden for 0.5 s while a local fragment must select the same published
+    # owner three times. Published/published crossing merges require five
+    # consecutive observations before the irreversible canonical merge.
+    "identity-v1-ownership": {
+        "track_motion_association_enabled": False,
+        "fusion_identity_retention_s": 3.0,
+        "fusion_provisional_buffer_enabled": True,
+        "fusion_provisional_min_age_s": 0.50,
+        "fusion_provisional_buffer_bootstrap_s": 1.0,
+        "fusion_batch_reconnect_enabled": False,
+        "fusion_adaptive_hysteresis_enabled": False,
+        "fusion_published_motion_gate_enabled": False,
+        "fusion_duplicate_suppression_enabled": False,
+        "fusion_duplicate_merge_m": 0.0,
+        "fusion_local_reconnect_long_window_s": 3.0,
+        "fusion_local_reconnect_window_s": 3.0,
+        "fusion_local_reconnect_covariance_enabled": False,
+        "fusion_local_reconnect_confirmations": 3,
+        "fusion_local_reconnect_confirmation_window_s": 0.35,
+        "fusion_local_reconnect_velocity_weight_s": 0.0,
+        "fusion_gid_ownership_hysteresis_enabled": True,
+        "fusion_instant_confirmations": 3,
+        "fusion_published_merge_confirmations": 5,
+        "clock_max_pair_delta_spread_s": 0.40,
     },
     # Reproduces the decision structure immediately before the identity-v2
     # work, while keeping all code paths available for a fair ablation.
@@ -293,7 +414,46 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         **_IDENTITY_V2_BASE,
         "fusion_provisional_min_age_s": 0.20,
     },
+    # Experimental fixed-population policy.  New fragments are kept under an
+    # internal ID for 0.75 s, allowing motion/tracklet reassociation to absorb
+    # local fragmentation before a public GID exists. After startup, a public
+    # GID needs boundary entry evidence and an available population slot. A
+    # public identity disappearing away from a boundary remains dormant for
+    # reconnect instead of immediately freeing a slot.
+    "fixed-population-buffered": {
+        "track_motion_association_enabled": False,
+        "fusion_identity_retention_s": 8.0,
+        "fusion_provisional_buffer_enabled": True,
+        "fusion_provisional_min_age_s": 0.75,
+        "fusion_provisional_buffer_bootstrap_s": 0.0,
+        "fusion_deferred_gid_allocation_enabled": True,
+        "fusion_fixed_population_size": 25,
+        "fusion_new_gid_entry_required": True,
+        "fusion_new_gid_bootstrap_s": 2.0,
+        "fusion_retire_requires_exit_boundary": True,
+        # Strict mode: do not release a public slot merely because time passed.
+        # The 25-slot cap keeps this state bounded without a timeout eviction.
+        "fusion_forced_retire_s": 0.0,
+        "fusion_batch_reconnect_enabled": True,
+        "fusion_adaptive_hysteresis_enabled": False,
+        "fusion_published_motion_gate_enabled": False,
+        "fusion_duplicate_suppression_enabled": True,
+        "fusion_duplicate_merge_m": 0.30,
+        "fusion_local_reconnect_long_window_s": 8.0,
+        "fusion_local_reconnect_window_s": 1.0,
+        "fusion_local_reconnect_covariance_enabled": True,
+        "fusion_local_reconnect_confirmations": 2,
+        "fusion_local_reconnect_velocity_weight_s": 0.15,
+        "fusion_gid_ownership_hysteresis_enabled": False,
+        "clock_max_pair_delta_spread_s": float("inf"),
+    },
 }
+
+# The CPU 1,000-frame release benchmark selected this policy over the exact
+# historical baseline.  Keeping the name in one place prevents the local,
+# evaluation, preview, benchmark, and Modal entrypoints from silently drifting
+# to different identity policies.
+DEFAULT_TRACKING_PROFILE = "identity-v1-drift-guard"
 
 
 def apply_tracking_profile(cfg: PipelineConfig, profile: str) -> PipelineConfig:

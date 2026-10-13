@@ -17,6 +17,7 @@ from scipy.optimize import linear_sum_assignment
 
 from .bytetrack import ConstantVelocityKalman
 from .config import PipelineConfig
+from .diagnostics import IdentityEventWriter
 from .tracklets import CameraClockOffsetEstimator, MatchResult, TrackletKey, TrackletMatcher, TrackletStore
 
 
@@ -60,6 +61,8 @@ class GlobalTrack:
     last_arrival_ts_s: float | None = None
     emitted: bool = False
     emitted_at_s: float | None = None
+    birth_near_boundary: bool = False
+    retirement_deferred: bool = False
     camera_endpoints: dict[str, TrackEndpoint] = field(default_factory=dict)
 
     @property
@@ -71,7 +74,26 @@ class GlobalTrackManager:
     """Fuse observations and maintain canonical, alias-safe global IDs."""
 
     def __init__(self, cfg: PipelineConfig):
+        if cfg.fusion_provisional_min_age_s < 0:
+            raise ValueError("fusion_provisional_min_age_s must be >= 0")
+        if cfg.fusion_provisional_buffer_bootstrap_s < 0:
+            raise ValueError("fusion_provisional_buffer_bootstrap_s must be >= 0")
+        if cfg.fusion_fixed_population_size < 0:
+            raise ValueError("fusion_fixed_population_size must be >= 0")
+        if cfg.fusion_new_gid_bootstrap_s < 0:
+            raise ValueError("fusion_new_gid_bootstrap_s must be >= 0")
+        if cfg.fusion_forced_retire_s < 0:
+            raise ValueError("fusion_forced_retire_s must be >= 0")
+        if cfg.identity_diagnostics_max_events < 0:
+            raise ValueError("identity_diagnostics_max_events must be >= 0")
+        if cfg.clock_max_pair_delta_spread_s < 0:
+            raise ValueError("clock_max_pair_delta_spread_s must be >= 0")
         self.cfg = cfg
+        self._diagnostics = IdentityEventWriter(
+            cfg.identity_diagnostics_path,
+            max_events=cfg.identity_diagnostics_max_events,
+            flush_every=cfg.identity_diagnostics_flush_every,
+        )
         self.tracks: dict[int, GlobalTrack] = {}
         self.affinity: dict[TrackletKey, int] = {}
         self.aliases: dict[int, int] = {}
@@ -83,7 +105,9 @@ class GlobalTrackManager:
         self.matcher = TrackletMatcher(cfg)
         self.metrics: defaultdict[str, int | float] = defaultdict(int)
         self._next_gid = 1
+        self._next_provisional_gid = -1
         self._event_mode_started = False
+        self._event_start_ts_s: float | None = None
         self._max_event_ts_s = float("-inf")
         self._max_arrival_ts_s = float("-inf")
         self._last_match_run_s = float("-inf")
@@ -93,6 +117,41 @@ class GlobalTrackManager:
         self._fragment_reconnect_votes: dict[
             TrackletKey, tuple[int, int, float]
         ] = {}
+        self._identity_event(
+            "run_start",
+            cameras=list(cfg.cameras),
+            tracklet_history_s=cfg.tracklet_history_s,
+            fusion_max_age_s=cfg.fusion_max_age_s,
+            fusion_identity_retention_s=cfg.fusion_identity_retention_s,
+        )
+
+    def _identity_event(
+        self,
+        event: str,
+        *,
+        event_ts_s: float | None = None,
+        arrival_ts_s: float | None = None,
+        **fields,
+    ) -> None:
+        if not self._diagnostics.enabled:
+            return
+        if event_ts_s is None and np.isfinite(self._max_event_ts_s):
+            event_ts_s = self._max_event_ts_s
+        if arrival_ts_s is None and np.isfinite(self._max_arrival_ts_s):
+            arrival_ts_s = self._max_arrival_ts_s
+        self._diagnostics.write(
+            event,
+            event_ts_s=event_ts_s,
+            arrival_ts_s=arrival_ts_s,
+            **fields,
+        )
+
+    def close(self) -> None:
+        self._diagnostics.close()
+
+    def record_diagnostic_event(self, event: str, **fields) -> None:
+        """Append a non-fusion event to the shared bounded diagnostics log."""
+        self._identity_event(event, **fields)
 
     def resolve_gid(self, gid: int) -> int:
         """Resolve and path-compress a possibly retired alias."""
@@ -138,6 +197,12 @@ class GlobalTrackManager:
             self._max_arrival_ts_s = max(self._max_arrival_ts_s, float(arrival_timestamp_s))
         if ordered:
             self._max_event_ts_s = max(self._max_event_ts_s, float(ordered[-1].capture_ts_s))
+        if self._event_start_ts_s is None:
+            start_candidates = [float(obs.capture_ts_s) for obs in ordered]
+            if timestamp_s is not None:
+                start_candidates.append(float(timestamp_s))
+            if start_candidates:
+                self._event_start_ts_s = min(start_candidates)
         if np.isfinite(self._max_event_ts_s):
             self.tracklets.advance(self._max_event_ts_s)
         changed_keys: set[TrackletKey] = set()
@@ -187,7 +252,9 @@ class GlobalTrackManager:
                     not requires_confirmation
                     and key not in self._fragment_reconnect_votes
                 ):
-                    gid = self._commit_fragment_reconnect(key, gid, candidate)
+                    gid = self._commit_fragment_reconnect(
+                        key, gid, candidate, event_ts=event_ts
+                    )
                 else:
                     reconnected = self._record_fragment_reconnect_vote(
                         key, gid, candidate, event_ts
@@ -220,20 +287,19 @@ class GlobalTrackManager:
 
         self._expire_event_tracks()
         self._canonicalize_affinity()
+        self._promote_ready_provisionals()
         self._prune_identity_metadata()
+        self._update_population_metrics()
         visible: list[GlobalTrack] = []
         for gid, track in sorted(self.tracks.items()):
             if self.resolve_gid(gid) != gid or not track.confirmed or track.last_seen_ts_s is None:
                 continue
+            if self.cfg.fusion_deferred_gid_allocation_enabled and gid < 0:
+                continue
             if gid in self._duplicate_suppressed_gids:
                 self.metrics["duplicate_outputs_suppressed"] += 1
                 continue
-            if (
-                self.cfg.fusion_provisional_buffer_enabled
-                and track.created_at_s is not None
-                and self._max_event_ts_s - track.created_at_s
-                + 1e-9 < self.cfg.fusion_provisional_min_age_s
-            ):
+            if self._publication_buffer_active(track):
                 self.metrics["provisional_publication_deferred"] += 1
                 continue
             output_age = self._max_arrival_ts_s - (
@@ -245,6 +311,18 @@ class GlobalTrackManager:
                     track.emitted_at_s = self._max_event_ts_s
                     self.metrics["provisional_ids_published"] += 1
                     self.metrics["unique_published_gids"] += 1
+                    self._identity_event(
+                        "publish",
+                        gid=gid,
+                        created_at_s=track.created_at_s,
+                        age_s=(
+                            None
+                            if track.created_at_s is None
+                            else self._max_event_ts_s - track.created_at_s
+                        ),
+                        cameras=sorted(track.cameras),
+                        covariance_trace=float(np.trace(track.kf.P)),
+                    )
                 track.emitted = True
                 track.trail.append(track.world_xy.copy())
                 self._trim_trail(track)
@@ -254,9 +332,33 @@ class GlobalTrackManager:
         self.metrics["tracklet_bytes"] = self.tracklets.approximate_bytes
         return visible
 
+    def _publication_buffer_active(self, track: GlobalTrack) -> bool:
+        """True while a post-bootstrap birth is still under ID review."""
+        if (
+            not self.cfg.fusion_provisional_buffer_enabled
+            or track.created_at_s is None
+        ):
+            return False
+        in_bootstrap = (
+            self.cfg.fusion_provisional_buffer_bootstrap_s > 0
+            and self._event_start_ts_s is not None
+            and track.created_at_s - self._event_start_ts_s
+            <= self.cfg.fusion_provisional_buffer_bootstrap_s + 1e-9
+        )
+        if in_bootstrap:
+            return False
+        return (
+            self._max_event_ts_s - track.created_at_s + 1e-9
+            < self.cfg.fusion_provisional_min_age_s
+        )
+
     def _birth_provisional(self, obs: CameraObservation) -> int:
-        gid = self._next_gid
-        self._next_gid += 1
+        if self.cfg.fusion_deferred_gid_allocation_enabled:
+            gid = self._next_provisional_gid
+            self._next_provisional_gid -= 1
+        else:
+            gid = self._next_gid
+            self._next_gid += 1
         event_ts = float(obs.capture_ts_s)
         track = GlobalTrack(
             gid=gid,
@@ -273,13 +375,127 @@ class GlobalTrackManager:
             last_arrival_ts_s=(
                 float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
             ),
+            birth_near_boundary=bool(obs.near_boundary),
             camera_endpoints={obs.camera: self._endpoint_from_observation(obs)},
         )
         self.tracks[gid] = track
         key = obs.camera, int(obs.local_id)
         self.affinity[key] = gid
         self.members[gid].add(key)
+        self._identity_event(
+            "birth",
+            event_ts_s=event_ts,
+            arrival_ts_s=track.last_arrival_ts_s,
+            camera=obs.camera,
+            local_id=int(obs.local_id),
+            gid=gid,
+            xy=obs.world_xy,
+            velocity=obs.world_velocity,
+            near_boundary=bool(obs.near_boundary),
+            provisional=not track.emitted,
+            covariance_trace=float(np.trace(track.kf.P)),
+        )
         return gid
+
+    def _promote_ready_provisionals(self) -> None:
+        """Allocate public GIDs only after the bounded identity decision."""
+        if not self.cfg.fusion_deferred_gid_allocation_enabled:
+            return
+        public_slots = sum(
+            gid > 0 and self.resolve_gid(gid) == gid for gid in self.tracks
+        )
+        pending = sorted(
+            (
+                track for gid, track in self.tracks.items()
+                if gid < 0 and self.resolve_gid(gid) == gid
+            ),
+            key=lambda track: (
+                float(track.created_at_s) if track.created_at_s is not None else float("inf"),
+                track.gid,
+            ),
+        )
+        for track in pending:
+            if not track.confirmed or track.created_at_s is None or track.last_seen_ts_s is None:
+                continue
+            age_s = self._max_event_ts_s - track.created_at_s
+            if age_s + 1e-9 < self.cfg.fusion_provisional_min_age_s:
+                self.metrics["provisional_publication_deferred"] += 1
+                continue
+            last_arrival = (
+                track.last_arrival_ts_s
+                if track.last_arrival_ts_s is not None else track.last_seen_ts_s
+            )
+            if self._max_arrival_ts_s - last_arrival > self.cfg.fusion_output_grace_s + 1e-9:
+                continue
+            in_bootstrap = (
+                self._event_start_ts_s is not None
+                and self._max_event_ts_s - self._event_start_ts_s
+                <= self.cfg.fusion_new_gid_bootstrap_s + 1e-9
+            )
+            if (
+                self.cfg.fusion_new_gid_entry_required
+                and not in_bootstrap
+                and not track.birth_near_boundary
+            ):
+                self.metrics["new_gid_entry_deferred"] += 1
+                continue
+            capacity = self.cfg.fusion_fixed_population_size
+            if capacity > 0 and public_slots >= capacity:
+                self.metrics["new_gid_capacity_deferred"] += 1
+                continue
+            self._promote_provisional_gid(track.gid)
+            public_slots += 1
+
+    def _promote_provisional_gid(self, provisional_gid: int) -> int:
+        provisional_gid = self.resolve_gid(provisional_gid)
+        if provisional_gid >= 0 or provisional_gid not in self.tracks:
+            return provisional_gid
+        public_gid = self._next_gid
+        self._next_gid += 1
+        track = self.tracks.pop(provisional_gid)
+        track.gid = public_gid
+        self.tracks[public_gid] = track
+        self.members[public_gid].update(self.members.pop(provisional_gid, set()))
+        self.aliases[provisional_gid] = public_gid
+        self._alias_created_s[provisional_gid] = self._max_event_ts_s
+        self._canonicalize_affinity()
+        # Votes are cheap and short-lived. Dropping them avoids carrying a
+        # stale provisional pair across the externally visible rename.
+        self._instant_merge_votes.clear()
+        self._duplicate_merge_votes.clear()
+        self.metrics["public_gid_allocations"] += 1
+        return public_gid
+
+    def public_affinity_snapshot(self) -> dict[TrackletKey, int]:
+        """Return only associations safe to expose to viewers/consumers."""
+        if (
+            not self.cfg.fusion_deferred_gid_allocation_enabled
+            and not self.cfg.fusion_provisional_buffer_enabled
+        ):
+            return dict(self.affinity)
+        published: dict[TrackletKey, int] = {}
+        for key, mapped_gid in self.affinity.items():
+            gid = self.resolve_gid(mapped_gid)
+            track = self.tracks.get(gid)
+            if gid > 0 and track is not None and track.emitted:
+                published[key] = gid
+        return published
+
+    def _update_population_metrics(self) -> None:
+        pending = sum(
+            gid < 0 and self.resolve_gid(gid) == gid for gid in self.tracks
+        )
+        public = sum(
+            gid > 0 and self.resolve_gid(gid) == gid for gid in self.tracks
+        )
+        self.metrics["pending_provisional_tracks"] = pending
+        self.metrics["public_identity_slots"] = public
+        self.metrics["peak_pending_provisional_tracks"] = max(
+            int(self.metrics["peak_pending_provisional_tracks"]), pending
+        )
+        self.metrics["peak_public_identity_slots"] = max(
+            int(self.metrics["peak_public_identity_slots"]), public
+        )
 
     @staticmethod
     def _endpoint_from_observation(obs: CameraObservation) -> TrackEndpoint:
@@ -312,12 +528,63 @@ class GlobalTrackManager:
             return None
         candidates.sort()
         best_cost, _best_distance, best_gid, best_is_long = candidates[0]
+        candidate_details = [
+            {
+                "gid": gid,
+                "cost": cost,
+                "distance_m": distance,
+                "long_gap": is_long,
+                "emitted": self.tracks[gid].emitted,
+                "covariance_trace": float(np.trace(self.tracks[gid].kf.P)),
+            }
+            for cost, distance, gid, is_long in candidates[:3]
+        ]
         if len(candidates) > 1:
             margin = candidates[1][0] - best_cost
             if margin + 1e-9 < self.cfg.fusion_instant_margin_m:
                 self.metrics["local_reconnect_ambiguous"] += 1
+                self._identity_event(
+                    "reconnect_rejected",
+                    event_ts_s=float(obs.capture_ts_s),
+                    arrival_ts_s=(
+                        float(obs.arrival_ts_s)
+                        if obs.arrival_ts_s is not None else None
+                    ),
+                    camera=obs.camera,
+                    local_id=int(obs.local_id),
+                    current_gid=excluded_gid,
+                    reason="ambiguity_margin",
+                    margin=margin,
+                    candidates=candidate_details,
+                    xy=obs.world_xy,
+                    velocity=self._stable_observation_velocity(obs),
+                )
                 return None
-        requires_confirmation = best_is_long or len(candidates) > 1
+        published_owner = self.tracks[best_gid].emitted
+        requires_confirmation = (
+            best_is_long
+            or len(candidates) > 1
+            or (
+                self.cfg.fusion_gid_ownership_hysteresis_enabled
+                and published_owner
+            )
+        )
+        self._identity_event(
+            "reconnect_candidate",
+            event_ts_s=float(obs.capture_ts_s),
+            arrival_ts_s=(
+                float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else None
+            ),
+            camera=obs.camera,
+            local_id=int(obs.local_id),
+            current_gid=excluded_gid,
+            selected_gid=best_gid,
+            published_owner=published_owner,
+            requires_confirmation=requires_confirmation,
+            candidates=candidate_details,
+            xy=obs.world_xy,
+            velocity=self._stable_observation_velocity(obs),
+        )
         return best_gid, requires_confirmation
 
     def _local_reconnect_candidates(
@@ -490,7 +757,16 @@ class GlobalTrackManager:
             ambiguous = margin + 1e-9 < self.cfg.fusion_instant_margin_m
             if ambiguous:
                 self.metrics["local_reconnect_ambiguous"] += 1
-            requires_confirmation = candidate[3] or ambiguous or len(row_candidates[row]) > 1
+            published_owner = self.tracks[candidate[2]].emitted
+            requires_confirmation = (
+                candidate[3]
+                or ambiguous
+                or len(row_candidates[row]) > 1
+                or (
+                    self.cfg.fusion_gid_ownership_hysteresis_enabled
+                    and published_owner
+                )
+            )
             assignments[eligible[row][1]] = (candidate[2], requires_confirmation)
             self.metrics["batch_reconnect_assignments"] += 1
         return assignments
@@ -541,26 +817,45 @@ class GlobalTrackManager:
         if count < max(1, self.cfg.fusion_local_reconnect_confirmations):
             self.metrics["local_reconnects_deferred_for_confirmation"] += 1
             return None
-        return self._commit_fragment_reconnect(key, current_gid, candidate_gid)
+        return self._commit_fragment_reconnect(
+            key, current_gid, candidate_gid, event_ts=event_ts
+        )
 
     def _commit_fragment_reconnect(
         self,
         key: TrackletKey,
         current_gid: int,
         candidate_gid: int,
+        *,
+        event_ts: float | None = None,
     ) -> int:
         current = self.resolve_gid(current_gid)
         candidate = self.resolve_gid(candidate_gid)
         reconnected_before_publish = (
             current in self.tracks and not self.tracks[current].emitted
         )
-        if current != candidate and self.merge_gids(candidate, current):
+        if current != candidate and self.merge_gids(
+            candidate,
+            current,
+            reason="local_fragment_reconnect",
+            evidence={"camera": key[0], "local_id": key[1]},
+        ):
             canonical = self.resolve_gid(candidate)
             self.affinity[key] = canonical
             self.members[canonical].add(key)
             self.metrics["local_fragments_reconnected"] += 1
             if reconnected_before_publish:
                 self.metrics["provisional_ids_reconnected_before_publish"] += 1
+            self._identity_event(
+                "reconnect",
+                event_ts_s=event_ts,
+                camera=key[0],
+                local_id=key[1],
+                previous_gid=current,
+                candidate_gid=candidate,
+                canonical_gid=canonical,
+                provisional_before_publish=reconnected_before_publish,
+            )
         else:
             canonical = self.resolve_gid(current)
         self._fragment_reconnect_votes.pop(key, None)
@@ -581,6 +876,7 @@ class GlobalTrackManager:
         track.last_arrival_ts_s = max(track.last_arrival_ts_s or arrival_ts, arrival_ts)
         track.hits += 1
         track.misses = 0
+        track.retirement_deferred = False
         track.cameras.add(obs.camera)
         previous_endpoint = track.camera_endpoints.get(obs.camera)
         if (
@@ -616,10 +912,22 @@ class GlobalTrackManager:
             )
             radius = self.cfg.offset_refine_window_s if clocks_known else self.cfg.max_camera_offset_s
             results = self.matcher.assign(left_items, right_items, center, radius)
-            if results:
-                median_delta = float(np.median([result.delta_s for result in results]))
+            clock_delta_spread_s = (
+                float(np.ptp([result.delta_s for result in results]))
+                if len(results) > 1
+                else 0.0
+            )
+            clock_delta_consistent = (
+                clock_delta_spread_s
+                <= self.cfg.clock_max_pair_delta_spread_s + 1e-9
+            )
+            if results and clock_delta_consistent:
+                median_delta = float(np.median([
+                    result.delta_s for result in results
+                ]))
                 representative = min(
-                    results, key=lambda result: abs(result.delta_s - median_delta)
+                    results,
+                    key=lambda result: abs(result.delta_s - median_delta),
                 )
                 aggregate = MatchResult(**{
                     **representative.__dict__,
@@ -632,12 +940,40 @@ class GlobalTrackManager:
                 # people in one frame are correlated evidence, not independent
                 # clock measurements.
                 self._learn_pair_offset(left_camera, right_camera, aggregate)
+            elif results and not clock_delta_consistent:
+                self.metrics["clock_updates_rejected_delta_spread"] += 1
+                self._identity_event(
+                    "clock_update_rejected",
+                    event_ts_s=pair_time,
+                    left_camera=left_camera,
+                    right_camera=right_camera,
+                    reason="inconsistent_pair_delta",
+                    matches=len(results),
+                    delta_spread_s=clock_delta_spread_s,
+                    maximum_spread_s=self.cfg.clock_max_pair_delta_spread_s,
+                )
             for result in results:
                 left_gid = self.resolve_gid(self.affinity[result.left_key])
                 right_gid = self.resolve_gid(self.affinity[result.right_key])
                 if left_gid == right_gid:
                     continue
-                if self.merge_gids(left_gid, right_gid):
+                if self.merge_gids(
+                    left_gid,
+                    right_gid,
+                    reason="tracklet_trajectory",
+                    evidence={
+                        "left_key": result.left_key,
+                        "right_key": result.right_key,
+                        "cost": result.cost,
+                        "margin": result.margin,
+                        "delta_s": result.delta_s,
+                        "overlap_s": result.overlap_s,
+                        "position_rmse_m": result.position_rmse_m,
+                        "velocity_rmse_mps": result.velocity_rmse_mps,
+                        "direction_cosine": result.direction_cosine,
+                        "confidence": result.confidence,
+                    },
+                ):
                     self.metrics["trajectory_matches_accepted"] += 1
 
     def _learn_pair_offset(
@@ -648,6 +984,8 @@ class GlobalTrackManager:
     ) -> None:
         left_history = self.tracklets.get(result.left_key)
         right_history = self.tracklets.get(result.right_key)
+        before_left = self.clock_estimator.estimate(left_camera)
+        before_right = self.clock_estimator.estimate(right_camera)
         if left_camera == self.clock_estimator.reference_camera:
             self.clock_estimator.observe(
                 right_camera, right_history.end_s, result.delta_s, result.confidence
@@ -669,6 +1007,41 @@ class GlobalTrackManager:
                 self.clock_estimator.observe(
                     left_camera, left_history.end_s, correction - result.delta_s, result.confidence
                 )
+        after_left = self.clock_estimator.estimate(left_camera)
+        after_right = self.clock_estimator.estimate(right_camera)
+        estimator_updated = (
+            after_left.samples > before_left.samples
+            or after_right.samples > before_right.samples
+        )
+        if not estimator_updated:
+            self.metrics["clock_updates_rejected_by_estimator"] += 1
+        self._identity_event(
+            "clock_update" if estimator_updated else "clock_update_rejected",
+            event_ts_s=max(left_history.end_s, right_history.end_s),
+            left_camera=left_camera,
+            right_camera=right_camera,
+            reason=None if estimator_updated else "estimator_confidence_or_outlier",
+            delta_s=result.delta_s,
+            confidence=result.confidence,
+            position_rmse_m=result.position_rmse_m,
+            velocity_rmse_mps=result.velocity_rmse_mps,
+            before={
+                left_camera: before_left.__dict__,
+                right_camera: before_right.__dict__,
+            },
+            after={
+                left_camera: after_left.__dict__,
+                right_camera: after_right.__dict__,
+            },
+            correction_s={
+                left_camera: self.clock_estimator.correction_at(
+                    left_camera, left_history.end_s
+                ),
+                right_camera: self.clock_estimator.correction_at(
+                    right_camera, right_history.end_s
+                ),
+            },
+        )
 
     def _instant_geometry_merge(self, observations: list[CameraObservation]) -> None:
         """Merge short/noisy tracks after camera clocks share one event time.
@@ -754,6 +1127,25 @@ class GlobalTrackManager:
                 margin = min(alternatives, default=float("inf")) - value
                 if margin + 1e-9 < self.cfg.fusion_instant_margin_m:
                     self.metrics["instant_geometry_ambiguous"] += 1
+                    self._identity_event(
+                        "instant_merge_rejected",
+                        event_ts_s=max(
+                            float(left_items[row].capture_ts_s),
+                            float(right_items[column].capture_ts_s),
+                        ),
+                        left_key=(left_camera, left_items[row].local_id),
+                        right_key=(right_camera, right_items[column].local_id),
+                        reason="ambiguity_margin",
+                        distance_m=float(spatial[row, column]),
+                        cost=float(value),
+                        margin=float(margin),
+                        left_clock_correction_s=self.clock_estimator.correction_at(
+                            left_camera, float(left_items[row].capture_ts_s)
+                        ),
+                        right_clock_correction_s=self.clock_estimator.correction_at(
+                            right_camera, float(right_items[column].capture_ts_s)
+                        ),
+                    )
                     continue
                 if ambiguous_assignment[row, column] and self._strongly_opposite_motion(
                     left_items[row], right_items[column]
@@ -762,6 +1154,18 @@ class GlobalTrackManager:
                     # Waiting until the people separate is safer than making an
                     # irreversible cross-person merge during this frame.
                     self.metrics["instant_opposite_direction_vetoes"] += 1
+                    self._identity_event(
+                        "instant_merge_rejected",
+                        event_ts_s=max(
+                            float(left_items[row].capture_ts_s),
+                            float(right_items[column].capture_ts_s),
+                        ),
+                        left_key=(left_camera, left_items[row].local_id),
+                        right_key=(right_camera, right_items[column].local_id),
+                        reason="opposite_motion",
+                        distance_m=float(spatial[row, column]),
+                        margin=float(margin),
+                    )
                     continue
                 left_key = left_camera, left_items[row].local_id
                 right_key = right_camera, right_items[column].local_id
@@ -825,7 +1229,21 @@ class GlobalTrackManager:
                 if count < confirmations:
                     self.metrics["instant_merges_deferred_for_confirmation"] += 1
                     continue
-                if self.merge_gids(left_gid, right_gid):
+                if self.merge_gids(
+                    left_gid,
+                    right_gid,
+                    reason="instant_geometry",
+                    evidence={
+                        "left_key": left_key,
+                        "right_key": right_key,
+                        "distance_m": float(spatial[row, column]),
+                        "cost": float(value),
+                        "margin": float(margin),
+                        "motion_compatible": motion_compatible,
+                        "confirmations": confirmations,
+                        "votes": count,
+                    },
+                ):
                     for candidate in list(self._instant_merge_votes):
                         if left_gid in candidate or right_gid in candidate:
                             del self._instant_merge_votes[candidate]
@@ -984,7 +1402,12 @@ class GlobalTrackManager:
                     )
                     self._duplicate_suppressed_gids.add(suppressed)
                 continue
-            if self.merge_gids(first_gid, second_gid):
+            if self.merge_gids(
+                first_gid,
+                second_gid,
+                reason="duplicate_consolidation",
+                evidence={"distance_m": float(_distance), "votes": count},
+            ):
                 self.metrics["duplicate_global_tracks_merged"] += 1
                 for candidate in list(self._duplicate_merge_votes):
                     if first_gid in candidate or second_gid in candidate:
@@ -1124,7 +1547,14 @@ class GlobalTrackManager:
             clipped_velocity_error + direction_penalty
         )
 
-    def merge_gids(self, first_gid: int, second_gid: int) -> bool:
+    def merge_gids(
+        self,
+        first_gid: int,
+        second_gid: int,
+        *,
+        reason: str = "explicit",
+        evidence: dict | None = None,
+    ) -> bool:
         """Merge IDs into the oldest canonical ID; safe and idempotent."""
         first = self.resolve_gid(first_gid)
         second = self.resolve_gid(second_gid)
@@ -1134,6 +1564,14 @@ class GlobalTrackManager:
             return False
         if self._has_same_camera_conflict(first, second):
             self.metrics["same_camera_merge_conflicts"] += 1
+            self._identity_event(
+                "merge_rejected",
+                first_gid=first,
+                second_gid=second,
+                reason=reason,
+                rejection="same_camera_overlap",
+                evidence=evidence or {},
+            )
             return False
 
         canonical = min((first, second), key=self._canonical_merge_priority)
@@ -1141,6 +1579,7 @@ class GlobalTrackManager:
         keep = self.tracks[canonical]
         lose = self.tracks[retired]
         was_late = keep.emitted or lose.emitted
+        published_pair = keep.emitted and lose.emitted
         if keep.emitted and not lose.emitted:
             self.metrics["published_id_preserved_on_merge"] += 1
         if (
@@ -1169,6 +1608,12 @@ class GlobalTrackManager:
             if value is not None
         ]
         keep.emitted_at_s = min(emitted_times) if emitted_times else None
+        keep.birth_near_boundary = (
+            keep.birth_near_boundary or lose.birth_near_boundary
+        )
+        keep.retirement_deferred = (
+            keep.retirement_deferred and lose.retirement_deferred
+        )
         keep.cameras.update(lose.cameras)
         for camera, endpoint in lose.camera_endpoints.items():
             current = keep.camera_endpoints.get(camera)
@@ -1185,6 +1630,19 @@ class GlobalTrackManager:
         self.metrics["global_id_merges"] += 1
         if was_late:
             self.metrics["late_reassociations"] += 1
+        self._identity_event(
+            "merge",
+            first_gid=first,
+            second_gid=second,
+            canonical_gid=canonical,
+            retired_gid=retired,
+            reason=reason,
+            evidence=evidence or {},
+            published_pair=published_pair,
+            canonical_was_published=keep.emitted,
+            retired_was_published=lose.emitted,
+            covariance_trace=float(np.trace(keep.kf.P)),
+        )
         return True
 
     def _canonical_merge_priority(self, gid: int) -> tuple[bool, float, int]:
@@ -1261,8 +1719,24 @@ class GlobalTrackManager:
             track = self.tracks[gid]
             if track.last_seen_ts_s is None:
                 continue
-            if self._max_event_ts_s - track.last_seen_ts_s <= retention_s:
+            age_s = self._max_event_ts_s - track.last_seen_ts_s
+            if age_s <= retention_s:
                 continue
+            if (
+                self.cfg.fusion_retire_requires_exit_boundary
+                and gid > 0
+                and track.emitted
+            ):
+                if self._has_exit_evidence(track):
+                    self.metrics["confirmed_identity_exits"] += 1
+                else:
+                    forced_s = self.cfg.fusion_forced_retire_s
+                    if forced_s <= 0 or age_s <= max(retention_s, forced_s):
+                        if not track.retirement_deferred:
+                            track.retirement_deferred = True
+                            self.metrics["retirement_deferred_no_exit"] += 1
+                        continue
+                    self.metrics["forced_identity_retirements"] += 1
             del self.tracks[gid]
             self.members.pop(gid, None)
             for key, mapped_gid in list(self.affinity.items()):
@@ -1270,6 +1744,28 @@ class GlobalTrackManager:
                     del self.affinity[key]
                     self._fragment_reconnect_votes.pop(key, None)
             self.metrics["global_tracks_expired"] += 1
+            self._identity_event(
+                "expiry",
+                gid=gid,
+                last_seen_ts_s=track.last_seen_ts_s,
+                age_s=age_s,
+                emitted=track.emitted,
+                exit_evidence=self._has_exit_evidence(track),
+                cameras=sorted(track.camera_endpoints),
+                covariance_trace=float(np.trace(track.kf.P)),
+            )
+
+    def _has_exit_evidence(self, track: GlobalTrack) -> bool:
+        """True when a final observation was at a camera image boundary."""
+        if track.last_seen_ts_s is None:
+            return False
+        latest = [
+            endpoint
+            for endpoint in track.camera_endpoints.values()
+            if abs(endpoint.timestamp_s - track.last_seen_ts_s)
+            <= self.cfg.fusion_event_time_gate_s + 1e-9
+        ]
+        return bool(latest) and any(endpoint.near_boundary for endpoint in latest)
 
     def metrics_snapshot(self) -> dict[str, int | float | dict[str, dict[str, float]]]:
         snapshot: dict = dict(self.metrics)
@@ -1279,8 +1775,16 @@ class GlobalTrackManager:
             "tracklet_points": self.tracklets.metrics["points_stored"],
             "tracklet_bytes": self.tracklets.approximate_bytes,
             "retained_global_tracks": len(self.tracks),
+            "pending_provisional_tracks": sum(
+                gid < 0 and self.resolve_gid(gid) == gid for gid in self.tracks
+            ),
+            "public_identity_slots": sum(
+                gid > 0 and self.resolve_gid(gid) == gid for gid in self.tracks
+            ),
             "retained_aliases": len(self.aliases),
             "retained_affinities": len(self.affinity),
+            "identity_events_written": self._diagnostics.events_written,
+            "identity_events_dropped": self._diagnostics.events_dropped,
             "clock_estimates": {
                 camera: {
                     "offset_s": estimate.offset_s,

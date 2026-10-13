@@ -77,6 +77,53 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertEqual(second, manager.affinity[("b", 12)])
         self.assertNotEqual(first, second)
 
+    def test_inconsistent_people_do_not_train_camera_clock(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            tracklet_min_duration_s=0.5,
+            clock_max_pair_delta_spread_s=0.2,
+        ))
+        # The two paths imply different clock shifts. This is characteristic
+        # of spatial calibration bias or a wrong identity pairing, not one
+        # physical camera clock. One early single-track bootstrap sample is
+        # allowed, but inconsistent multi-person cycles must add no samples.
+        for event_time in np.arange(0.0, 2.01, 0.1):
+            manager.step([
+                _obs("a", 1, event_time, (event_time, 0.0)),
+                _obs("a", 2, event_time, (event_time, 3.0)),
+                _obs("b", 11, event_time + 1.0, (event_time, 0.0)),
+                _obs("b", 12, event_time + 2.0, (event_time, 3.0)),
+            ])
+
+        self.assertGreater(
+            manager.metrics["clock_updates_rejected_delta_spread"], 0
+        )
+        self.assertLessEqual(manager.clock_estimator.estimate("b").samples, 1)
+
+    def test_consistent_people_still_learn_two_second_clock_offset(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            tracklet_min_duration_s=0.5,
+            clock_max_pair_delta_spread_s=0.4,
+        ))
+        for event_time in np.arange(0.0, 2.01, 0.1):
+            manager.step([
+                _obs("a", 1, event_time, (event_time, 0.0)),
+                _obs("a", 2, event_time, (event_time, 3.0)),
+                _obs("b", 11, event_time + 2.0, (event_time, 0.0)),
+                _obs("b", 12, event_time + 2.0, (event_time, 3.0)),
+            ])
+
+        estimate = manager.clock_estimator.estimate("b")
+        self.assertGreater(estimate.confidence, 0.55)
+        self.assertAlmostEqual(estimate.offset_s, -2.0, delta=0.25)
+        self.assertEqual(
+            manager.affinity[("a", 1)], manager.affinity[("b", 11)]
+        )
+        self.assertEqual(
+            manager.affinity[("a", 2)], manager.affinity[("b", 12)]
+        )
+
     def test_overlapping_same_camera_tracks_cannot_merge(self) -> None:
         manager = GlobalTrackManager(self._config())
         for timestamp in (0.0, 0.5, 1.0):
@@ -274,6 +321,74 @@ class EventTimeFusionTests(unittest.TestCase):
             manager.metrics["provisional_ids_reconnected_before_publish"], 1
         )
 
+    def test_published_owner_requires_consecutive_fragment_evidence(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.5,
+            fusion_provisional_buffer_bootstrap_s=0.1,
+            fusion_gid_ownership_hysteresis_enabled=True,
+            fusion_local_reconnect_confirmations=3,
+            fusion_local_reconnect_confirmation_window_s=0.35,
+            fusion_instant_merge_enabled=False,
+            tracklet_min_duration_s=10.0,
+        ))
+        visible = manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), (1.0, 0.0))
+        ])
+        original_gid = manager.affinity[("a", 1)]
+        self.assertEqual([track.gid for track in visible], [original_gid])
+
+        # A post-bootstrap local fragment stays internal while ownership is
+        # still only a one/two-frame hypothesis.
+        visible = manager.step([
+            _obs("a", 2, 0.2, (0.2, 0.0), (1.0, 0.0))
+        ])
+        self.assertEqual([track.gid for track in visible], [original_gid])
+        provisional_gid = manager.affinity[("a", 2)]
+        self.assertNotEqual(provisional_gid, original_gid)
+        self.assertNotIn(("a", 2), manager.public_affinity_snapshot())
+        self.assertEqual(manager.step([
+            _obs("a", 2, 0.3, (0.3, 0.0), (1.0, 0.0))
+        ]), [])
+
+        visible = manager.step([
+            _obs("a", 2, 0.4, (0.4, 0.0), (1.0, 0.0))
+        ])
+        self.assertEqual(manager.affinity[("a", 2)], original_gid)
+        self.assertEqual(
+            manager.public_affinity_snapshot()[("a", 2)], original_gid
+        )
+        self.assertEqual([track.gid for track in visible], [original_gid])
+        self.assertGreaterEqual(
+            manager.metrics["local_reconnects_deferred_for_confirmation"], 2
+        )
+
+    def test_fragment_challenger_must_be_consecutive(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.5,
+            fusion_provisional_buffer_bootstrap_s=0.1,
+            fusion_gid_ownership_hysteresis_enabled=True,
+            fusion_local_reconnect_confirmations=2,
+            fusion_local_reconnect_confirmation_window_s=0.35,
+            fusion_instant_merge_enabled=False,
+            tracklet_min_duration_s=10.0,
+        ))
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0))])
+        original_gid = manager.affinity[("a", 1)]
+
+        manager.step([_obs("a", 2, 0.2, (0.2, 0.0))])
+        self.assertNotEqual(manager.affinity[("a", 2)], original_gid)
+        # No compatible owner on the next update clears the pending vote.
+        manager.step([_obs("a", 2, 0.3, (5.0, 0.0))])
+        self.assertNotIn(("a", 2), manager._fragment_reconnect_votes)
+        # Returning close to the old owner starts at one vote again.
+        manager.step([_obs("a", 2, 0.4, (0.4, 0.0))])
+        self.assertNotEqual(manager.affinity[("a", 2)], original_gid)
+
     def test_crossing_fragments_reconnect_by_motion_not_nearest_position(self) -> None:
         manager = GlobalTrackManager(self._config(
             cameras=["a"],
@@ -456,6 +571,167 @@ class EventTimeFusionTests(unittest.TestCase):
             false_track.step([], timestamp_s=0.4, arrival_timestamp_s=0.4), []
         )
         self.assertEqual(false_track.metrics["provisional_ids_published"], 0)
+
+    def test_deferred_allocation_does_not_expose_gid_before_decision(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.75,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_instant_merge_enabled=False,
+        ))
+        self.assertEqual(manager.step([_obs("a", 1, 0.0, (0.0, 0.0))]), [])
+        provisional = manager.affinity[("a", 1)]
+        self.assertLess(provisional, 0)
+        self.assertEqual(manager.public_affinity_snapshot(), {})
+        self.assertEqual(manager.step([_obs("a", 1, 0.5, (0.5, 0.0))]), [])
+
+        visible = manager.step([_obs("a", 1, 0.75, (0.75, 0.0))])
+        self.assertEqual([track.gid for track in visible], [1])
+        self.assertEqual(manager.resolve_gid(provisional), 1)
+        self.assertEqual(manager.public_affinity_snapshot()[("a", 1)], 1)
+        self.assertEqual(manager.metrics["public_gid_allocations"], 1)
+
+    def test_fragments_reconnect_inside_buffer_before_one_public_gid_is_allocated(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.75,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_instant_merge_enabled=False,
+        ))
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0), (1.0, 0.0))])
+        first_provisional = manager.affinity[("a", 1)]
+        manager.step([_obs("a", 2, 0.2, (0.2, 0.0), (1.0, 0.0))])
+        self.assertEqual(manager.affinity[("a", 2)], first_provisional)
+        manager.step([_obs("a", 2, 0.8, (0.8, 0.0), (1.0, 0.0))])
+
+        self.assertEqual(manager.metrics["provisional_ids_created"], 2)
+        self.assertEqual(manager.metrics["public_gid_allocations"], 1)
+        self.assertEqual(manager.affinity[("a", 1)], 1)
+        self.assertEqual(manager.affinity[("a", 2)], 1)
+
+    def test_new_public_gid_requires_entry_after_bootstrap(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.5,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_new_gid_entry_required=True,
+            fusion_new_gid_bootstrap_s=0.2,
+            fusion_local_reconnect_gate_m=0.1,
+            fusion_instant_merge_enabled=False,
+        ))
+        manager.step([], timestamp_s=0.0, arrival_timestamp_s=0.0)
+        manager.step([_obs("a", 1, 0.5, (0.0, 0.0))])
+        manager.step([_obs("a", 1, 1.1, (0.0, 0.0))])
+        self.assertLess(manager.affinity[("a", 1)], 0)
+        self.assertEqual(manager.public_affinity_snapshot(), {})
+
+        manager.step([_obs("a", 2, 1.2, (10.0, 0.0), near_boundary=True)])
+        visible = manager.step([
+            _obs("a", 2, 1.8, (10.0, 0.0), near_boundary=True)
+        ])
+        self.assertEqual(len(visible), 1)
+        self.assertGreater(visible[0].gid, 0)
+        self.assertGreater(manager.metrics["new_gid_entry_deferred"], 0)
+
+    def test_fixed_population_capacity_keeps_excess_identity_pending(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.5,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_fixed_population_size=2,
+            fusion_new_gid_bootstrap_s=2.0,
+            fusion_instant_merge_enabled=False,
+        ))
+        observations = [
+            _obs("a", 1, 0.0, (0.0, 0.0)),
+            _obs("a", 2, 0.0, (5.0, 0.0)),
+            _obs("a", 3, 0.0, (10.0, 0.0)),
+        ]
+        manager.step(observations)
+        visible = manager.step([
+            _obs("a", 1, 0.5, (0.0, 0.0)),
+            _obs("a", 2, 0.5, (5.0, 0.0)),
+            _obs("a", 3, 0.5, (10.0, 0.0)),
+        ])
+        self.assertEqual(len(visible), 2)
+        self.assertEqual(manager.metrics["public_identity_slots"], 2)
+        self.assertEqual(manager.metrics["pending_provisional_tracks"], 1)
+        self.assertGreater(manager.metrics["new_gid_capacity_deferred"], 0)
+
+    def test_confirmed_exit_frees_capacity_for_exactly_one_new_gid(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            tracklet_history_s=0.1,
+            tracklet_late_drop_s=0.1,
+            fusion_max_age_s=0.2,
+            fusion_identity_retention_s=0.2,
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.1,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_fixed_population_size=1,
+            fusion_new_gid_bootstrap_s=2.0,
+            fusion_retire_requires_exit_boundary=True,
+            fusion_forced_retire_s=0.0,
+            fusion_local_reconnect_gate_m=0.1,
+            fusion_instant_merge_enabled=False,
+        ))
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0), near_boundary=True)])
+        manager.step([_obs("a", 1, 0.1, (0.1, 0.0), near_boundary=True)])
+        self.assertEqual(manager.metrics["public_gid_allocations"], 1)
+
+        manager.step([_obs("a", 2, 0.2, (10.0, 0.0), near_boundary=True)])
+        self.assertLess(manager.affinity[("a", 2)], 0)
+        manager.step([_obs("a", 2, 0.4, (10.1, 0.0), near_boundary=True)])
+
+        self.assertEqual(manager.metrics["confirmed_identity_exits"], 1)
+        self.assertEqual(manager.metrics["public_gid_allocations"], 2)
+        self.assertEqual(manager.affinity[("a", 2)], 2)
+        self.assertEqual(manager.metrics["public_identity_slots"], 1)
+
+    def test_public_identity_retires_only_after_boundary_exit_evidence(self) -> None:
+        cfg = self._config(
+            cameras=["a"],
+            tracklet_history_s=0.1,
+            tracklet_late_drop_s=0.1,
+            fusion_max_age_s=0.2,
+            fusion_identity_retention_s=0.2,
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.1,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_new_gid_bootstrap_s=1.0,
+            fusion_retire_requires_exit_boundary=True,
+            fusion_forced_retire_s=0.0,
+            fusion_instant_merge_enabled=False,
+        )
+        manager = GlobalTrackManager(cfg)
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0))])
+        manager.step([_obs("a", 1, 0.1, (0.1, 0.0))])
+        gid = manager.affinity[("a", 1)]
+        manager.step([], timestamp_s=0.5, arrival_timestamp_s=0.5)
+        self.assertIn(gid, manager.tracks)
+        self.assertEqual(manager.metrics["retirement_deferred_no_exit"], 1)
+
+        exiting = GlobalTrackManager(cfg)
+        exiting.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), near_boundary=True)
+        ])
+        exiting.step([
+            _obs("a", 1, 0.1, (0.1, 0.0), near_boundary=True)
+        ])
+        exiting_gid = exiting.affinity[("a", 1)]
+        exiting.step([], timestamp_s=0.5, arrival_timestamp_s=0.5)
+        self.assertNotIn(exiting_gid, exiting.tracks)
+        self.assertEqual(exiting.metrics["confirmed_identity_exits"], 1)
 
     def test_clear_published_pair_uses_confirmation_when_motion_is_noisy(self) -> None:
         manager = GlobalTrackManager(self._config(
