@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from multicam_tracker.bytetrack import ByteTracker, match_by_iou
-from multicam_tracker.config import PipelineConfig
+from multicam_tracker.config import PipelineConfig, apply_tracking_profile
 from multicam_tracker.demo import run_pipeline
 from multicam_tracker.fusion import CameraObservation, GlobalTrackManager
 from multicam_tracker.timebase import FrameBatch, FramePacket
@@ -26,6 +26,32 @@ def detection():
 
 
 class LifecycleRegressionTests(unittest.TestCase):
+    def test_baseline_profile_restores_legacy_clock_delta_policy(self) -> None:
+        cfg = PipelineConfig()
+        self.assertEqual(cfg.clock_max_pair_delta_spread_s, 0.40)
+
+        apply_tracking_profile(cfg, "identity-v1-baseline")
+        self.assertTrue(np.isinf(cfg.clock_max_pair_delta_spread_s))
+
+        apply_tracking_profile(cfg, "identity-v1-drift-guard")
+        self.assertEqual(cfg.clock_max_pair_delta_spread_s, 0.40)
+
+    def test_ownership_profile_and_rollback_are_explicit(self) -> None:
+        cfg = PipelineConfig()
+        apply_tracking_profile(cfg, "identity-v1-ownership")
+        self.assertTrue(cfg.fusion_gid_ownership_hysteresis_enabled)
+        self.assertEqual(cfg.fusion_provisional_min_age_s, 0.5)
+        self.assertEqual(cfg.fusion_provisional_buffer_bootstrap_s, 1.0)
+        self.assertEqual(cfg.fusion_local_reconnect_confirmations, 3)
+        self.assertEqual(cfg.fusion_published_merge_confirmations, 5)
+
+        apply_tracking_profile(cfg, "identity-v1-drift-guard")
+        self.assertFalse(cfg.fusion_gid_ownership_hysteresis_enabled)
+        self.assertFalse(cfg.fusion_provisional_buffer_enabled)
+        self.assertEqual(cfg.fusion_provisional_buffer_bootstrap_s, 0.0)
+        self.assertEqual(cfg.fusion_local_reconnect_confirmations, 1)
+        self.assertEqual(cfg.fusion_published_merge_confirmations, 1)
+
     def test_zero_trail_length_disables_history(self):
         manager = GlobalTrackManager(PipelineConfig(cameras=["a"], fusion_min_hits=1, trail_length=0))
         for sequence in range(40):

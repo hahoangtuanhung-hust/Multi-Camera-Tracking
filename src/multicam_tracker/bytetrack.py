@@ -320,6 +320,29 @@ class ByteTracker:
         self._next_id = 1
         self._last_timestamp_s: float | None = None
         self.metrics: defaultdict[str, int] = defaultdict(int)
+        # Cleared every update: diagnostics stay O(decisions in one tick) and
+        # are streamed by demo.py through the shared bounded JSONL writer.
+        self.last_events: list[dict] = []
+        self._diagnostics_enabled = cfg.identity_diagnostics_path is not None
+
+    def _record_event(self, event: str, track: Track, **fields) -> None:
+        if not self._diagnostics_enabled:
+            return
+        self.last_events.append({
+            "event": event,
+            "local_track_id": track.track_id,
+            "state": (
+                "Lost" if track.confirmed and track.misses > 0
+                else "Confirmed" if track.confirmed
+                else "Tentative"
+            ),
+            "hits": track.hits,
+            "misses": track.misses,
+            "missed_seconds": track.missed_seconds,
+            "bbox_xyxy": track.xyxy.copy(),
+            "confidence": track.conf,
+            **fields,
+        })
 
     def update(self, detections: np.ndarray, timestamp_s: float | None = None) -> list[Track]:
         """Advance one tick with (N, 5) [x1, y1, x2, y2, conf] detections.
@@ -327,6 +350,7 @@ class ByteTracker:
         Returns the confirmed tracks (stable IDs, Kalman-smoothed boxes).
         """
         cfg = self.cfg
+        self.last_events.clear()
         detections = np.asarray(detections, dtype=float).reshape((-1, 5))
         if timestamp_s is not None and not np.isfinite(timestamp_s):
             raise ValueError("ByteTracker timestamp must be finite")
@@ -346,8 +370,19 @@ class ByteTracker:
             self._last_timestamp_s = float(timestamp_s)
             # A camera may be absent for many ticks. Expire before matching,
             # otherwise its first returning detection resurrects an old ID.
-            self.tracks = [track for track in self.tracks
-                           if track.missed_seconds + dt <= cfg.track_max_age_s]
+            retained = []
+            for track in self.tracks:
+                if track.missed_seconds + dt <= cfg.track_max_age_s:
+                    retained.append(track)
+                else:
+                    self.metrics["tracks_removed_timeout"] += 1
+                    self._record_event(
+                        "local_removed",
+                        track,
+                        reason="capture_time_timeout_before_association",
+                        elapsed_since_last_match_s=track.missed_seconds + dt,
+                    )
+            self.tracks = retained
 
         # 1. Predict where every known track should be this tick. Until a
         #    track is matched and updated, `track.xyxy` is this prediction.
@@ -381,10 +416,32 @@ class ByteTracker:
                 track_boxes, high[:, :4], cfg.track_min_iou
         )
         for t_idx, d_idx in pairs:
-            if self.tracks[t_idx].misses > 0:
+            track = self.tracks[t_idx]
+            was_lost = track.misses > 0
+            predicted_bbox = track.xyxy.copy() if self._diagnostics_enabled else None
+            was_confirmed = track.confirmed if self._diagnostics_enabled else False
+            if was_lost:
                 self.metrics["reactivations"] += 1
             self.metrics["high_confidence_matches"] += 1
-            self._mark_matched(self.tracks[t_idx], high[d_idx])
+            self._mark_matched(track, high[d_idx])
+            if self._diagnostics_enabled:
+                overlap = float(iou_matrix(
+                    predicted_bbox[None, :], high[d_idx:d_idx + 1, :4]
+                )[0, 0])
+                self._record_event(
+                    "local_match",
+                    track,
+                    stage="high_confidence",
+                    association="motion" if cfg.track_motion_association_enabled else "iou",
+                    iou=overlap,
+                    association_cost=1.0 - overlap,
+                    minimum_iou=cfg.track_min_iou,
+                    predicted_bbox_xyxy=predicted_bbox,
+                    detection_bbox_xyxy=high[d_idx, :4].copy(),
+                    detection_confidence=float(high[d_idx, 4]),
+                    reactivated=was_lost,
+                    became_confirmed=not was_confirmed and track.confirmed,
+                )
 
         # 3. Stage two (the "byte" trick): leftover tracks get a second
         #    chance against low-confidence detections — typically occluded
@@ -403,30 +460,69 @@ class ByteTracker:
                 leftover_boxes, low[:, :4], cfg.track_min_iou
         )
         for local_t, d_idx in pairs2:
-            if self.tracks[unmatched_tracks[local_t]].misses > 0:
+            track = self.tracks[unmatched_tracks[local_t]]
+            was_lost = track.misses > 0
+            predicted_bbox = track.xyxy.copy() if self._diagnostics_enabled else None
+            was_confirmed = track.confirmed if self._diagnostics_enabled else False
+            if was_lost:
                 self.metrics["reactivations"] += 1
             self.metrics["low_confidence_matches"] += 1
-            self._mark_matched(self.tracks[unmatched_tracks[local_t]], low[d_idx])
+            self._mark_matched(track, low[d_idx])
+            if self._diagnostics_enabled:
+                overlap = float(iou_matrix(
+                    predicted_bbox[None, :], low[d_idx:d_idx + 1, :4]
+                )[0, 0])
+                self._record_event(
+                    "local_match",
+                    track,
+                    stage="low_confidence",
+                    association="motion" if cfg.track_motion_association_enabled else "iou",
+                    iou=overlap,
+                    association_cost=1.0 - overlap,
+                    minimum_iou=cfg.track_min_iou,
+                    predicted_bbox_xyxy=predicted_bbox,
+                    detection_bbox_xyxy=low[d_idx, :4].copy(),
+                    detection_confidence=float(low[d_idx, 4]),
+                    reactivated=was_lost,
+                    became_confirmed=not was_confirmed and track.confirmed,
+                )
         unmatched_tracks = [unmatched_tracks[i] for i in still_unmatched]
 
         # 4. Unmatched tracks age; tentative ones die immediately,
         #    confirmed ones survive up to max_age ticks (occlusion tolerance).
         for t_idx in unmatched_tracks:
-            self.tracks[t_idx].misses += 1
-            self.tracks[t_idx].missed_seconds += dt
-        self.tracks = [
-            t for t in self.tracks
-            if (
-                (t.missed_seconds <= cfg.track_max_age_s if timestamp_s is not None else t.misses <= cfg.track_max_age)
-                if t.confirmed else t.misses <= 0
+            track = self.tracks[t_idx]
+            track.misses += 1
+            track.missed_seconds += dt
+            self._record_event(
+                "local_miss",
+                track,
+                reason="no_association",
             )
-        ]
+        retained = []
+        for track in self.tracks:
+            keep = (
+                (
+                    track.missed_seconds <= cfg.track_max_age_s
+                    if timestamp_s is not None
+                    else track.misses <= cfg.track_max_age
+                )
+                if track.confirmed
+                else track.misses <= 0
+            )
+            if keep:
+                retained.append(track)
+                continue
+            reason = "tentative_first_miss" if not track.confirmed else "timeout"
+            self.metrics["tracks_removed_tentative" if not track.confirmed else "tracks_removed_timeout"] += 1
+            self._record_event("local_removed", track, reason=reason)
+        self.tracks = retained
 
         # 5. Every unmatched high-confidence detection births a new track.
         for d_idx in unmatched_high:
             det = high[d_idx]
             measurement = _xyxy_to_box_state(det)
-            self.tracks.append(Track(
+            track = Track(
                 track_id=self._next_id,
                 kf=ConstantVelocityKalman(
                     measurement,
@@ -436,9 +532,18 @@ class ByteTracker:
                 conf=float(det[4]),
                 confirmed=cfg.track_min_hits <= 1,
                 last_measurement=measurement.copy(),
-            ))
+            )
+            self.tracks.append(track)
             self._next_id += 1
             self.metrics["tracks_created"] += 1
+            self._record_event(
+                "local_birth",
+                track,
+                reason="unmatched_high_confidence_detection",
+                detection_bbox_xyxy=det[:4].copy(),
+                detection_confidence=float(det[4]),
+                birth_threshold=cfg.track_high_conf,
+            )
 
         self.metrics["peak_retained_tracks"] = max(
             self.metrics["peak_retained_tracks"], len(self.tracks)

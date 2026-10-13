@@ -1,5 +1,6 @@
 import numpy as np
 import unittest
+from pathlib import Path
 
 from multicam_tracker.bytetrack import (
     ByteTracker,
@@ -16,6 +17,35 @@ def _det(x: float = 0.0) -> np.ndarray:
 
 
 class TimebaseTrackingTests(unittest.TestCase):
+    def test_local_lifecycle_diagnostics_are_per_tick_and_explain_removal(self) -> None:
+        tracker = ByteTracker(PipelineConfig(
+            track_min_hits=2,
+            identity_diagnostics_path=Path("diagnostics-enabled.jsonl"),
+        ))
+
+        tracker.update(_det(), timestamp_s=0.0)
+        self.assertEqual([row["event"] for row in tracker.last_events], [
+            "local_birth",
+        ])
+        tracker.update(_det(0.5), timestamp_s=0.1)
+        match = next(row for row in tracker.last_events if row["event"] == "local_match")
+        self.assertTrue(match["became_confirmed"])
+        self.assertEqual(match["stage"], "high_confidence")
+        tracker.update(np.empty((0, 5)), timestamp_s=0.2)
+        self.assertEqual(tracker.last_events[0]["state"], "Lost")
+        self.assertNotIn("detector_ran", tracker.last_events[0])
+        tracker.update(_det(1.0), timestamp_s=0.3)
+        self.assertTrue(tracker.last_events[0]["reactivated"])
+
+        tracker.update(np.empty((0, 5)), timestamp_s=2.5)
+        removed = next(
+            row for row in tracker.last_events if row["event"] == "local_removed"
+        )
+        self.assertEqual(
+            removed["reason"], "capture_time_timeout_before_association"
+        )
+        self.assertEqual(tracker.tracks, [])
+
     def test_cached_kalman_matrices_match_constant_acceleration_equations(self):
         rng = np.random.default_rng(42)
         kf = ConstantVelocityKalman(np.array([1., 2.]), .05, .1)
