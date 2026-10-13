@@ -39,7 +39,7 @@ def _batches(count: int) -> list[FrameBatch]:
 
 
 class ContinuousPipelineTests(unittest.TestCase):
-    @patch("multicam_tracker.demo.ByteTracker.update", return_value=[])
+    @patch("multicam_tracker.ocsort.OCSortTracker.update", return_value=[])
     @patch("multicam_tracker.demo.load_calibrations", return_value={})
     def test_four_camera_detector_once_and_tracking_every_frame(self, _load, update):
         detector = _CountingDetector()

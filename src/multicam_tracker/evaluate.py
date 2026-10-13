@@ -14,6 +14,7 @@ Run: ``uv run evaluate --max-frames 1200``
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -21,8 +22,14 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .config import PipelineConfig, TRACKING_PROFILE_OVERRIDES, apply_tracking_profile
+from .config import (
+    DEFAULT_TRACKING_PROFILE,
+    PipelineConfig,
+    TRACKING_PROFILE_OVERRIDES,
+    apply_tracking_profile,
+)
 from .demo import run_pipeline
+from .local_tracker import LOCAL_TRACKERS
 from .mot_metrics import evaluate_mot
 
 MATCH_GATE_M = 1.0
@@ -80,18 +87,30 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--max-frames", type=int, default=1200)
     parser.add_argument("--device", default=None, choices=["mps", "cpu", "cuda"])
+    parser.add_argument(
+        "--local-tracker",
+        choices=LOCAL_TRACKERS,
+        default=None,
+        help="Per-camera tracker (default: ocsort)",
+    )
     parser.add_argument("--cameras", nargs="+", default=None, metavar="CAM")
     parser.add_argument(
         "--profile",
         choices=sorted(TRACKING_PROFILE_OVERRIDES),
-        default="identity-v1-baseline",
-        help="Named identity ablation profile (default: identity-v1-baseline)",
+        default=DEFAULT_TRACKING_PROFILE,
+        help=f"Named identity ablation profile (default: {DEFAULT_TRACKING_PROFILE})",
     )
     parser.add_argument(
         "--match-gate-m",
         type=float,
         default=MATCH_GATE_M,
         help="Maximum world-plane match distance in meters (default: 1.0)",
+    )
+    parser.add_argument(
+        "--expected-people",
+        type=int,
+        default=None,
+        help="Override fixed public-GID capacity (0 disables the cap)",
     )
     parser.add_argument(
         "--metric-window-frames",
@@ -116,18 +135,49 @@ def main() -> None:
         action="store_true",
         help="Print the frame/person/GID transition for every measured ID switch",
     )
+    parser.add_argument(
+        "--identity-events",
+        type=Path,
+        default=None,
+        help="Stream bounded identity lifecycle diagnostics as JSONL",
+    )
+    parser.add_argument(
+        "--identity-events-max",
+        type=int,
+        default=250_000,
+        help="Maximum fusion diagnostic events written (0 is unlimited)",
+    )
+    parser.add_argument(
+        "--cumulative-frames",
+        type=int,
+        nargs="*",
+        default=[300, 1000, 3000, 6000, 9000],
+        help="Report from-start metrics at these evaluated tick counts",
+    )
     args = parser.parse_args()
     if args.metric_window_frames < 0:
         parser.error("--metric-window-frames must be >= 0")
+    if args.expected_people is not None and args.expected_people < 0:
+        parser.error("--expected-people must be >= 0")
+    if args.identity_events_max < 0:
+        parser.error("--identity-events-max must be >= 0")
+    if any(value <= 0 for value in args.cumulative_frames):
+        parser.error("--cumulative-frames values must be > 0")
 
     cfg = PipelineConfig(data_root=args.data_root, async_ingest=False)
     apply_tracking_profile(cfg, args.profile)
+    cfg.identity_diagnostics_path = args.identity_events
+    cfg.identity_diagnostics_max_events = args.identity_events_max
+    if args.expected_people is not None:
+        cfg.fusion_fixed_population_size = args.expected_people
     available = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())
     if not available:
         raise SystemExit("No cameras found — run `uv run download-data` first.")
     cfg.cameras = args.cameras or available
     if args.device:
         cfg.device = args.device
+    if args.local_tracker:
+        cfg.local_tracker = args.local_tracker
     if args.track_kf_time_process_noise is not None:
         cfg.track_kf_time_process_noise = args.track_kf_time_process_noise
     if args.track_kf_robust_nis_threshold is not None:
@@ -139,9 +189,14 @@ def main() -> None:
         cfg.camera_start_frame_offsets,
         max_frame=args.max_frames + 3,
     )
-    print(f"Evaluating {len(cfg.cameras)} cameras over {args.max_frames} frames (stride={cfg.stride})...", flush=True)
+    print(
+        f"Evaluating {len(cfg.cameras)} cameras over {args.max_frames} frames "
+        f"(stride={cfg.stride}, tracker={cfg.local_tracker})...",
+        flush=True,
+    )
 
     predictions: list[tuple[int, dict[int, np.ndarray]]] = []
+    source_maps: dict[int, dict[int, list[tuple[str, int]]]] = {}
     last_metrics: dict = {}
     started = time.perf_counter()
     for tick in run_pipeline(cfg, max_frames=args.max_frames):
@@ -149,6 +204,14 @@ def main() -> None:
             tick["frame_index"],
             {t.gid: t.world_xy.copy() for t in tick["global_tracks"]},
         ))
+        if args.identity_events is not None:
+            sources: defaultdict[int, list[tuple[str, int]]] = defaultdict(list)
+            for observation in tick["observations"]:
+                key = observation.camera, int(observation.local_id)
+                gid = tick["local_to_gid"].get(key)
+                if gid is not None:
+                    sources[int(gid)].append(key)
+            source_maps[tick["frame_index"]] = dict(sources)
         last_metrics = tick["metrics"]
         if len(predictions) % 50 == 0:
             print(f"Evaluated {len(predictions)} ticks in {time.perf_counter() - started:.1f}s", flush=True)
@@ -172,6 +235,18 @@ def main() -> None:
         match_gate_m=args.match_gate_m,
     )
     switch_events = metrics["switch_events"]
+    switch_diagnostics = []
+    if args.identity_events is not None:
+        switch_diagnostics = _classify_switch_events(
+            switch_events,
+            source_maps,
+            predictions,
+            gt_frames,
+            best_offset,
+        )
+        with args.identity_events.open("a", encoding="utf-8") as destination:
+            for record in switch_diagnostics:
+                destination.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     print(f"\nFrame offset used     : {best_offset}")
     print(f"World match gate      : {args.match_gate_m:.2f} m")
@@ -179,6 +254,7 @@ def main() -> None:
     print(f"Precision / Recall    : {metrics['precision']:.3f} / {metrics['recall']:.3f}")
     print(f"Position RMSE         : {metrics['position_RMSE_m']:.3f} m")
     print(f"Global ID switches    : {metrics['IDSW']}")
+    print(f"Track fragmentations  : {metrics['Frag']}")
     print("\nIdentity metrics")
     print(f"IDTP / IDFP / IDFN    : {metrics['IDTP']} / {metrics['IDFP']} / {metrics['IDFN']}")
     print(f"IDP / IDR / IDF1      : {metrics['IDP']:.3f} / {metrics['IDR']:.3f} / {metrics['IDF1']:.3f}")
@@ -192,6 +268,27 @@ def main() -> None:
     print(f"AssPr / AssRe         : {metrics['AssPr']:.3f} / {metrics['AssRe']:.3f}")
     print(f"CPU pipeline          : {len(predictions) / max(elapsed, 1e-6):.3f} ticks/s ({elapsed:.2f}s)")
     print(f"Tracking profile      : {args.profile}")
+    print(
+        "Public identity slots : "
+        f"{cfg.fusion_fixed_population_size or 'unbounded'}"
+    )
+    print(
+        "GID state             : "
+        f"public={last_metrics.get('public_identity_slots', 0)}, "
+        f"pending={last_metrics.get('pending_provisional_tracks', 0)}, "
+        f"allocated={last_metrics.get('public_gid_allocations', 0)}, "
+        f"capacity_deferred={last_metrics.get('new_gid_capacity_deferred', 0)}, "
+        f"entry_deferred={last_metrics.get('new_gid_entry_deferred', 0)}"
+    )
+    print(
+        "Local lifecycle       : "
+        f"created={last_metrics.get('local_tracks_created', 0)}, "
+        f"reactivated={last_metrics.get('local_track_reactivations', 0)}, "
+        f"tentative_removed={last_metrics.get('local_tracks_removed_tentative', 0)}, "
+        f"timeout_removed={last_metrics.get('local_tracks_removed_timeout', 0)}, "
+        f"retained={last_metrics.get('retained_local_tracks', 0)}, "
+        f"peak={last_metrics.get('peak_retained_local_tracks', 0)}"
+    )
     gaps = [event[2] - event[1] for event in switch_events]
     print(
         "Switch gaps           : "
@@ -207,7 +304,7 @@ def main() -> None:
         print(
             f"\nWindow metrics ({args.metric_window_frames} evaluated ticks each)"
         )
-        print("frames              IDF1   MOTA   HOTA   IDSW")
+        print("frames              IDF1   MOTA   HOTA   IDSW  Frag")
         for start in range(0, len(predictions), args.metric_window_frames):
             window_predictions = predictions[
                 start:start + args.metric_window_frames
@@ -221,7 +318,32 @@ def main() -> None:
             print(
                 f"{window_predictions[0][0]:6d}-{window_predictions[-1][0]:6d}  "
                 f"{window['IDF1']:.3f}  {window['MOTA']:.3f}  "
-                f"{window['HOTA']:.3f}  {window['IDSW']:5d}"
+                f"{window['HOTA']:.3f}  {window['IDSW']:5d}  "
+                f"{window['Frag']:4d}"
+            )
+    cumulative_counts = sorted({
+        min(value, len(predictions))
+        for value in args.cumulative_frames
+        if predictions and value <= len(predictions)
+    })
+    if predictions and len(predictions) not in cumulative_counts:
+        cumulative_counts.append(len(predictions))
+    if cumulative_counts:
+        print("\nCumulative metrics (from frame 0)")
+        print("ticks    IDF1   IDP    IDR    HOTA   AssA   MOTA   IDSW  Frag")
+        for count in cumulative_counts:
+            cumulative = evaluate_mot(
+                predictions[:count],
+                gt_frames,
+                frame_offset=best_offset,
+                match_gate_m=args.match_gate_m,
+            )
+            print(
+                f"{count:5d}  {cumulative['IDF1']:.3f}  "
+                f"{cumulative['IDP']:.3f}  {cumulative['IDR']:.3f}  "
+                f"{cumulative['HOTA']:.3f}  {cumulative['AssA']:.3f}  "
+                f"{cumulative['MOTA']:.3f}  {cumulative['IDSW']:5d}  "
+                f"{cumulative['Frag']:4d}"
             )
     if args.switch_details:
         print("\nID switch events (person: previous_frame/GID -> frame/GID):")
@@ -240,6 +362,83 @@ def main() -> None:
             "same_camera_merge_conflicts",
         ):
             print(f"  {name}: {last_metrics.get(name, 0)}")
+    if switch_diagnostics:
+        categories: defaultdict[str, int] = defaultdict(int)
+        for record in switch_diagnostics:
+            categories[record["classification"]] += 1
+        print("\nSwitch diagnostic classes:")
+        for name, count in sorted(categories.items()):
+            print(f"  {name}: {count}")
+
+
+def _classify_switch_events(
+    switch_events,
+    source_maps: dict[int, dict[int, list[tuple[str, int]]]],
+    predictions: list[tuple[int, dict[int, np.ndarray]]],
+    gt_frames: dict[int, dict[int, np.ndarray]],
+    frame_offset: int,
+) -> list[dict]:
+    """Attach bounded local/global context to evaluator switch events."""
+    predictions_by_frame = dict(predictions)
+    records: list[dict] = []
+    for person_id, previous_frame, frame, previous_gid, gid in switch_events:
+        previous_sources = set(
+            source_maps.get(previous_frame, {}).get(previous_gid, [])
+        )
+        current_sources = set(source_maps.get(frame, {}).get(gid, []))
+        shared_local = sorted(previous_sources & current_sources)
+        same_camera_fragment = sorted({
+            camera
+            for camera, local_id in previous_sources
+            for current_camera, current_local_id in current_sources
+            if camera == current_camera and local_id != current_local_id
+        })
+        gap = frame - previous_frame
+        if shared_local:
+            classification = "global_changed_local_stable"
+        elif same_camera_fragment:
+            classification = "local_fragmentation"
+        elif gap == 1:
+            classification = "consecutive_cross_camera_or_global"
+        elif gap <= 30:
+            classification = "short_gap"
+        else:
+            classification = "long_gap"
+
+        frame_gt = gt_frames.get(frame + frame_offset, {})
+        point = frame_gt.get(person_id)
+        neighbor_distance = None
+        if point is not None:
+            distances = [
+                float(np.linalg.norm(point - other))
+                for other_id, other in frame_gt.items()
+                if other_id != person_id
+            ]
+            if distances:
+                neighbor_distance = min(distances)
+        previous_predictions = predictions_by_frame.get(previous_frame, {})
+        current_predictions = predictions_by_frame.get(frame, {})
+        records.append({
+            "event": "evaluator_switch",
+            "person_id": person_id,
+            "previous_frame": previous_frame,
+            "frame": frame,
+            "gap_frames": gap,
+            "previous_gid": previous_gid,
+            "gid": gid,
+            "classification": classification,
+            "previous_sources": sorted(previous_sources),
+            "current_sources": sorted(current_sources),
+            "shared_local_sources": shared_local,
+            "same_camera_fragment": same_camera_fragment,
+            "nearest_gt_person_m": neighbor_distance,
+            "near_crossing": (
+                neighbor_distance is not None and neighbor_distance <= 1.5
+            ),
+            "previous_gid_present_at_switch": previous_gid in current_predictions,
+            "new_gid_present_previous_frame": gid in previous_predictions,
+        })
+    return records
 
 
 def _match_errors(

@@ -149,7 +149,9 @@ def _clear_metrics(sequence):
     previous_match = np.full(sequence["num_gt_ids"], -1, dtype=int)
     previous_frame_match = np.full(sequence["num_gt_ids"], -1, dtype=int)
     previous_frame_index: dict[int, int] = {}
-    tp = fp = fn = id_switches = 0
+    tp = fp = fn = id_switches = fragmentations = 0
+    tracked_before = np.zeros(sequence["num_gt_ids"], dtype=bool)
+    tracked_previous_frame = np.zeros(sequence["num_gt_ids"], dtype=bool)
     similarity_sum = 0.0
     distance_sum = 0.0
     squared_distance_sum = 0.0
@@ -162,10 +164,12 @@ def _clear_metrics(sequence):
         if not len(gt_ids):
             fp += len(tracker_ids)
             previous_frame_match[:] = -1
+            tracked_previous_frame[:] = False
             continue
         if not len(tracker_ids):
             fn += len(gt_ids)
             previous_frame_match[:] = -1
+            tracked_previous_frame[:] = False
             continue
 
         continuation = (
@@ -179,6 +183,12 @@ def _clear_metrics(sequence):
         columns = columns[matched]
         matched_gt = gt_ids[rows]
         matched_tracker = tracker_ids[columns]
+        fragmentations += int(np.sum(
+            tracked_before[matched_gt] & ~tracked_previous_frame[matched_gt]
+        ))
+        tracked_before[matched_gt] = True
+        tracked_previous_frame[:] = False
+        tracked_previous_frame[matched_gt] = True
 
         for row, column, gt_id, tracker_id in zip(
             rows, columns, matched_gt, matched_tracker
@@ -220,6 +230,7 @@ def _clear_metrics(sequence):
         "precision": precision,
         "recall": recall,
         "IDSW": id_switches,
+        "Frag": fragmentations,
         "MOTA": mota,
         "MOTP": motp,
         "MOTP_distance_m": motp_distance,

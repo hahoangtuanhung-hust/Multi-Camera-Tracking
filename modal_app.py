@@ -11,12 +11,12 @@ Later runs reuse the persistent Volume:
 Evaluate a longer sequence and save the returned metrics locally:
 
     modal run modal_app.py --evaluate --max-frames 1800 \
-        --tracking-profile identity-v1-baseline \
+        --tracking-profile identity-v1-drift-guard \
         --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
         --metrics-out mot-metrics.json
 
 The local entrypoint waits for the remote job, then downloads the completed
-MP4. Detection runs on CUDA; decoding, ByteTrack, fusion, and composition run
+MP4. Detection runs on CUDA; decoding, OC-SORT, fusion, and composition run
 on the T4 container's CPU.
 """
 
@@ -26,6 +26,8 @@ from pathlib import Path
 import uuid
 
 import modal
+
+from multicam_tracker.config import DEFAULT_TRACKING_PROFILE
 
 
 APP_NAME = "multicam-tracker-t4"
@@ -63,6 +65,8 @@ def render_on_t4(
     start: int = 0,
     stride: int = 1,
     cameras: list[str] | None = None,
+    tracking_profile: str = DEFAULT_TRACKING_PROFILE,
+    expected_people: int | None = None,
 ) -> dict[str, object]:
     """Run detection/tracking on T4 and persist a validated MP4."""
     import time
@@ -80,6 +84,8 @@ def render_on_t4(
         raise ValueError("start must be >= 0")
     if stride < 1:
         raise ValueError("stride must be >= 1")
+    if expected_people is not None and expected_people < 0:
+        raise ValueError("expected_people must be >= 0")
 
     safe_name = Path(output_name).name
     if safe_name != output_name or Path(safe_name).suffix.lower() != ".mp4":
@@ -112,6 +118,8 @@ def render_on_t4(
         device="cuda",
         model_name=str(model_path),
         cameras=cameras,
+        tracking_profile=tracking_profile,
+        expected_people=expected_people,
     )
     elapsed_s = time.perf_counter() - started
 
@@ -149,7 +157,8 @@ def evaluate_on_t4(
     match_gate_m: float = 1.0,
     metric_window_frames: int = 1000,
     cameras: list[str] | None = None,
-    tracking_profile: str = "identity-v1-baseline",
+    tracking_profile: str = DEFAULT_TRACKING_PROFILE,
+    expected_people: int | None = None,
 ) -> dict[str, object]:
     """Run the full tracker on CUDA and return world-plane MOT metrics."""
     import json
@@ -171,6 +180,8 @@ def evaluate_on_t4(
         raise ValueError("match_gate_m must be a finite positive number")
     if metric_window_frames <= 0:
         raise ValueError("metric_window_frames must be > 0")
+    if expected_people is not None and expected_people < 0:
+        raise ValueError("expected_people must be >= 0")
 
     safe_name = Path(output_name).name
     if safe_name != output_name or Path(safe_name).suffix.lower() != ".json":
@@ -194,6 +205,8 @@ def evaluate_on_t4(
         async_ingest=False,
     )
     apply_tracking_profile(cfg, tracking_profile)
+    if expected_people is not None:
+        cfg.fusion_fixed_population_size = expected_people
     cfg.model_name = str(model_path)
     available = sorted(
         path.name for path in cfg.scene_dir.glob("camera_*") if path.is_dir()
@@ -301,6 +314,16 @@ def evaluate_on_t4(
         "same_camera_merge_conflicts",
         "published_id_preserved_on_merge",
         "peak_retained_global_tracks",
+        "pending_provisional_tracks",
+        "peak_pending_provisional_tracks",
+        "public_identity_slots",
+        "peak_public_identity_slots",
+        "public_gid_allocations",
+        "new_gid_entry_deferred",
+        "new_gid_capacity_deferred",
+        "retirement_deferred_no_exit",
+        "confirmed_identity_exits",
+        "forced_identity_retirements",
         "local_tracks_created",
         "local_track_reactivations",
         "peak_retained_local_tracks",
@@ -316,6 +339,7 @@ def evaluate_on_t4(
         "gpu": torch.cuda.get_device_name(0),
         "cameras": cfg.cameras,
         "tracking_profile": tracking_profile,
+        "expected_people": cfg.fusion_fixed_population_size,
         "switch_gap_buckets": {
             "1": sum(gap == 1 for gap in switch_gaps),
             "2_30": sum(2 <= gap <= 30 for gap in switch_gaps),
@@ -335,6 +359,8 @@ def evaluate_on_t4(
                 "retained_aliases", "retained_affinities",
                 "peak_retained_global_tracks", "retained_local_tracks",
                 "peak_retained_local_tracks",
+                "pending_provisional_tracks", "peak_pending_provisional_tracks",
+                "public_identity_slots", "peak_public_identity_slots",
             )
         },
     })
@@ -382,12 +408,16 @@ def main(
     match_gate_m: float = 1.0,
     metrics_out: str = "modal-mot-metrics.json",
     metric_window_frames: int = 1000,
-    tracking_profile: str = "identity-v1-baseline",
+    tracking_profile: str = DEFAULT_TRACKING_PROFILE,
+    expected_people: int = -1,
 ) -> None:
     """Optionally upload inputs, then render MP4 or evaluate MOT metrics."""
     if upload:
         _upload_assets(Path(data_root).expanduser().resolve(), Path(model).expanduser().resolve())
 
+    if expected_people < -1:
+        raise ValueError("--expected-people must be >= 0, or omitted")
+    expected_people_override = None if expected_people == -1 else expected_people
     selected_cameras = [value.strip() for value in cameras.split(",") if value.strip()]
     if evaluate:
         import json
@@ -407,6 +437,7 @@ def main(
             metric_window_frames=metric_window_frames,
             cameras=selected_cameras or None,
             tracking_profile=tracking_profile,
+            expected_people=expected_people_override,
         )
         local_metrics.parent.mkdir(parents=True, exist_ok=True)
         serializable = {
@@ -427,13 +458,18 @@ def main(
     if local_out.suffix.lower() != ".mp4":
         raise ValueError("--out must end with .mp4")
     remote_name = f"{local_out.stem}-{uuid.uuid4().hex[:10]}.mp4"
-    print(f"Starting Modal T4 render: seconds={seconds}, stride={stride}...")
+    print(
+        f"Starting Modal T4 render: seconds={seconds}, stride={stride}, "
+        f"profile={tracking_profile}..."
+    )
     result = render_on_t4.remote(
         output_name=remote_name,
         seconds=seconds,
         start=start,
         stride=stride,
         cameras=selected_cameras or None,
+        tracking_profile=tracking_profile,
+        expected_people=expected_people_override,
     )
 
     local_out.parent.mkdir(parents=True, exist_ok=True)

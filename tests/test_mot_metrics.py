@@ -24,6 +24,7 @@ class MotMetricTests(unittest.TestCase):
         for name in ("IDF1", "IDP", "IDR", "MOTA", "MOTP", "HOTA", "DetA", "AssA", "LocA"):
             self.assertAlmostEqual(metrics[name], 1.0, msg=name)
         self.assertEqual(metrics["IDSW"], 0)
+        self.assertEqual(metrics["Frag"], 0)
         self.assertAlmostEqual(metrics["MOTP_distance_m"], 0.0)
 
     def test_missing_detection_reduces_identity_and_hota(self) -> None:
@@ -63,6 +64,21 @@ class MotMetricTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["MOTA"], 0.75)
         self.assertAlmostEqual(metrics["HOTA"], np.sqrt(0.5))
         self.assertEqual(metrics["switch_events"][0][3:], (10, 11))
+
+    def test_reacquisition_after_a_missed_visible_frame_is_fragmentation(self) -> None:
+        predictions = [
+            (0, {10: self._point(0.0)}),
+            (1, {}),
+            (2, {10: self._point(2.0)}),
+        ]
+        ground_truth = {
+            frame: {1: self._point(float(frame))} for frame in range(3)
+        }
+
+        metrics = evaluate_mot(predictions, ground_truth)
+
+        self.assertEqual(metrics["Frag"], 1)
+        self.assertEqual(metrics["IDSW"], 0)
 
     def test_point_outside_world_gate_is_fp_and_fn(self) -> None:
         predictions = [(0, {10: self._point(1.01)})]

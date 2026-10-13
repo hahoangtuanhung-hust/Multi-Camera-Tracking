@@ -106,7 +106,7 @@ class RerunLogger:
         self,
         frame_index: int,
         frames: dict[str, np.ndarray],
-        camera_tracks: dict[str, list],   # cam -> list[bytetrack.Track]
+        camera_tracks: dict[str, list],   # cam -> list[local tracker Track]
         local_to_gid: dict[tuple[str, int], int],
         global_tracks: list,              # list[fusion.GlobalTrack]
         fps: float | None = None,

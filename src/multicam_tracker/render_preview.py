@@ -16,8 +16,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .config import PipelineConfig
+from .config import (
+    DEFAULT_TRACKING_PROFILE,
+    PipelineConfig,
+    TRACKING_PROFILE_OVERRIDES,
+    apply_tracking_profile,
+)
 from .demo import run_pipeline
+from .local_tracker import LOCAL_TRACKERS
 from .viz import color_for_id
 
 CELL_W, CELL_H = 480, 270          # camera cell in the grid
@@ -125,6 +131,9 @@ def render_video(
     device: str = "cpu",
     model_name: str | None = None,
     cameras: list[str] | None = None,
+    tracking_profile: str = DEFAULT_TRACKING_PROFILE,
+    local_tracker: str = "ocsort",
+    expected_people: int | None = None,
     gif: Path | None = None,
     gif_fps: int = 10,
 ) -> Path:
@@ -144,8 +153,14 @@ def render_video(
         raise ValueError("stride must be >= 1")
     if gif_fps < 1:
         raise ValueError("gif_fps must be >= 1")
+    if expected_people is not None and expected_people < 0:
+        raise ValueError("expected_people must be >= 0")
 
     cfg = PipelineConfig(data_root=data_root, stride=stride, device=device, async_ingest=False)
+    apply_tracking_profile(cfg, tracking_profile)
+    cfg.local_tracker = local_tracker
+    if expected_people is not None:
+        cfg.fusion_fixed_population_size = expected_people
     if model_name is not None:
         cfg.model_name = model_name
     available = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())
@@ -237,9 +252,21 @@ def main() -> None:
                         help="Process every Nth source frame (default: 1)")
     parser.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"],
                         help="Inference device (default: cpu)")
+    parser.add_argument(
+        "--local-tracker",
+        choices=LOCAL_TRACKERS,
+        default="ocsort",
+        help="Per-camera tracker (default: ocsort)",
+    )
     parser.add_argument("--model", default=None,
                         help="YOLO weights path/name (default from PipelineConfig)")
     parser.add_argument("--cameras", nargs="+", default=None, metavar="CAM")
+    parser.add_argument(
+        "--profile",
+        choices=sorted(TRACKING_PROFILE_OVERRIDES),
+        default=DEFAULT_TRACKING_PROFILE,
+    )
+    parser.add_argument("--expected-people", type=int, default=None)
     parser.add_argument("--gif-fps", type=int, default=10)
     args = parser.parse_args()
 
@@ -252,6 +279,9 @@ def main() -> None:
         device=args.device,
         model_name=args.model,
         cameras=args.cameras,
+        tracking_profile=args.profile,
+        local_tracker=args.local_tracker,
+        expected_people=args.expected_people,
         gif=args.gif,
         gif_fps=args.gif_fps,
     )

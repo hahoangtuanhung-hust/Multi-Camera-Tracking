@@ -14,14 +14,20 @@ import argparse
 import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from time import monotonic
 
 import numpy as np
 
-from .bytetrack import ByteTracker
 from .calibration import load_calibrations
-from .config import PipelineConfig
+from .config import (
+    DEFAULT_TRACKING_PROFILE,
+    PipelineConfig,
+    TRACKING_PROFILE_OVERRIDES,
+    apply_tracking_profile,
+)
 from .detector import PersonDetector
 from .fusion import CameraObservation, GlobalTrackManager, foot_point_xyxy
+from .local_tracker import LOCAL_TRACKERS, create_local_tracker
 from .timebase import ClockModel, FrameBatch
 from .video import AsyncVideoReader, SyncedVideoReader
 
@@ -95,7 +101,7 @@ def run_pipeline(
                 decoder_threads=cfg.decoder_threads,
             )
         batch_iter = reader.iter_batches()
-    trackers = {cam: ByteTracker(cfg) for cam in cfg.cameras}
+    trackers = {cam: create_local_tracker(cfg) for cam in cfg.cameras}
     fusion = GlobalTrackManager(cfg)
     world_motion: dict[tuple[str, int], tuple[float, np.ndarray, np.ndarray]] = {}
     last_capture_ts: dict[str, float] = {}
@@ -144,6 +150,30 @@ def run_pipeline(
                 )
                 for camera, dets in zip(cameras, detections)
             }
+            processing_ts_s = monotonic()
+            for camera in cameras:
+                packet = batch.packets[camera]
+                for event in trackers[camera].last_events:
+                    event = dict(event)
+                    event_name = event.pop("event")
+                    local_id = int(event["local_track_id"])
+                    mapped_gid = fusion.affinity.get((camera, local_id))
+                    if mapped_gid is not None:
+                        mapped_gid = fusion.resolve_gid(mapped_gid)
+                    # Compose one mapping before expansion so a future local
+                    # diagnostic field cannot cause a duplicate-key call
+                    # failure. Pipeline-owned timing/context wins.
+                    event.update({
+                        "event_ts_s": packet.capture_ts_s,
+                        "arrival_ts_s": packet.arrival_ts_s,
+                        "processing_ts_s": processing_ts_s,
+                        "camera_id": camera,
+                        "frame_id": packet.sequence * cfg.stride,
+                        "source_frame_index": packet.source_frame_index,
+                        "detector_ran": True,
+                        "global_id": mapped_gid,
+                    })
+                    fusion.record_diagnostic_event(event_name, **event)
 
             observations: list[CameraObservation] = []
             for camera, tracks in camera_tracks.items():
@@ -203,7 +233,9 @@ def run_pipeline(
                 "camera_tracks": camera_tracks,
                 "observations": observations,
                 "global_tracks": global_tracks,
-                "local_to_gid": dict(fusion.affinity),
+                # Pending negative IDs are internal decision-buffer state and
+                # must never leak into Rerun, MP4 labels, or API consumers.
+                "local_to_gid": fusion.public_affinity_snapshot(),
                 "gid_aliases": dict(fusion.aliases),
                 "calibrations": calibrations,
                 "metrics": {
@@ -214,6 +246,38 @@ def run_pipeline(
                     ),
                     "local_track_reactivations": sum(
                         tracker.metrics["reactivations"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_tracks_removed_tentative": sum(
+                        tracker.metrics["tracks_removed_tentative"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_tracks_removed_timeout": sum(
+                        tracker.metrics["tracks_removed_timeout"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_high_confidence_matches": sum(
+                        tracker.metrics["high_confidence_matches"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_low_confidence_matches": sum(
+                        tracker.metrics["low_confidence_matches"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_ocm_matches": sum(
+                        tracker.metrics["ocm_matches"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_ocr_matches": sum(
+                        tracker.metrics["ocr_matches"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_oru_reupdates": sum(
+                        tracker.metrics["oru_reupdates"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_byte_extension_matches": sum(
+                        tracker.metrics["byte_extension_matches"]
                         for tracker in trackers.values()
                     ),
                     "retained_local_tracks": sum(
@@ -231,6 +295,7 @@ def run_pipeline(
                 },
             }
     finally:
+        fusion.close()
         if reader is not None:
             reader.close()
 
@@ -248,6 +313,12 @@ def main() -> None:
                         help="Print status every N processed ticks (default: 30)")
     parser.add_argument("--device", default=None, choices=["mps", "cpu", "cuda"],
                         help="Inference device (default: cpu)")
+    parser.add_argument(
+        "--local-tracker",
+        choices=LOCAL_TRACKERS,
+        default=None,
+        help="Per-camera tracker (default: ocsort; bytetrack is kept for A/B)",
+    )
     parser.add_argument("--save", default=None, metavar="FILE.rrd",
                         help="Record to a .rrd file instead of opening the viewer")
     parser.add_argument("--async-ingest", action=argparse.BooleanOptionalAction, default=True,
@@ -256,9 +327,24 @@ def main() -> None:
                         help="PyTorch CPU threads (default: up to 4)")
     parser.add_argument("--single-person-mode", action="store_true",
                         help="Optimize matching for at most one real person")
+    parser.add_argument(
+        "--profile",
+        choices=sorted(TRACKING_PROFILE_OVERRIDES),
+        default=DEFAULT_TRACKING_PROFILE,
+        help=f"Named identity policy (default: {DEFAULT_TRACKING_PROFILE})",
+    )
+    parser.add_argument(
+        "--expected-people",
+        type=int,
+        default=None,
+        help="Override fixed public-GID capacity (0 disables the cap)",
+    )
     args = parser.parse_args()
+    if args.expected_people is not None and args.expected_people < 0:
+        parser.error("--expected-people must be >= 0")
 
     cfg = PipelineConfig(data_root=args.data_root)
+    apply_tracking_profile(cfg, args.profile)
     if args.cameras:
         cfg.cameras = args.cameras
     else:
@@ -270,10 +356,14 @@ def main() -> None:
         cfg.stride = args.stride
     if args.device:
         cfg.device = args.device
+    if args.local_tracker:
+        cfg.local_tracker = args.local_tracker
     cfg.async_ingest = args.async_ingest
     if args.cpu_threads is not None:
         cfg.cpu_threads = args.cpu_threads
     cfg.single_person_mode = args.single_person_mode
+    if args.expected_people is not None:
+        cfg.fusion_fixed_population_size = args.expected_people
 
     # Imported here, not at module top: evaluate.py and render_preview.py
     # import run_pipeline from this module and should not pay for (or
@@ -286,7 +376,11 @@ def main() -> None:
     started = t_prev
     processed_ticks = camera_frames = 0
     metrics = {}
-    print(f"Cameras: {', '.join(cfg.cameras)} | device={cfg.device} stride={cfg.stride}")
+    print(
+        f"Cameras: {', '.join(cfg.cameras)} | device={cfg.device} "
+        f"stride={cfg.stride} tracker={cfg.local_tracker} profile={args.profile} "
+        f"identity_slots={cfg.fusion_fixed_population_size or 'unbounded'}"
+    )
 
     for tick in run_pipeline(cfg, max_frames=args.max_frames):
         processed_ticks += 1
