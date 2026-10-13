@@ -76,6 +76,32 @@ uv run evaluate                        # metrics vs. ground truth
 uv run render-preview --gif out.gif    # composite MP4/GIF like the one above
 ```
 
+For a fixed population, the experimental `fixed-population-buffered` profile
+keeps each new fragment under a private negative ID for 0.75 s. It publishes a
+positive GID only after the fragment survives the buffer, is confirmed, and
+(after the 2 s startup bootstrap) begins at an image entry/exit boundary. At
+most 25 public identities are retained by default. A public identity that
+disappears inside the scene remains dormant for reassociation; its slot is
+released only when its last observation supplies boundary-exit evidence.
+
+```bash
+# Live CPU/Rerun, all downloaded cameras, every frame.
+uv run demo --device cpu --stride 1 \
+  --profile fixed-population-buffered --expected-people 25
+
+# Local MP4 using the same identity policy.
+uv run render-preview --device cpu --stride 1 --seconds 60 \
+  --profile fixed-population-buffered --expected-people 25 \
+  --out fixed-population.mp4
+```
+
+The runtime default is `identity-v1-drift-guard`; the fixed-population policy
+remains experimental until it passes a long-sequence IDF1/HOTA comparison.
+Without ReID/FaceID, a person who
+leaves and later enters at an unrelated boundary remains fundamentally
+ambiguous; the fixed capacity prevents ID proliferation but cannot prove that
+two disconnected trajectories belong to the same person.
+
 ### Render MP4 or evaluate MOT metrics on Modal T4
 
 The Modal entrypoint uploads only `data/custom` plus the local model to a persistent Volume,
@@ -94,6 +120,12 @@ uv run --extra modal modal run modal_app.py \
 # Reuse the uploaded data/model on later jobs:
 uv run --extra modal modal run modal_app.py \
   --seconds 60 --stride 1 --out modal-result.mp4
+
+# Render with buffered fixed-population identity allocation:
+uv run --extra modal modal run modal_app.py \
+  --seconds 60 --stride 1 \
+  --tracking-profile fixed-population-buffered --expected-people 25 \
+  --out fixed-population-modal.mp4
 ```
 
 Select a subset with a comma-separated list such as
@@ -109,14 +141,14 @@ upload. Camera names must remain one comma-separated CLI argument:
 # 1 minute at 30 FPS; saves the full result locally as JSON.
 uv run --extra modal modal run modal_app.py \
   --evaluate --max-frames 1800 \
-  --tracking-profile identity-v1-baseline \
+  --tracking-profile identity-v1-drift-guard \
   --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
   --metrics-out mot-metrics-1800.json
 
 # A longer 10-minute evaluation (subject to the available source length).
 uv run --extra modal modal run modal_app.py \
   --evaluate --max-frames 9000 \
-  --tracking-profile identity-v1-baseline \
+  --tracking-profile identity-v1-drift-guard \
   --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
   --metric-window-frames 1000 \
   --metrics-out mot-metrics-9000.json
@@ -155,7 +187,7 @@ flowchart LR
     subgraph tick ["event-time pipeline — dynamic camera batches"]
         V["<b>FramePacket readers</b><br/>video.py<br/><i>capture + arrival timestamps</i>"]
         D["<b>PersonDetector</b><br/>detector.py<br/><i>YOLO26n, one batched call</i>"]
-        T["<b>ByteTracker × N</b><br/>bytetrack.py<br/><i>local IDs per camera</i>"]
+        T["<b>OCSortTracker × N</b><br/>ocsort.py<br/><i>local IDs per camera</i>"]
         P["<b>CameraCalibration</b><br/>calibration.py<br/><i>foot pixel → world meters</i>"]
         F["<b>GlobalTrackManager</b><br/>fusion.py<br/><i>global IDs on ground plane</i>"]
         V --> D --> T --> P --> F
@@ -174,14 +206,14 @@ flowchart LR
 sequenceDiagram
     participant R as SyncedVideoReader
     participant Y as PersonDetector
-    participant B as ByteTracker per camera
+    participant B as OC-SORT per camera
     participant C as CameraCalibration
     participant G as GlobalTrackManager
     participant Z as RerunLogger
 
     R->>Y: dynamic {cam: FramePacket}
     Y->>B: per-cam detections (M, 5) [x1 y1 x2 y2 conf]
-    Note over B: KF predict → IoU Hungarian →<br/>low-conf rescue → lifecycle
+    Note over B: KF predict → OCM Hungarian →<br/>OCR/ORU recovery → lifecycle
     B->>C: confirmed Tracks (local_id, bbox)
     C->>G: CameraObservation(cam, local_id, capture_ts, world_xy, velocity)
     Note over G: 5 s metadata history → offset scan →<br/>trajectory gates + Hungarian → canonical gid
@@ -195,7 +227,7 @@ sequenceDiagram
 |---|---|---|---|
 | `FramePacket` | `video.py` | `camera`, image, `capture_ts_s`, `arrival_ts_s`, sequence, source index, quality | separates event time from transport/processing time |
 | detections | `PersonDetector` | `(M, 5)` float32 `[x1, y1, x2, y2, conf]` | people found in one frame |
-| `Track` | `ByteTracker` | `track_id`, Kalman box, `hits`, `misses`, `confirmed` | one person, one camera, stable local ID |
+| `OCTrack` | `OCSortTracker` | `track_id`, Kalman box, observed direction, `hits`, `misses`, `confirmed` | one person, one camera, stable local ID |
 | `CameraObservation` | `demo.run_pipeline` | `camera`, `local_id`, capture time, `world_xy`, world velocity, bbox, confidence | a confirmed track projected to the floor |
 | `TimedWorldPoint` | `TrackletStore` | timestamp, 2D position/velocity, confidence | metadata-only history; no image or appearance embedding |
 | `GlobalTrack` | `GlobalTrackManager` | `gid`, fused Kalman `world_xy`, `trail`, supporting `cameras` | one *physical person* across all cameras |
@@ -208,11 +240,11 @@ sequenceDiagram
 | Fusion strategy | **Late fusion** (fuse tracks, not pixels) | Matches DeepStream MV3DT; modular, camera dropout degrades gracefully. Early fusion (BEV feature projection) is more accurate on dense scenes but monolithic. |
 | Fusion topology | **Centralized** manager | One readable class. MV3DT distributes this over MQTT peers — great production property, unnecessary complexity for learning. |
 | Association cost | **Trajectory only** | Position RMSE, velocity RMSE, direction, overlap and confidence. No ReID/FaceID. |
-| Per-camera tracker | **Vendored ~200-line ByteTrack** | The tracker *is* course material; a dependency would hide it. Also lets one batched detector feed N trackers (libraries typically tie tracker state to model instances). |
+| Per-camera tracker | **Vendored OC-SORT, motion-only** | Observation momentum, last-observation recovery and Kalman re-update improve crossings/occlusion without ReID. The former ByteTrack backend remains available for A/B. |
 | Detection | **One batched YOLO26n call** for all cameras | Amortizes per-call overhead exactly like DeepStream's `nvinfer` stream batching; NMS-free architecture removes a postprocessing stage. |
 | Time base | **Capture event time in seconds** | Handles 1–3 s camera skew, irregular FPS, delayed arrival and clock drift; ticks remain a legacy fallback. |
 | Visualization | **Rerun** | Camera grid + 3D world + timeline scrubbing in one dependency; a custom web UI would cost hundreds of lines and lose replay. |
-| State estimation | **One generic constant-velocity Kalman class** | Reused at two altitudes: pixel boxes (`bytetrack.py`) and world meters (`fusion.py`) — one motion model to learn, two applications. |
+| State estimation | **One generic constant-velocity Kalman class** | Reused at two altitudes: pixel boxes (`ocsort.py`) and world meters (`fusion.py`); the implementation currently lives in `bytetrack.py` for backward compatibility. |
 
 ### Coordinate systems
 
@@ -255,18 +287,23 @@ in **all cameras with one batched inference call** per tick. YOLO26 is
 end-to-end (no NMS postprocessing) and runs on Apple's GPU via PyTorch
 MPS, or on CPU with `--device cpu`.
 
-### 3. Single-camera tracking (`bytetrack.py`)
+### 3. Single-camera tracking (`ocsort.py`)
 
 Detection says *where people are*; tracking says *who is who over time*.
-Each camera runs a ~200-line simplified [ByteTrack](https://arxiv.org/abs/2110.06864):
+Each camera runs a motion-only [OC-SORT](https://arxiv.org/abs/2203.14360) tracker:
 
-- A **constant-velocity Kalman filter** per person predicts the next box,
-  so matching survives motion and missed detections.
-- **Hungarian matching** on IoU associates predictions with detections.
-- **Two-stage association** (ByteTrack's key idea): unmatched tracks get a
-  second chance against *low-confidence* detections — which is usually
-  what an occluded person looks like — rescuing tracks that a single-pass
-  tracker would drop.
+- **Observation-centric momentum (OCM)** adds observed movement direction to
+  IoU Hungarian matching, helping identities keep ownership while crossing.
+- **Observation-centric recovery (OCR)** retries unmatched tracks against the
+  last real detection instead of trusting a drifting Kalman prediction alone.
+- **Observation-centric re-update (ORU)** is available to rebuild the Kalman
+  trajectory with virtual observations after an occlusion. It is release-gated
+  off by default because the current scene's A/B reduced IDF1 when it was on.
+- The optional **BYTE low-confidence extension** is enabled by default to keep
+  partially occluded tracks alive; low-confidence boxes never create IDs.
+
+No appearance embedding, ReID model, or FaceID is used. Select the legacy
+backend for a direct A/B with `--local-tracker bytetrack`.
 
 Per-camera IDs still fragment under long occlusions (watch the racks in
 camera_0001). That's expected — and it's exactly what the next stage fixes.
@@ -332,7 +369,7 @@ debugging trackers.
 | Hardware | NVIDIA GPU (x86 Linux / Jetson) | Any laptop (MPS / CPU) |
 | Ingest | GStreamer + NVDEC, `nvstreammux` | OpenCV `VideoCapture` |
 | Detection | PeopleNet Transformer / RT-DETR (TensorRT) | YOLO26n (PyTorch, batched) |
-| Per-camera tracking | NvMultiObjectTracker, SV3DT 3D human model | Simplified ByteTrack (this repo) |
+| Per-camera tracking | NvMultiObjectTracker, SV3DT 3D human model | Motion-only OC-SORT (this repo) |
 | Cross-camera | Distributed peers over MQTT, RMSE tracklet matching, visibility-weighted Kalman fusion | Centralized event-time tracklets + camera clock estimation + gated Hungarian + canonical IDs |
 | Calibration | AutoMagicCalib (no checkerboards) | Provided by the dataset |
 | Output | Kafka protobuf + OSD + BEV visualizer | Rerun viewer / .rrd / MP4 |
@@ -358,6 +395,7 @@ mean matched distance in metres (lower is better) are printed.
 
 ```bash
 uv run evaluate --max-frames 60 --device cpu \
+  --profile fixed-population-buffered --expected-people 25 \
   --cameras camera_0001 camera_0007 camera_0008 camera_0010
 ```
 
@@ -389,16 +427,44 @@ adaptive published-pair softening was harmful:
 
 | Fusion profile | IDF1 | HOTA | MOTA | IDSW |
 |---|---:|---:|---:|---:|
-| `identity-v1-baseline` (default) | 0.705 | 0.480 | 0.594 | 39 |
+| `identity-v1-baseline` (rollback) | 0.705 | 0.480 | 0.594 | 39 |
+| `identity-v1-drift-guard` (default) | 0.709 | 0.483 | 0.595 | 33 |
 | Pre-identity-v2 | 0.703 | 0.469 | 0.542 | 42 |
 | Batch reconnect only | 0.703 | 0.469 | 0.542 | 42 |
 | Duplicate suppression only | 0.704 | 0.469 | 0.542 | 42 |
 | Adaptive hysteresis only | 0.681 | 0.466 | 0.538 | 51 |
 | Full fusion safeguards, local motion off | 0.681 | 0.467 | 0.539 | 51 |
 
-The decisive comparison is the full 9,000-frame Modal T4 evaluation. The
-strict release gate was **not met**, so the default remains
-`identity-v1-baseline`; experimental improvements must be selected explicitly.
+`identity-v1-drift-guard` changes only online camera-clock learning. When
+different matched people imply timestamp shifts spread by more than 0.40 s,
+that camera-pair update is rejected instead of feeding an ambiguous crossing
+back into later event-time association. A single trajectory, or multiple
+trajectories that agree, can still learn the full ±3 s configured offset; no
+appearance, ReID, FaceID, frame skipping, or fixed-population assumption is
+used.
+
+On the same 300-frame CPU evaluation, `fixed-population-buffered` retained 25
+public slots and reduced ID switches from 39 to 30, but scored IDF1 0.673,
+HOTA 0.438 and MOTA 0.519. Its 0.75 s publication delay plus strict
+entry/capacity checks lower short-sequence recall. Use it when preventing GID
+proliferation is the priority, and validate it on the full sequence before
+considering it as the default profile.
+
+The older identity-v2 candidates below were compared on the full 9,000-frame
+Modal T4 evaluation. They missed the strict release gate and remain explicit
+experiments. The newer drift guard is deliberately smaller in scope and was
+accepted from a same-input CPU A/B capped at 1,000 frames:
+
+| 1,000-frame profile | IDF1 | IDP | IDR | HOTA | AssA | MOTA | IDSW |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `identity-v1-baseline` | 0.539 | 0.484 | 0.608 | 0.346 | 0.318 | 0.523 | 181 |
+| `identity-v1-drift-guard` | **0.574** | **0.517** | **0.644** | **0.359** | **0.340** | **0.530** | **161** |
+
+The guard therefore reduced ID switches by 20 (11.0%) while improving both
+identity precision and recall. On the cached 300-frame A/B it also reduced
+CLEAR fragmentations from 54 to 53. The historical 9,000-frame results remain
+useful evidence that the broader identity-v2 policies should not be enabled by
+default:
 
 | Profile/result | IDF1 | HOTA | AssA | IDSW | MOTA | RMSE | FP | tick/s |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -450,9 +516,31 @@ To benchmark inference, tracking and fusion separately from visualization:
 
 ```bash
 uv run python benchmarks/cpu_pipeline.py --frames 300 --out data/cpu-audit/run.json
+uv run python benchmarks/cpu_pipeline.py --frames 300 \
+  --tracking-profile identity-v1-drift-guard \
+  --out data/cpu-audit/drift-guard.json
 uv run python benchmarks/cpu_pipeline.py --frames 100 --profile --out data/cpu-audit/profile.json
-uv run python benchmarks/state_retention.py
+uv run python benchmarks/state_retention.py \
+  --tracking-profile identity-v1-drift-guard
 ```
+
+For a bounded decision audit, stream fusion events and evaluator-attributed
+ID switches directly to JSONL:
+
+```bash
+uv run evaluate --device cpu --max-frames 300 \
+  --profile identity-v1-drift-guard \
+  --identity-events data/cpu-audit/identity-events.jsonl \
+  --cameras camera_0001 camera_0007 camera_0008 camera_0010
+```
+
+The JSONL includes local birth/match/miss/removal lifecycle data (state,
+association cost, threshold, predicted/detected boxes), global
+birth/publication/merge/reconnect/expiry decisions, capture/arrival/processing
+timestamps, clock corrections and rejected clock updates, plus
+local-fragment/crossing context for each measured ID switch.
+`--identity-events-max` bounds fusion events;
+the default is 250,000 and `0` explicitly means unlimited.
 
 The benchmark uses the four configured default cameras and records actual
 tick throughput, RSS and tracking quality. The CLI demo/evaluator/renderer
@@ -471,7 +559,9 @@ src/multicam_tracker/
 ├── timebase.py           # FramePacket and affine camera clock contract
 ├── video.py              # lockstep dataset + bounded async readers
 ├── detector.py           # batched YOLO26 wrapper
-├── bytetrack.py          # Kalman filter + simplified ByteTrack
+├── local_tracker.py      # local tracker factory (OC-SORT default)
+├── ocsort.py             # OCM + OCR + ORU local tracker
+├── bytetrack.py          # shared Kalman + legacy ByteTrack A/B backend
 ├── fusion.py             # cross-camera association — the core idea
 ├── tracklets.py          # 5 s history, offset estimation, trajectory matcher
 ├── faults.py             # delay/jitter/drop/clock-skew simulation
@@ -490,7 +580,8 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | Knob | Default | Effect |
 |---|---|---|
 | `stride` | 1 | detect/track every decoded frame; values >1 explicitly skip frames |
-| `conf_threshold` | 0.25 | detection floor; low values feed ByteTrack's rescue stage |
+| `local_tracker` | `ocsort` | per-camera backend; set `bytetrack` only for rollback/A/B |
+| `conf_threshold` | 0.25 | detection floor; low values feed OC-SORT's optional BYTE extension |
 | `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
 | `track_max_age` | 60 ticks | legacy no-timestamp fallback (~2 s at 30 fps) |
 | `track_max_age_s` | 2.0 s | timestamp-mode local-track timeout |
@@ -498,6 +589,12 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `track_kf_robust_nis_threshold` | 0 (off) | optionally down-weight statistically extreme bbox updates; tune against IDSW before enabling |
 | `track_kf_adaptive_noise` | false | optionally scale Kalman noise with bbox height |
 | `track_motion_association_enabled` | false | experimental local Mahalanobis/size/direction association; enable through `identity-full` only |
+| `ocsort_delta_t` | 3 ticks | observation look-back used to estimate motion direction |
+| `ocsort_inertia` | 0.10 | weight of observation-direction consistency in primary matching |
+| `ocsort_use_byte` | true | allow low-confidence boxes to update an existing track, never to create one |
+| `ocsort_observation_recovery_enabled` | true | enable last-observation recovery (OCR) after prediction mismatch |
+| `ocsort_oru_enabled` | false | optional virtual Kalman re-update; release A/B keeps it off because it reduced IDF1 |
+| `ocsort_oru_min_misses` | 2 ticks | avoid rebuilding motion from a one-frame merged detection at a crossing |
 | `fusion_gate_m` | 2.0 m | max world distance for cross-camera association |
 | `fusion_merge_m` | 1.0 m | cluster radius when grouping new observations |
 | `fusion_max_age` | 90 ticks | legacy no-timestamp fallback (~3 s at 30 fps) |
@@ -521,6 +618,7 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `fusion_min_hits` | 3 | ticks of support before a global track is shown |
 | `tracklet_history_s` | 5.0 s | bounded metadata history per local ID |
 | `max_camera_offset_s` | 3.0 s | coarse residual clock-offset search radius |
+| `clock_max_pair_delta_spread_s` | 0.40 s | reject inconsistent multi-person clock evidence; `identity-v1-baseline` restores the legacy unlimited value |
 | `tracklet_min_duration_s` / `tracklet_min_overlap_s` | 1.0 / 0.8 s | evidence required before cross-camera merge |
 | `tracklet_position_gate_m` | 0.85 m | maximum accepted trajectory position RMSE |
 | `tracklet_velocity_gate_mps` | 0.90 m/s | maximum accepted trajectory velocity RMSE |
@@ -571,6 +669,7 @@ python benchmarks/tracklet_matching.py
 
 - NVIDIA, [Multi-View 3D Tracking in DeepStream](https://docs.nvidia.com/metropolis/deepstream/dev-guide/text/DS_MV3DT.html) · [Build a Multi-Camera 3D Tracking Application with DeepStream 9.1 Skills](https://developer.nvidia.com/blog/build-a-multi-camera-3d-tracking-application-with-nvidia-deepstream-9-1-skills/)
 - Zhang et al., [ByteTrack: Multi-Object Tracking by Associating Every Detection Box](https://arxiv.org/abs/2110.06864), ECCV 2022
+- Cao et al., [Observation-Centric SORT: Rethinking SORT for Robust Multi-Object Tracking](https://arxiv.org/abs/2203.14360), CVPR 2023
 - Aharon et al., [BoT-SORT: Robust Associations Multi-Pedestrian Tracking](https://arxiv.org/abs/2206.14651), 2022
 - Zhou et al., [Omni-Scale Feature Learning for Person Re-Identification](https://arxiv.org/abs/1905.00953) (OSNet), ICCV 2019
 - Chavdarova et al., [WILDTRACK: A Multi-camera HD Dataset for Dense Unscripted Pedestrian Detection](https://openaccess.thecvf.com/content_cvpr_2018/papers/Chavdarova_WILDTRACK_A_Multi-Camera_CVPR_2018_paper.pdf), CVPR 2018

@@ -45,6 +45,7 @@ def _score(predictions, gt_frames):
         "recall": metrics["recall"],
         "rmse": metrics["position_RMSE_m"],
         "switches": metrics["IDSW"],
+        "fragmentations": metrics["Frag"],
         "idf1": metrics["IDF1"],
         "mota": metrics["MOTA"],
         "hota": metrics["HOTA"],

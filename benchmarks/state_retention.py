@@ -9,7 +9,12 @@ from time import perf_counter
 import numpy as np
 import psutil
 
-from multicam_tracker.config import PipelineConfig
+from multicam_tracker.config import (
+    PipelineConfig,
+    TRACKING_PROFILE_OVERRIDES,
+    DEFAULT_TRACKING_PROFILE,
+    apply_tracking_profile,
+)
 from multicam_tracker.fusion import CameraObservation, GlobalTrackManager
 
 
@@ -17,8 +22,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ticks", type=int, default=3600)
     parser.add_argument("--out", type=Path, default=Path("data/cpu-audit/retention.json"))
+    parser.add_argument(
+        "--tracking-profile",
+        choices=sorted(TRACKING_PROFILE_OVERRIDES),
+        default=DEFAULT_TRACKING_PROFILE,
+    )
     args = parser.parse_args()
     cfg = PipelineConfig(cameras=["a", "b", "c", "d"], fusion_min_hits=1)
+    apply_tracking_profile(cfg, args.tracking_profile)
     manager = GlobalTrackManager(cfg)
     process = psutil.Process()
     samples = []
@@ -45,7 +56,9 @@ def main() -> None:
             assert sample["aliases"] <= 4 * 7
             assert sample["affinities"] <= 4 * 7
             assert sample["members"] <= 4 * 7
+    manager.close()
     summary = {"ticks": args.ticks, "event_seconds": args.ticks / 30.,
+               "tracking_profile": args.tracking_profile,
                "elapsed_s": perf_counter() - started, "samples": samples}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(summary, indent=2), encoding="utf-8")

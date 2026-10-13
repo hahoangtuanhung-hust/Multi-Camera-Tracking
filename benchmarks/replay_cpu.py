@@ -8,14 +8,21 @@ import json
 from pathlib import Path
 import pickle
 import sys
+from collections import defaultdict
 from unittest.mock import patch
 
 import numpy as np
 
 from multicam_tracker import bytetrack, fusion, tracklets
-from multicam_tracker.config import PipelineConfig
+from multicam_tracker.config import PipelineConfig, TRACKING_PROFILE_OVERRIDES, apply_tracking_profile
 from multicam_tracker.demo import run_pipeline
-from multicam_tracker.evaluate import ground_truth_by_frame
+from multicam_tracker.evaluate import (
+    _classify_switch_events,
+    _match_errors,
+    ground_truth_by_frame,
+)
+from multicam_tracker.mot_metrics import evaluate_mot
+from multicam_tracker.local_tracker import LOCAL_TRACKERS
 from multicam_tracker.timebase import FrameBatch, FramePacket
 from evaluate_thresholds import _score
 
@@ -25,6 +32,37 @@ def main():
     parser.add_argument("--baseline-source", type=Path, required=True)
     parser.add_argument("--detections", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--only-current", action="store_true")
+    parser.add_argument(
+        "--profile",
+        choices=sorted(TRACKING_PROFILE_OVERRIDES),
+        default="identity-v1-baseline",
+    )
+    parser.add_argument("--identity-events", type=Path)
+    parser.add_argument(
+        "--local-tracker",
+        choices=LOCAL_TRACKERS,
+        default="ocsort",
+        help="Per-camera tracker used by the current pipeline replay",
+    )
+    parser.add_argument("--ocsort-inertia", type=float, default=None)
+    parser.add_argument("--ocsort-delta-t", type=int, default=None)
+    parser.add_argument("--ocsort-oru-min-misses", type=int, default=None)
+    parser.add_argument(
+        "--ocsort-use-byte",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ocsort-observation-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ocsort-oru",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     args = parser.parse_args()
     package = args.baseline_source / "multicam_tracker"
     spec = importlib.util.spec_from_file_location("baseline_tracker", package / "__init__.py",
@@ -36,8 +74,43 @@ def main():
     base_tracking = importlib.import_module("baseline_tracker.bytetrack")
     base_tracklets = importlib.import_module("baseline_tracker.tracklets")
     base_fusion = importlib.import_module("baseline_tracker.fusion")
-    rows = pickle.loads(args.detections.read_bytes())
-    cfg = PipelineConfig()
+    payload = pickle.loads(args.detections.read_bytes())
+    metadata = None
+    if isinstance(payload, dict) and payload.get("metadata", {}).get("schema") == "multicam-detection-cache-v2":
+        metadata = payload["metadata"]
+        rows = payload["rows"]
+        if metadata.get("ticks") != len(rows):
+            raise ValueError("Detection cache tick count does not match its metadata")
+        print(json.dumps(metadata, indent=2), flush=True)
+    else:
+        # Backward compatibility for trusted, local v1 cache files.
+        rows = payload
+    cfg = PipelineConfig(async_ingest=False)
+    apply_tracking_profile(cfg, args.profile)
+    cfg.local_tracker = args.local_tracker
+    if args.ocsort_inertia is not None:
+        cfg.ocsort_inertia = args.ocsort_inertia
+    if args.ocsort_delta_t is not None:
+        cfg.ocsort_delta_t = args.ocsort_delta_t
+    if args.ocsort_oru_min_misses is not None:
+        cfg.ocsort_oru_min_misses = args.ocsort_oru_min_misses
+    if args.ocsort_use_byte is not None:
+        cfg.ocsort_use_byte = args.ocsort_use_byte
+    if args.ocsort_observation_recovery is not None:
+        cfg.ocsort_observation_recovery_enabled = args.ocsort_observation_recovery
+    if args.ocsort_oru is not None:
+        cfg.ocsort_oru_enabled = args.ocsort_oru
+    if metadata is not None:
+        cache_input = metadata.get("input", {})
+        if int(cache_input.get("stride", cfg.stride)) != cfg.stride:
+            raise ValueError("Detection cache stride does not match replay stride")
+        cfg.cameras = list(cache_input.get("cameras", cfg.cameras))
+        cfg.camera_start_frame_offsets = {
+            str(camera): int(offset)
+            for camera, offset in cache_input.get(
+                "camera_start_frame_offsets", cfg.camera_start_frame_offsets
+            ).items()
+        }
     gt = ground_truth_by_frame(cfg.scene_dir, cfg.cameras, cfg.camera_start_frame_offsets)
     scores = {}
 
@@ -56,17 +129,77 @@ def main():
             yield FrameBatch(packets, max(p.arrival_ts_s for p in packets.values()))
 
     def score(name, pipeline=run_pipeline):
-        predictions = [(tick["frame_index"], {track.gid: track.world_xy.copy() for track in tick["global_tracks"]})
-                       for tick in pipeline(cfg, batch_iter=batches(), detector=Detector())]
+        predictions = []
+        source_maps = {}
+        last_pipeline_metrics = {}
+        previous_diagnostics_path = cfg.identity_diagnostics_path
+        cfg.identity_diagnostics_path = (
+            args.identity_events if name == "current" else None
+        )
+        try:
+            for tick in pipeline(cfg, batch_iter=batches(), detector=Detector()):
+                predictions.append((
+                    tick["frame_index"],
+                    {track.gid: track.world_xy.copy() for track in tick["global_tracks"]},
+                ))
+                if args.identity_events and name == "current":
+                    sources = defaultdict(list)
+                    for observation in tick["observations"]:
+                        key = observation.camera, int(observation.local_id)
+                        gid = tick["local_to_gid"].get(key)
+                        if gid is not None:
+                            sources[int(gid)].append(key)
+                    source_maps[tick["frame_index"]] = dict(sources)
+                last_pipeline_metrics = tick["metrics"]
+        finally:
+            cfg.identity_diagnostics_path = previous_diagnostics_path
         scores[name] = _score(predictions, gt)
+        for metric in (
+            "local_tracks_created",
+            "local_track_reactivations",
+            "local_tracks_removed_tentative",
+            "local_tracks_removed_timeout",
+            "local_high_confidence_matches",
+            "local_low_confidence_matches",
+            "local_ocm_matches",
+            "local_ocr_matches",
+            "local_oru_reupdates",
+            "local_byte_extension_matches",
+        ):
+            scores[name][metric] = last_pipeline_metrics.get(metric, 0)
+        if args.identity_events and name == "current":
+            best_offset = min(
+                (0, 1, 2),
+                key=lambda offset: np.sqrt(np.mean(np.square(
+                    _match_errors(predictions[:100], gt, offset)
+                ))) if _match_errors(predictions[:100], gt, offset) else float("inf"),
+            )
+            full = evaluate_mot(predictions, gt, frame_offset=best_offset)
+            diagnostics = _classify_switch_events(
+                full["switch_events"], source_maps, predictions, gt, best_offset
+            )
+            with args.identity_events.open("a", encoding="utf-8") as destination:
+                for record in diagnostics:
+                    destination.write(json.dumps(record) + "\n")
+            classes = defaultdict(int)
+            for record in diagnostics:
+                classes[record["classification"]] += 1
+            scores[name]["switch_classes"] = dict(classes)
         print(name, scores[name], flush=True)
         args.out.write_text(json.dumps(scores, indent=2), encoding="utf-8")
+
+    if args.only_current:
+        score("current")
+        return
 
     score("baseline", base_demo.run_pipeline)
     score("current")
     with patch.object(bytetrack, "match_by_iou", base_tracking.match_by_iou):
         score("old_iou")
-    with patch.object(bytetrack.ByteTracker, "update", base_tracking.ByteTracker.update):
+    with patch(
+        "multicam_tracker.demo.create_local_tracker",
+        side_effect=lambda current_cfg: base_tracking.ByteTracker(current_cfg),
+    ):
         score("old_local_lifecycle")
     with patch.object(fusion.GlobalTrackManager, "_has_same_camera_conflict", base_fusion.GlobalTrackManager._has_same_camera_conflict):
         score("old_same_camera_conflict")

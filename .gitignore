@@ -5,6 +5,7 @@ data/
 *.onnx
 *.mp4
 calibration_check/
+*.json
 
 # Python
 __pycache__/
