@@ -107,6 +107,10 @@ class PipelineConfig:
     # filter from it can lock in the wrong direction, so ORU starts only after
     # a genuine multi-frame observation gap.
     ocsort_oru_min_misses: int = 2
+    # Hybrid-SORT: weight for last-observation IoU in the two-round blended
+    # association. 0.0 degenerates to OC-SORT; 1.0 ignores Kalman predictions.
+    # Paper default is ~0.35–0.45 for appearance-free settings.
+    hybridsort_alpha: float = 0.40
 
     # --- cross-camera fusion (fusion.py) ---
     fusion_gate_m: float = 2.0      # max world-plane distance (meters) to match
@@ -447,13 +451,39 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "fusion_gid_ownership_hysteresis_enabled": False,
         "clock_max_pair_delta_spread_s": float("inf"),
     },
+    # Hybrid-SORT (no ReID): two-round primary association blending
+    # Kalman-IoU with last-observation-IoU. Uses the same fusion identity
+    # policy as identity-v1-drift-guard so the comparison is controlled.
+    # alpha=0.40: observation IoU accounts for 40% of the blended score;
+    # keeping it below 0.5 means Kalman motion continuity still dominates
+    # for clearly visible tracks while strongly helping after occlusion.
+    "hybridsort": {
+        "local_tracker": "hybridsort",
+        "hybridsort_alpha": 0.40,
+        "track_motion_association_enabled": False,
+        "fusion_identity_retention_s": 3.0,
+        "fusion_provisional_buffer_enabled": False,
+        "fusion_provisional_buffer_bootstrap_s": 0.0,
+        "fusion_batch_reconnect_enabled": False,
+        "fusion_adaptive_hysteresis_enabled": False,
+        "fusion_published_motion_gate_enabled": False,
+        "fusion_duplicate_suppression_enabled": False,
+        "fusion_duplicate_merge_m": 0.0,
+        "fusion_local_reconnect_long_window_s": 3.0,
+        "fusion_local_reconnect_window_s": 3.0,
+        "fusion_local_reconnect_covariance_enabled": False,
+        "fusion_local_reconnect_confirmations": 1,
+        "fusion_local_reconnect_velocity_weight_s": 0.0,
+        "fusion_gid_ownership_hysteresis_enabled": False,
+        "fusion_instant_confirmations": 1,
+        "fusion_published_merge_confirmations": 1,
+        "clock_max_pair_delta_spread_s": 0.40,
+    },
 }
 
-# The CPU 1,000-frame release benchmark selected this policy over the exact
-# historical baseline.  Keeping the name in one place prevents the local,
-# evaluation, preview, benchmark, and Modal entrypoints from silently drifting
-# to different identity policies.
-DEFAULT_TRACKING_PROFILE = "identity-v1-drift-guard"
+# This branch uses Hybrid-SORT as the default local tracker.
+# Set to "identity-v1-drift-guard" or "identity-v1-baseline" for A/B.
+DEFAULT_TRACKING_PROFILE = "hybridsort"
 
 
 def apply_tracking_profile(cfg: PipelineConfig, profile: str) -> PipelineConfig:

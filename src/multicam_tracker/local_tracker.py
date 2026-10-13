@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from .bytetrack import ByteTracker
 from .config import PipelineConfig
+from .hybridsort import HybridSortTracker
 from .ocsort import OCSortTracker
 
 
-LOCAL_TRACKERS = ("ocsort", "bytetrack")
+LOCAL_TRACKERS = ("hybridsort", "ocsort", "bytetrack")
 
 
 def create_local_tracker(cfg: PipelineConfig):
     """Construct the configured local tracker with the shared pipeline API."""
     name = cfg.local_tracker.strip().lower()
+    if name == "hybridsort":
+        return HybridSortTracker(cfg)
     if name == "ocsort":
         return OCSortTracker(cfg)
     if name == "bytetrack":
