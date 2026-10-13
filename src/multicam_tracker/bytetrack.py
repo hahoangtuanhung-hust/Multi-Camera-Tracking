@@ -22,6 +22,7 @@ tracks on the world ground plane — one motion model, two altitudes.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
@@ -116,6 +117,39 @@ class ConstantVelocityKalman:
         self.x = self.x + K @ innovation
         self.P = (self._identity - K @ self.H) @ self.P
 
+    def projected_measurement(
+        self,
+        dt: float = 0.0,
+        process_noise_scale: float = 1.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return future measurement mean/covariance without mutating state.
+
+        Fusion uses this for statistically gated fragment reconnection. A
+        longer gap naturally grows covariance, while an implausible position
+        can still be rejected by its normalized innovation distance.
+        """
+        if not np.isfinite(dt) or dt < 0:
+            raise ValueError(f"Kalman dt must be non-negative, got {dt}")
+        if not np.isfinite(process_noise_scale) or process_noise_scale < 0:
+            raise ValueError(
+                "Kalman process-noise scale must be non-negative, "
+                f"got {process_noise_scale}"
+            )
+        transition = np.eye(2 * self.m)
+        index = np.arange(self.m)
+        transition[index, index + self.m] = dt
+        q = self.process_noise * process_noise_scale
+        process_cov = np.zeros_like(self.P)
+        process_cov[index, index] = q * dt**4 / 4
+        process_cov[index, index + self.m] = q * dt**3 / 2
+        process_cov[index + self.m, index] = q * dt**3 / 2
+        process_cov[index + self.m, index + self.m] = q * dt**2
+        predicted_state = transition @ self.x
+        predicted_covariance = transition @ self.P @ transition.T + process_cov
+        mean = self.H @ predicted_state
+        covariance = self.H @ predicted_covariance @ self.H.T + self.R
+        return mean, covariance
+
     @property
     def position(self) -> np.ndarray:
         return self.x[: self.m]
@@ -156,6 +190,99 @@ def match_by_iou(tracks_xyxy: np.ndarray, dets_xyxy: np.ndarray, min_iou: float)
     )
 
 
+def match_tracks_motion(
+    tracks: list["Track"],
+    detections: np.ndarray,
+    cfg: PipelineConfig,
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Associate boxes with IoU plus statistically normalized motion.
+
+    The Kalman states have already been predicted to the current capture
+    timestamp.  Active tracks still require the normal IoU gate.  A confirmed
+    track that was missed recently may instead pass the NIS and size gates,
+    which is the inexpensive reactivation path needed after a short
+    occlusion.  The cost matrix is solved globally so detection ordering never
+    determines identity ownership.
+    """
+    if not tracks or len(detections) == 0:
+        return [], list(range(len(tracks))), list(range(len(detections)))
+
+    detections = np.asarray(detections, dtype=float).reshape((-1, 5))
+    track_boxes = np.stack([track.xyxy for track in tracks])
+    overlap = iou_matrix(track_boxes, detections[:, :4])
+    sentinel = 1e6
+    cost = np.full(overlap.shape, sentinel, dtype=float)
+    gate = max(float(cfg.track_association_nis_gate), 1e-9)
+    max_size_change = max(float(cfg.track_association_max_size_log_change), 1e-9)
+
+    for row, track in enumerate(tracks):
+        predicted, covariance = track.kf.projected_measurement()
+        try:
+            covariance_inverse = np.linalg.inv(covariance)
+        except np.linalg.LinAlgError:
+            continue
+        for column, detection in enumerate(detections):
+            measurement = _xyxy_to_box_state(detection)
+            if np.any(measurement[2:] <= 0.0):
+                continue
+            innovation = measurement - predicted
+            nis = float(innovation @ covariance_inverse @ innovation)
+            if not np.isfinite(nis):
+                continue
+
+            predicted_size = np.maximum(predicted[2:], 1.0)
+            measured_size = np.maximum(measurement[2:], 1.0)
+            size_change = float(
+                np.mean(np.abs(np.log(measured_size / predicted_size)))
+            )
+            recently_lost = (
+                track.confirmed
+                and track.misses > 0
+                and track.missed_seconds <= cfg.track_motion_reactivation_s + 1e-9
+            )
+            passes_iou = overlap[row, column] >= cfg.track_min_iou
+            if not passes_iou and not recently_lost:
+                continue
+            # Preserve ByteTrack's reliable active-track candidate set.  Hard
+            # statistical/scale gates are for the low-IoU reactivation path;
+            # on a visible track they would turn harmless detector box jitter
+            # into a new local ID even though overlap is still strong.
+            if recently_lost and (nis > gate or size_change > max_size_change):
+                continue
+
+            direction_penalty = 0.0
+            if track.last_measurement is not None:
+                velocity = np.asarray(track.kf.velocity[:2], dtype=float)
+                displacement = measurement[:2] - track.last_measurement[:2]
+                speed = float(np.linalg.norm(velocity))
+                travel = float(np.linalg.norm(displacement))
+                if speed > cfg.track_motion_min_speed and travel > 1e-6:
+                    cosine = float(np.dot(velocity, displacement) / (speed * travel))
+                    direction_penalty = 0.5 * (1.0 - np.clip(cosine, -1.0, 1.0))
+
+            cost[row, column] = (
+                cfg.track_association_iou_weight * (1.0 - overlap[row, column])
+                + cfg.track_association_nis_weight * min(nis / gate, 1.0)
+                + cfg.track_association_size_weight
+                * min(size_change / max_size_change, 1.0)
+                + cfg.track_association_direction_weight * direction_penalty
+            )
+
+    rows, columns = linear_sum_assignment(cost)
+    pairs = [
+        (int(row), int(column))
+        for row, column in zip(rows, columns)
+        if cost[row, column] < sentinel
+    ]
+    matched_tracks = {row for row, _ in pairs}
+    matched_detections = {column for _, column in pairs}
+    return (
+        pairs,
+        [index for index in range(len(tracks)) if index not in matched_tracks],
+        [index for index in range(len(detections)) if index not in matched_detections],
+    )
+
+
 def _xyxy_to_box_state(box: np.ndarray) -> np.ndarray:
     """Convert xyxy to the stable [center_x, center_y, width, height] state."""
     x1, y1, x2, y2 = box[:4]
@@ -176,6 +303,7 @@ class Track:
     misses: int = 0
     missed_seconds: float = 0.0
     confirmed: bool = False
+    last_measurement: np.ndarray | None = None
 
     @property
     def xyxy(self) -> np.ndarray:
@@ -191,6 +319,7 @@ class ByteTracker:
         self.tracks: list[Track] = []
         self._next_id = 1
         self._last_timestamp_s: float | None = None
+        self.metrics: defaultdict[str, int] = defaultdict(int)
 
     def update(self, detections: np.ndarray, timestamp_s: float | None = None) -> list[Track]:
         """Advance one tick with (N, 5) [x1, y1, x2, y2, conf] detections.
@@ -238,16 +367,23 @@ class ByteTracker:
 
         high = detections[detections[:, 4] >= cfg.track_high_conf]
         low = detections[detections[:, 4] < cfg.track_high_conf]
-        track_boxes = (
-            np.stack([t.xyxy for t in self.tracks])
-            if self.tracks else np.empty((0, 4))
-        )
-
         # 2. Stage one: high-confidence detections vs. all tracks.
-        pairs, unmatched_tracks, unmatched_high = match_by_iou(
-            track_boxes, high[:, :4], cfg.track_min_iou
+        if cfg.track_motion_association_enabled:
+            pairs, unmatched_tracks, unmatched_high = match_tracks_motion(
+                self.tracks, high, cfg
+            )
+        else:
+            track_boxes = (
+                np.stack([t.xyxy for t in self.tracks])
+                if self.tracks else np.empty((0, 4))
+            )
+            pairs, unmatched_tracks, unmatched_high = match_by_iou(
+                track_boxes, high[:, :4], cfg.track_min_iou
         )
         for t_idx, d_idx in pairs:
+            if self.tracks[t_idx].misses > 0:
+                self.metrics["reactivations"] += 1
+            self.metrics["high_confidence_matches"] += 1
             self._mark_matched(self.tracks[t_idx], high[d_idx])
 
         # 3. Stage two (the "byte" trick): leftover tracks get a second
@@ -255,14 +391,21 @@ class ByteTracker:
         #    people whose boxes the detector wasn't sure about. (These
         #    tracks were not updated in stage one, so their boxes are
         #    still the stage-one predictions.)
-        leftover_boxes = (
-            np.stack([self.tracks[t].xyxy for t in unmatched_tracks])
-            if unmatched_tracks else np.empty((0, 4))
-        )
-        pairs2, still_unmatched, _ = match_by_iou(
-            leftover_boxes, low[:, :4], cfg.track_min_iou
+        leftover = [self.tracks[index] for index in unmatched_tracks]
+        if cfg.track_motion_association_enabled:
+            pairs2, still_unmatched, _ = match_tracks_motion(leftover, low, cfg)
+        else:
+            leftover_boxes = (
+                np.stack([track.xyxy for track in leftover])
+                if leftover else np.empty((0, 4))
+            )
+            pairs2, still_unmatched, _ = match_by_iou(
+                leftover_boxes, low[:, :4], cfg.track_min_iou
         )
         for local_t, d_idx in pairs2:
+            if self.tracks[unmatched_tracks[local_t]].misses > 0:
+                self.metrics["reactivations"] += 1
+            self.metrics["low_confidence_matches"] += 1
             self._mark_matched(self.tracks[unmatched_tracks[local_t]], low[d_idx])
         unmatched_tracks = [unmatched_tracks[i] for i in still_unmatched]
 
@@ -282,18 +425,24 @@ class ByteTracker:
         # 5. Every unmatched high-confidence detection births a new track.
         for d_idx in unmatched_high:
             det = high[d_idx]
+            measurement = _xyxy_to_box_state(det)
             self.tracks.append(Track(
                 track_id=self._next_id,
                 kf=ConstantVelocityKalman(
-                    _xyxy_to_box_state(det),
+                    measurement,
                     process_noise=cfg.track_kf_process_noise,
                     measurement_noise=cfg.track_kf_measurement_noise,
                 ),
                 conf=float(det[4]),
                 confirmed=cfg.track_min_hits <= 1,
+                last_measurement=measurement.copy(),
             ))
             self._next_id += 1
+            self.metrics["tracks_created"] += 1
 
+        self.metrics["peak_retained_tracks"] = max(
+            self.metrics["peak_retained_tracks"], len(self.tracks)
+        )
         return [t for t in self.tracks if t.confirmed and t.misses == 0]
 
     def _mark_matched(self, track: Track, det: np.ndarray) -> None:
@@ -301,8 +450,9 @@ class ByteTracker:
             1.0 - float(np.clip(det[4], 0.0, 1.0))
         )
         measurement_scale = self._box_noise_scale(det[3] - det[1]) * confidence_scale
+        measurement = _xyxy_to_box_state(det)
         track.kf.update(
-            _xyxy_to_box_state(det),
+            measurement,
             measurement_noise_scale=measurement_scale,
             nis_threshold=self.cfg.track_kf_robust_nis_threshold,
         )
@@ -310,6 +460,7 @@ class ByteTracker:
         track.hits += 1
         track.misses = 0
         track.missed_seconds = 0.0
+        track.last_measurement = measurement.copy()
         if track.hits >= self.cfg.track_min_hits:
             track.confirmed = True
 

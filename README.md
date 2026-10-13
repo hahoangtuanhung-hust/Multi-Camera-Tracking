@@ -109,14 +109,17 @@ upload. Camera names must remain one comma-separated CLI argument:
 # 1 minute at 30 FPS; saves the full result locally as JSON.
 uv run --extra modal modal run modal_app.py \
   --evaluate --max-frames 1800 \
+  --tracking-profile identity-v1-baseline \
   --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
   --metrics-out mot-metrics-1800.json
 
 # A longer 10-minute evaluation (subject to the available source length).
 uv run --extra modal modal run modal_app.py \
-  --evaluate --max-frames 18000 \
+  --evaluate --max-frames 9000 \
+  --tracking-profile identity-v1-baseline \
   --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
-  --metrics-out mot-metrics-18000.json
+  --metric-window-frames 1000 \
+  --metrics-out mot-metrics-9000.json
 ```
 
 The evaluation worker has a six-hour timeout, uses `stride=1`, prints progress
@@ -358,20 +361,63 @@ uv run evaluate --max-frames 60 --device cpu \
   --cameras camera_0001 camera_0007 camera_0008 camera_0010
 ```
 
+Long evaluations additionally print an IDF1/MOTA/HOTA table every 1,000
+evaluated ticks. Change that interval with `--metric-window-frames`, or set it
+to zero to print only the full-sequence result. Modal evaluation stores the
+same window summaries in `metric_windows` in the output JSON.
+
 Latest CPU verification on the current custom 4-camera scene used 60 source
-frames (50 evaluated ticks), with ground truth aligned to each configured
+frames (60 evaluated ticks), with ground truth aligned to each configured
 source-frame trim:
 
 | Metric | Value |
 |---|---|
 | IDP / IDR / IDF1 | 0.772 / 0.832 / 0.801 |
 | MOTA | 0.584 |
-| MOTP similarity / distance | 0.764 / 0.236 m |
-| HOTA | 0.630 |
-| DetA / AssA / LocA | 0.488 / 0.846 / 0.829 |
+| MOTP similarity / distance | 0.761 / 0.239 m |
+| HOTA | 0.626 |
+| DetA / AssA / LocA | 0.484 / 0.841 / 0.829 |
 | Precision / Recall | 0.773 / 0.833 |
-| World-plane position RMSE | 0.302 m |
-| Global ID switches | 5 over 50 ticks |
+| World-plane position RMSE | 0.308 m |
+| Global ID switches | 5 over 60 ticks |
+| CPU throughput | 2.11 tick/s |
+
+The fusion ablation replays identical local observations through multiple
+global-association configurations. On 300 source frames, batch reconnect was
+neutral, early duplicate suppression was neutral/slightly positive, and
+adaptive published-pair softening was harmful:
+
+| Fusion profile | IDF1 | HOTA | MOTA | IDSW |
+|---|---:|---:|---:|---:|
+| `identity-v1-baseline` (default) | 0.705 | 0.480 | 0.594 | 39 |
+| Pre-identity-v2 | 0.703 | 0.469 | 0.542 | 42 |
+| Batch reconnect only | 0.703 | 0.469 | 0.542 | 42 |
+| Duplicate suppression only | 0.704 | 0.469 | 0.542 | 42 |
+| Adaptive hysteresis only | 0.681 | 0.466 | 0.538 | 51 |
+| Full fusion safeguards, local motion off | 0.681 | 0.467 | 0.539 | 51 |
+
+The decisive comparison is the full 9,000-frame Modal T4 evaluation. The
+strict release gate was **not met**, so the default remains
+`identity-v1-baseline`; experimental improvements must be selected explicitly.
+
+| Profile/result | IDF1 | HOTA | AssA | IDSW | MOTA | RMSE | FP | tick/s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Best v1 baseline | 0.1825 | 0.1585 | 0.0715 | 1,202 | 0.4800 | 0.454 m | 67,690 | 6.44 |
+| Pre-identity-v2 result | 0.1586 | 0.1522 | 0.0629 | 1,299 | 0.4867 | 0.436 m | 69,081 | 6.11 |
+| `identity-full` | 0.1433 | 0.1461 | 0.0591 | 1,591 | 0.4573 | 0.438 m | 73,376 | 5.43 |
+| `fusion-identity-safe` | 0.1655 | 0.1562 | 0.0662 | 1,307 | 0.4892 | 0.436 m | 68,716 | 5.92 |
+| `identity-v1-safe` candidate | 0.1808 | 0.1629 | 0.0725 | 1,225 | 0.4880 | 0.439 m | 66,605 | 7.37 |
+
+`identity-v1-safe` improved HOTA, AssA, MOTA, localization, false positives,
+and speed, and reduced 1–30-frame switches from 1,115 to 1,026. It still
+missed the required IDF1 (>0.1825) and IDSW (<1,202) gates, so it is retained
+only as an explicit experiment. Full JSON results are in
+`mot-metrics-9000-identity-v1-safe.json`,
+`mot-metrics-9000-identity-safe.json`, and
+`mot-metrics-9000-identity-v2.json`.
+
+Use `benchmarks/evaluate_thresholds.py --profiles ...` for reproducible
+ablation without rerunning YOLO separately for every fusion configuration.
 
 Recall losses concentrate at FOV edges and behind the racks — with only 4
 of the 10 cameras there are blind spots. Download `--full` and re-run to
@@ -432,6 +478,7 @@ src/multicam_tracker/
 ├── viz.py                # Rerun blueprint + logging
 ├── demo.py               # the pipeline as one readable loop + CLI
 ├── evaluate.py           # metrics vs ground truth
+├── mot_metrics.py        # Identity, CLEAR MOT and HOTA for world points
 ├── check_calibration.py  # dataset geometry sanity checks
 └── render_preview.py     # composite MP4/GIF clips
 ```
@@ -450,13 +497,25 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `track_kf_process_noise` / `track_kf_time_process_noise` | 2.0 / 2.0 | local Kalman acceleration variance for legacy ticks / timestamped frames |
 | `track_kf_robust_nis_threshold` | 0 (off) | optionally down-weight statistically extreme bbox updates; tune against IDSW before enabling |
 | `track_kf_adaptive_noise` | false | optionally scale Kalman noise with bbox height |
+| `track_motion_association_enabled` | false | experimental local Mahalanobis/size/direction association; enable through `identity-full` only |
 | `fusion_gate_m` | 2.0 m | max world distance for cross-camera association |
 | `fusion_merge_m` | 1.0 m | cluster radius when grouping new observations |
 | `fusion_max_age` | 90 ticks | legacy no-timestamp fallback (~3 s at 30 fps) |
-| `fusion_max_age_s` | 3.0 s | timestamp-mode identity retention timeout |
+| `fusion_max_age_s` | 3.0 s | normal short-gap association horizon |
+| `fusion_identity_retention_s` | 3.0 s | hidden identity retention; the experimental v2 profiles use 8 s |
 | `fusion_output_grace_s` | 0.25 s | publish freshness; retained IDs are not emitted as stale people |
+| `fusion_published_motion_gate_enabled` | false | experimental hard/soft motion policy for already-published GIDs |
+| `fusion_batch_reconnect_enabled` | false | experimental order-independent one-to-one fragment assignment |
+| `fusion_provisional_buffer_enabled` | false | optional extra age buffer; `fusion_min_hits` still hides unconfirmed births |
 | `fusion_event_time_gate_s` | 0.15 s | simultaneous-geometry gate after clock correction |
 | `fusion_local_reconnect_gate_m` | 1.0 m | reconnect a fragmented local ID to a retained same-camera global track |
+| `fusion_local_reconnect_window_s` | 3.0 s | default reconnect horizon; v2 uses a 1 s strict short window |
+| `fusion_local_reconnect_covariance_enabled` | false | experimental 2-D NIS gate (`fusion_local_reconnect_nis_gate=9.21`) |
+| `fusion_local_reconnect_confirmations` | 1 | v2 requires 2 observations for ambiguous/long-gap reconnects |
+| `fusion_local_reconnect_long_window_s` | 3.0 s | v2 can retain up to 8 s only with boundary and motion evidence |
+| `fusion_boundary_margin_ratio` | 0.06 | image-edge entry/exit band used by long reconnect |
+| `fusion_duplicate_merge_m` | 0 (off) | experimental profile uses a tight 0.30 m duplicate radius |
+| `fusion_duplicate_confirmations` | 5 | consecutive duplicate evidence before irreversible merge |
 | `fusion_instant_velocity_weight_s` | 0 (off) | optional motion re-ranking at ambiguous cross-camera merges |
 | `fusion_instant_opposite_direction_cosine` | -1.1 (off) | optional opposite-direction veto; e.g. `-0.25` for a conservative crossing guard |
 | `fusion_min_hits` | 3 | ticks of support before a global track is shown |

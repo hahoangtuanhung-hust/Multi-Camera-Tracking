@@ -46,6 +46,21 @@ class TimebaseTrackingTests(unittest.TestCase):
         self.assertAlmostEqual(kf.predict(dt=0.25)[0], 0.5)
         self.assertAlmostEqual(kf.predict(dt=1.5)[0], 3.5)
 
+    def test_projected_measurement_grows_uncertainty_without_mutation(self) -> None:
+        kf = ConstantVelocityKalman(np.array([1.0, 2.0]), 0.05, 0.1)
+        kf.x[2:] = np.array([0.5, -0.25])
+        original_state = kf.x.copy()
+        original_covariance = kf.P.copy()
+
+        near_mean, near_covariance = kf.projected_measurement(0.1)
+        far_mean, far_covariance = kf.projected_measurement(2.0)
+
+        np.testing.assert_allclose(near_mean, [1.05, 1.975])
+        np.testing.assert_allclose(far_mean, [2.0, 1.5])
+        self.assertGreater(far_covariance[0, 0], near_covariance[0, 0])
+        np.testing.assert_array_equal(kf.x, original_state)
+        np.testing.assert_array_equal(kf.P, original_covariance)
+
     def test_box_kalman_state_round_trips_xyxy(self) -> None:
         box = np.array([10.0, 20.0, 50.0, 120.0])
         state = _xyxy_to_box_state(box)
@@ -128,3 +143,49 @@ class TimebaseTrackingTests(unittest.TestCase):
         self.assertGreater(center_1, center_2)
         self.assertGreater(by_id[1].kf.velocity[0], 0.0)
         self.assertLess(by_id[2].kf.velocity[0], 0.0)
+
+    def test_recent_lost_track_reactivates_when_iou_is_below_gate(self) -> None:
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.30,
+            track_motion_association_enabled=True,
+        )
+        tracker = ByteTracker(cfg)
+        first = tracker.update(_det(0.0), timestamp_s=0.0)[0].track_id
+        tracker.update(_det(4.0), timestamp_s=0.1)
+        tracker.update(np.empty((0, 5)), timestamp_s=0.2)
+        visible = tracker.update(_det(14.0), timestamp_s=0.3)
+
+        self.assertEqual([track.track_id for track in visible], [first])
+        self.assertEqual(tracker._next_id, 2)
+
+    def test_motion_gate_rejects_far_bbox_outlier_without_dragging_track(self) -> None:
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_motion_association_enabled=True,
+        )
+        tracker = ByteTracker(cfg)
+        tracker.update(_det(0.0), timestamp_s=0.0)
+        tracker.update(_det(1.0), timestamp_s=0.1)
+        original_position = tracker.tracks[0].kf.position.copy()
+        visible = tracker.update(_det(500.0), timestamp_s=0.2)
+
+        self.assertEqual([track.track_id for track in visible], [2])
+        self.assertLess(tracker.tracks[0].kf.position[0], 20.0)
+        self.assertLess(
+            abs(tracker.tracks[0].kf.position[2] - original_position[2]),
+            1.0,
+        )
+
+    def test_implausible_bbox_scale_change_does_not_steal_track(self) -> None:
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_motion_association_enabled=True,
+            track_association_max_size_log_change=0.4,
+        )
+        tracker = ByteTracker(cfg)
+        tracker.update(_det(0.0), timestamp_s=0.0)
+        huge = np.array([[-45.0, -90.0, 55.0, 110.0, 0.95]])
+        visible = tracker.update(huge, timestamp_s=0.1)
+
+        self.assertEqual([track.track_id for track in visible], [2])

@@ -12,6 +12,7 @@ def _obs(
     timestamp: float,
     xy: tuple[float, float],
     velocity: tuple[float, float] | None = None,
+    near_boundary: bool = False,
 ):
     return CameraObservation(
         camera=camera,
@@ -23,6 +24,7 @@ def _obs(
         world_velocity=(
             None if velocity is None else np.asarray(velocity, dtype=float)
         ),
+        near_boundary=near_boundary,
     )
 
 
@@ -162,6 +164,8 @@ class EventTimeFusionTests(unittest.TestCase):
             fusion_crossing_guard_m=0.0,
             fusion_instant_opposite_direction_cosine=-0.25,
             fusion_instant_margin_m=0.1,
+            fusion_published_merge_confirmations=2,
+            fusion_instant_velocity_gate_mps=10.0,
             tracklet_min_duration_s=10.0,
         ))
         # Projection noise puts each camera-B observation closer to the wrong
@@ -182,6 +186,12 @@ class EventTimeFusionTests(unittest.TestCase):
             _obs("a", 2, 0.2, (-0.2, 0.0), (-1.0, 0.0)),
             _obs("b", 11, 0.2, (0.25, 0.0), (1.0, 0.0)),
             _obs("b", 12, 0.2, (-0.25, 0.0), (-1.0, 0.0)),
+        ])
+        manager.step([
+            _obs("a", 1, 0.3, (0.3, 0.0), (1.0, 0.0)),
+            _obs("a", 2, 0.3, (-0.3, 0.0), (-1.0, 0.0)),
+            _obs("b", 11, 0.3, (0.35, 0.0), (1.0, 0.0)),
+            _obs("b", 12, 0.3, (-0.35, 0.0), (-1.0, 0.0)),
         ])
         self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
         self.assertEqual(manager.affinity[("a", 2)], manager.affinity[("b", 12)])
@@ -220,6 +230,12 @@ class EventTimeFusionTests(unittest.TestCase):
             _obs("b", 11, 0.6, (0.25, 0.0), (1.0, 0.0)),
             _obs("b", 12, 0.6, (-0.25, 0.0), (-1.0, 0.0)),
         ])
+        manager.step([
+            _obs("a", 1, 0.8, (0.4, 0.0), (1.0, 0.0)),
+            _obs("a", 2, 0.8, (-0.4, 0.0), (-1.0, 0.0)),
+            _obs("b", 11, 0.8, (0.45, 0.0), (1.0, 0.0)),
+            _obs("b", 12, 0.8, (-0.45, 0.0), (-1.0, 0.0)),
+        ])
 
         self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 11)])
         self.assertEqual(manager.affinity[("a", 2)], manager.affinity[("b", 12)])
@@ -254,6 +270,9 @@ class EventTimeFusionTests(unittest.TestCase):
         manager.step([_obs("a", 2, 0.6, (0.6, 0.0))])
         self.assertEqual(manager.affinity[("a", 2)], original_gid)
         self.assertEqual(manager.metrics["local_fragments_reconnected"], 1)
+        self.assertEqual(
+            manager.metrics["provisional_ids_reconnected_before_publish"], 1
+        )
 
     def test_crossing_fragments_reconnect_by_motion_not_nearest_position(self) -> None:
         manager = GlobalTrackManager(self._config(
@@ -277,10 +296,95 @@ class EventTimeFusionTests(unittest.TestCase):
             _obs("a", 3, 0.4, (0.1, 0.0), (1.0, 0.0)),
             _obs("a", 4, 0.4, (-0.1, 0.0), (-1.0, 0.0)),
         ])
+        manager.step([
+            _obs("a", 3, 0.6, (0.3, 0.0), (1.0, 0.0)),
+            _obs("a", 4, 0.6, (-0.3, 0.0), (-1.0, 0.0)),
+        ])
 
         self.assertEqual(manager.affinity[("a", 3)], first_gid)
         self.assertEqual(manager.affinity[("a", 4)], second_gid)
         self.assertGreater(manager.metrics["local_reconnect_motion_penalties"], 0)
+
+    def test_long_fragment_requires_boundary_and_motion_evidence(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_local_reconnect_confirmations=2,
+            fusion_identity_retention_s=8.0,
+            fusion_local_reconnect_window_s=1.0,
+            fusion_local_reconnect_long_window_s=8.0,
+        ))
+        manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), (1.0, 0.0), near_boundary=True)
+        ])
+        manager.step([
+            _obs("a", 1, 0.2, (0.2, 0.0), (1.0, 0.0), near_boundary=True)
+        ])
+        original_gid = manager.affinity[("a", 1)]
+        manager.step([
+            _obs("a", 2, 4.0, (4.0, 0.0), (1.0, 0.0), near_boundary=True)
+        ])
+        manager.step([
+            _obs("a", 2, 4.2, (4.2, 0.0), (1.0, 0.0), near_boundary=True)
+        ])
+
+        self.assertEqual(manager.affinity[("a", 2)], original_gid)
+        self.assertEqual(manager.metrics["local_fragments_reconnected"], 1)
+
+    def test_long_fragment_inside_scene_gets_a_new_gid(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_identity_retention_s=8.0,
+            fusion_local_reconnect_window_s=1.0,
+            fusion_local_reconnect_long_window_s=8.0,
+        ))
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0), (1.0, 0.0))])
+        manager.step([_obs("a", 1, 0.2, (0.2, 0.0), (1.0, 0.0))])
+        original_gid = manager.affinity[("a", 1)]
+        manager.step([_obs("a", 2, 4.0, (4.0, 0.0), (1.0, 0.0))])
+        manager.step([_obs("a", 2, 4.2, (4.2, 0.0), (1.0, 0.0))])
+
+        self.assertNotEqual(manager.affinity[("a", 2)], original_gid)
+        self.assertGreater(manager.metrics["long_reconnect_boundary_rejected"], 0)
+
+    def test_duplicate_globals_merge_only_after_consecutive_evidence(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_instant_merge_enabled=False,
+            fusion_duplicate_merge_m=0.30,
+            fusion_duplicate_confirmations=3,
+            tracklet_min_duration_s=10.0,
+        ))
+        for timestamp in (0.0, 0.1):
+            manager.step([
+                _obs("a", 1, timestamp, (timestamp, 0.0), (1.0, 0.0)),
+                _obs("b", 7, timestamp, (timestamp + 0.05, 0.0), (1.0, 0.0)),
+            ])
+            self.assertNotEqual(
+                manager.affinity[("a", 1)], manager.affinity[("b", 7)]
+            )
+        manager.step([
+            _obs("a", 1, 0.2, (0.2, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 0.2, (0.25, 0.0), (1.0, 0.0)),
+        ])
+
+        self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 7)])
+        self.assertEqual(manager.metrics["duplicate_global_tracks_merged"], 1)
+
+    def test_competing_gid_vote_resets_ownership_hysteresis(self) -> None:
+        votes: dict[tuple[int, int], tuple[int, float]] = {}
+        self.assertEqual(
+            GlobalTrackManager._record_pair_vote(votes, (1, 2), 0.0, 0.5),
+            1,
+        )
+        self.assertEqual(
+            GlobalTrackManager._record_pair_vote(votes, (1, 3), 0.1, 0.5),
+            1,
+        )
+        self.assertEqual(
+            GlobalTrackManager._record_pair_vote(votes, (1, 2), 0.2, 0.5),
+            1,
+        )
+        self.assertNotIn((1, 3), votes)
 
     def test_simultaneous_same_camera_tracks_do_not_reconnect(self) -> None:
         manager = GlobalTrackManager(self._config())
@@ -290,6 +394,123 @@ class EventTimeFusionTests(unittest.TestCase):
             _obs("a", 2, 0.2, (0.25, 0.0)),
         ])
         self.assertNotEqual(manager.affinity[("a", 1)], manager.affinity[("a", 2)])
+
+    def test_batch_fragment_assignment_is_independent_of_observation_order(self) -> None:
+        def run(new_observations):
+            manager = GlobalTrackManager(self._config(
+                cameras=["a"],
+                fusion_batch_reconnect_enabled=True,
+                fusion_local_reconnect_velocity_weight_s=0.25,
+            ))
+            manager.step([
+                _obs("a", 1, 0.0, (-0.6, 0.0), (1.0, 0.0)),
+                _obs("a", 2, 0.0, (0.6, 0.0), (-1.0, 0.0)),
+            ])
+            manager.step([
+                _obs("a", 1, 0.2, (-0.4, 0.0), (1.0, 0.0)),
+                _obs("a", 2, 0.2, (0.4, 0.0), (-1.0, 0.0)),
+            ])
+            expected = (
+                manager.affinity[("a", 1)],
+                manager.affinity[("a", 2)],
+            )
+            manager.step(new_observations)
+            manager.step([
+                _obs("a", 3, 0.6, (0.3, 0.0), (1.0, 0.0)),
+                _obs("a", 4, 0.6, (-0.3, 0.0), (-1.0, 0.0)),
+            ])
+            return expected, (
+                manager.affinity[("a", 3)],
+                manager.affinity[("a", 4)],
+            )
+
+        forward = [
+            _obs("a", 3, 0.4, (0.1, 0.0), (1.0, 0.0)),
+            _obs("a", 4, 0.4, (-0.1, 0.0), (-1.0, 0.0)),
+        ]
+        expected_forward, assigned_forward = run(forward)
+        expected_reverse, assigned_reverse = run(list(reversed(forward)))
+        self.assertEqual(assigned_forward, expected_forward)
+        self.assertEqual(assigned_reverse, expected_reverse)
+
+    def test_provisional_age_buffer_hides_short_false_track(self) -> None:
+        cfg = self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.2,
+            fusion_instant_merge_enabled=False,
+        )
+        manager = GlobalTrackManager(cfg)
+        self.assertEqual(manager.step([_obs("a", 1, 0.0, (0.0, 0.0))]), [])
+        self.assertEqual(manager.step([_obs("a", 1, 0.1, (0.1, 0.0))]), [])
+        visible = manager.step([_obs("a", 1, 0.2, (0.2, 0.0))])
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(manager.metrics["provisional_ids_published"], 1)
+
+        false_track = GlobalTrackManager(cfg)
+        self.assertEqual(
+            false_track.step([_obs("a", 9, 0.0, (0.0, 0.0))]), []
+        )
+        self.assertEqual(
+            false_track.step([], timestamp_s=0.4, arrival_timestamp_s=0.4), []
+        )
+        self.assertEqual(false_track.metrics["provisional_ids_published"], 0)
+
+    def test_clear_published_pair_uses_confirmation_when_motion_is_noisy(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_min_hits=1,
+            fusion_adaptive_hysteresis_enabled=True,
+            fusion_published_motion_gate_enabled=True,
+            fusion_published_merge_confirmations=1,
+            fusion_motion_min_span_s=10.0,
+            tracklet_min_duration_s=10.0,
+            fusion_duplicate_merge_m=0.0,
+        ))
+        manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 0.0, (5.0, 0.0), (-1.0, 0.0)),
+        ])
+        manager.step([
+            _obs("a", 1, 0.1, (1.0, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 0.1, (1.05, 0.0), (-1.0, 0.0)),
+        ])
+        self.assertNotEqual(
+            manager.affinity[("a", 1)], manager.affinity[("b", 7)]
+        )
+        manager.step([
+            _obs("a", 1, 0.2, (2.0, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 0.2, (2.05, 0.0), (-1.0, 0.0)),
+        ])
+        self.assertEqual(
+            manager.affinity[("a", 1)], manager.affinity[("b", 7)]
+        )
+        self.assertGreaterEqual(manager.metrics["published_merge_motion_softened"], 2)
+        self.assertEqual(manager.metrics["published_merge_motion_rejected"], 0)
+
+    def test_duplicate_output_is_suppressed_before_irreversible_merge(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_min_hits=1,
+            fusion_instant_merge_enabled=False,
+            fusion_duplicate_merge_m=0.30,
+            fusion_duplicate_confirmations=3,
+            fusion_duplicate_suppression_enabled=True,
+            fusion_duplicate_suppression_min_confirmations=2,
+            tracklet_min_duration_s=10.0,
+        ))
+        first = manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 0.0, (0.05, 0.0), (1.0, 0.0)),
+        ])
+        second = manager.step([
+            _obs("a", 1, 0.1, (0.1, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 0.1, (0.15, 0.0), (1.0, 0.0)),
+        ])
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(manager.metrics["duplicate_outputs_suppressed"], 1)
 
 
 if __name__ == "__main__":

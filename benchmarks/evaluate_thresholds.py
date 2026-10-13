@@ -57,6 +57,12 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=200)
     parser.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     parser.add_argument("--cameras", nargs="+", default=None, metavar="CAM")
+    parser.add_argument(
+        "--profiles",
+        nargs="+",
+        default=None,
+        help="Optional subset of fusion profiles to replay",
+    )
     args = parser.parse_args()
 
     detector_cfg = PipelineConfig(
@@ -64,12 +70,111 @@ def main() -> None:
         device=args.device,
         timestamp_fusion_enabled=False,
         async_ingest=False,
+        # Keep local detections/track IDs identical while replaying only the
+        # global-fusion feature flags below.
+        track_motion_association_enabled=False,
     )
     available = sorted(
         path.name for path in detector_cfg.scene_dir.glob("camera_*") if path.is_dir()
     )
     detector_cfg.cameras = args.cameras or available
     candidates = {
+        "pre-identity-v2": dict(
+            fusion_provisional_buffer_enabled=False,
+            fusion_batch_reconnect_enabled=False,
+            fusion_adaptive_hysteresis_enabled=False,
+            fusion_duplicate_suppression_enabled=False,
+        ),
+        "batch-only": dict(
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.0,
+            fusion_batch_reconnect_enabled=True,
+            fusion_adaptive_hysteresis_enabled=False,
+            fusion_duplicate_suppression_enabled=False,
+        ),
+        "adaptive-only": dict(
+            fusion_provisional_buffer_enabled=False,
+            fusion_batch_reconnect_enabled=False,
+            fusion_adaptive_hysteresis_enabled=True,
+            fusion_duplicate_suppression_enabled=False,
+        ),
+        "duplicate-only": dict(
+            fusion_provisional_buffer_enabled=False,
+            fusion_batch_reconnect_enabled=False,
+            fusion_adaptive_hysteresis_enabled=False,
+            fusion_duplicate_suppression_enabled=True,
+        ),
+        "fusion-identity-safe": dict(
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.0,
+            fusion_batch_reconnect_enabled=True,
+            fusion_adaptive_hysteresis_enabled=True,
+            fusion_duplicate_suppression_enabled=True,
+        ),
+        "stable-default": dict(),
+        "sequential-reconnect": dict(
+            fusion_batch_reconnect_enabled=False,
+        ),
+        "hard-published-motion": dict(
+            fusion_adaptive_hysteresis_enabled=False,
+        ),
+        "no-duplicate-suppression": dict(
+            fusion_duplicate_suppression_enabled=False,
+        ),
+        "provisional-020": dict(
+            fusion_provisional_min_age_s=0.20,
+        ),
+        "no-hysteresis": dict(
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=1,
+            fusion_local_reconnect_confirmations=1,
+        ),
+        "crossing-only": dict(
+            fusion_instant_confirmations=2,
+            fusion_published_merge_confirmations=1,
+            fusion_local_reconnect_confirmations=1,
+        ),
+        "published-2": dict(
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=2,
+            fusion_local_reconnect_confirmations=1,
+        ),
+        "fragment-2": dict(
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=1,
+            fusion_local_reconnect_confirmations=2,
+        ),
+        "duplicate-045": dict(
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=1,
+            fusion_local_reconnect_confirmations=2,
+            fusion_duplicate_merge_m=0.45,
+            fusion_duplicate_confirmations=3,
+        ),
+        "minhits-4": dict(
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=1,
+            fusion_local_reconnect_confirmations=2,
+            fusion_min_hits=4,
+        ),
+        "minhits-5": dict(
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=1,
+            fusion_local_reconnect_confirmations=2,
+            fusion_min_hits=5,
+        ),
+        "hysteresis-2": dict(
+            fusion_instant_confirmations=2,
+            fusion_published_merge_confirmations=2,
+            fusion_local_reconnect_confirmations=2,
+        ),
+        "no-duplicate": dict(
+            fusion_duplicate_merge_m=0.0,
+        ),
+        "short-retention": dict(
+            fusion_identity_retention_s=5.0,
+            fusion_local_reconnect_long_window_s=3.0,
+        ),
         "position": dict(
             fusion_crossing_guard_m=0.0,
             fusion_instant_velocity_weight_s=0.0,
@@ -103,6 +208,11 @@ def main() -> None:
             fusion_local_reconnect_velocity_weight_s=0.0,
         ),
     }
+    if args.profiles:
+        unknown = sorted(set(args.profiles) - set(candidates))
+        if unknown:
+            raise SystemExit(f"Unknown profiles: {', '.join(unknown)}")
+        candidates = {name: candidates[name] for name in args.profiles}
     managers = {
         name: GlobalTrackManager(replace(
             detector_cfg,
@@ -135,7 +245,7 @@ def main() -> None:
     )
     legacy_score = _score(predictions["legacy"], gt_frames)
     print(
-        f"{'legacy':8s} P={legacy_score['precision']:.3f} "
+        f"{'legacy':16s} P={legacy_score['precision']:.3f} "
         f"R={legacy_score['recall']:.3f} RMSE={legacy_score['rmse']:.3f} "
         f"IDSW={legacy_score['switches']:4d} IDF1={legacy_score['idf1']:.3f} "
         f"MOTA={legacy_score['mota']:.3f} HOTA={legacy_score['hota']:.3f} "
@@ -144,7 +254,7 @@ def main() -> None:
     for name, manager in managers.items():
         score = _score(predictions[name], gt_frames)
         print(
-            f"{name:8s} P={score['precision']:.3f} R={score['recall']:.3f} "
+            f"{name:16s} P={score['precision']:.3f} R={score['recall']:.3f} "
             f"RMSE={score['rmse']:.3f} IDSW={score['switches']:4d} "
             f"IDF1={score['idf1']:.3f} MOTA={score['mota']:.3f} "
             f"HOTA={score['hota']:.3f} "

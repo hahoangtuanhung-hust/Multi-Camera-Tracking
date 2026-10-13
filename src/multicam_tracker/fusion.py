@@ -32,6 +32,17 @@ class CameraObservation:
     capture_ts_s: float | None = None
     world_velocity: np.ndarray | None = None
     arrival_ts_s: float | None = None
+    near_boundary: bool = False
+
+
+@dataclass
+class TrackEndpoint:
+    """Latest compact observation retained for safe fragment reconnection."""
+
+    timestamp_s: float
+    xy: np.ndarray
+    velocity: np.ndarray | None
+    near_boundary: bool
 
 
 @dataclass
@@ -48,6 +59,8 @@ class GlobalTrack:
     last_seen_ts_s: float | None = None
     last_arrival_ts_s: float | None = None
     emitted: bool = False
+    emitted_at_s: float | None = None
+    camera_endpoints: dict[str, TrackEndpoint] = field(default_factory=dict)
 
     @property
     def world_xy(self) -> np.ndarray:
@@ -75,6 +88,11 @@ class GlobalTrackManager:
         self._max_arrival_ts_s = float("-inf")
         self._last_match_run_s = float("-inf")
         self._instant_merge_votes: dict[tuple[int, int], tuple[int, float]] = {}
+        self._duplicate_merge_votes: dict[tuple[int, int], tuple[int, float]] = {}
+        self._duplicate_suppressed_gids: set[int] = set()
+        self._fragment_reconnect_votes: dict[
+            TrackletKey, tuple[int, int, float]
+        ] = {}
 
     def resolve_gid(self, gid: int) -> int:
         """Resolve and path-compress a possibly retired alias."""
@@ -106,6 +124,7 @@ class GlobalTrackManager:
         timestamp_s: float | None,
         arrival_timestamp_s: float | None,
     ) -> list[GlobalTrack]:
+        self._duplicate_suppressed_gids.clear()
         for track in self.tracks.values():
             track.cameras = set()
 
@@ -123,6 +142,7 @@ class GlobalTrackManager:
             self.tracklets.advance(self._max_event_ts_s)
         changed_keys: set[TrackletKey] = set()
         accepted: list[CameraObservation] = []
+        records: list[tuple[CameraObservation, TrackletKey, int, bool]] = []
         for obs in ordered:
             event_ts = float(obs.capture_ts_s)
             arrival_ts = float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
@@ -143,21 +163,49 @@ class GlobalTrackManager:
             accepted.append(obs)
             changed_keys.add(key)
             gid = self.affinity.get(key)
-            if gid is None or self.resolve_gid(gid) not in self.tracks:
-                gid = self._find_local_reconnect(obs)
-                if gid is None:
-                    gid = self._birth_provisional(obs)
-                    self.metrics["provisional_ids_created"] += 1
-                else:
-                    self.affinity[key] = gid
-                    self.members[gid].add(key)
-                    self._update_track(self.tracks[gid], obs)
-                    self.metrics["local_fragments_reconnected"] += 1
+            is_new = gid is None or self.resolve_gid(gid) not in self.tracks
+            if is_new:
+                gid = self._birth_provisional(obs)
+                self.metrics["provisional_ids_created"] += 1
             else:
                 gid = self.resolve_gid(gid)
-                self.affinity[key] = gid
+            records.append((obs, key, gid, is_new))
+
+        active_by_camera: defaultdict[str, set[int]] = defaultdict(set)
+        for obs, _key, gid, _is_new in records:
+            active_by_camera[obs.camera].add(self.resolve_gid(gid))
+        reconnects = self._batch_local_reconnect(records, active_by_camera)
+
+        for obs, key, initial_gid, is_new in records:
+            event_ts = float(obs.capture_ts_s)
+            gid = self.resolve_gid(initial_gid)
+            reconnect = reconnects.get(key)
+            if reconnect is not None:
+                candidate, requires_confirmation = reconnect
+                candidate = self.resolve_gid(candidate)
+                if (
+                    not requires_confirmation
+                    and key not in self._fragment_reconnect_votes
+                ):
+                    gid = self._commit_fragment_reconnect(key, gid, candidate)
+                else:
+                    reconnected = self._record_fragment_reconnect_vote(
+                        key, gid, candidate, event_ts
+                    )
+                    if reconnected is not None:
+                        gid = reconnected
+            elif key in self._fragment_reconnect_votes:
+                del self._fragment_reconnect_votes[key]
+
+            gid = self.resolve_gid(gid)
+            self.affinity[key] = gid
+            if not is_new:
                 self._update_track(self.tracks[gid], obs)
             self.members[gid].add(key)
+
+        self.metrics["peak_retained_global_tracks"] = max(
+            int(self.metrics["peak_retained_global_tracks"]), len(self.tracks)
+        )
 
         if (
             changed_keys
@@ -168,6 +216,7 @@ class GlobalTrackManager:
             self._last_match_run_s = self._max_event_ts_s
         if self.cfg.fusion_instant_merge_enabled and accepted:
             self._instant_geometry_merge(accepted)
+        self._consolidate_duplicate_tracks()
 
         self._expire_event_tracks()
         self._canonicalize_affinity()
@@ -176,11 +225,26 @@ class GlobalTrackManager:
         for gid, track in sorted(self.tracks.items()):
             if self.resolve_gid(gid) != gid or not track.confirmed or track.last_seen_ts_s is None:
                 continue
+            if gid in self._duplicate_suppressed_gids:
+                self.metrics["duplicate_outputs_suppressed"] += 1
+                continue
+            if (
+                self.cfg.fusion_provisional_buffer_enabled
+                and track.created_at_s is not None
+                and self._max_event_ts_s - track.created_at_s
+                + 1e-9 < self.cfg.fusion_provisional_min_age_s
+            ):
+                self.metrics["provisional_publication_deferred"] += 1
+                continue
             output_age = self._max_arrival_ts_s - (
                 track.last_arrival_ts_s
                 if track.last_arrival_ts_s is not None else track.last_seen_ts_s
             )
             if output_age <= self.cfg.fusion_output_grace_s + 1e-9:
+                if not track.emitted:
+                    track.emitted_at_s = self._max_event_ts_s
+                    self.metrics["provisional_ids_published"] += 1
+                    self.metrics["unique_published_gids"] += 1
                 track.emitted = True
                 track.trail.append(track.world_xy.copy())
                 self._trim_trail(track)
@@ -209,6 +273,7 @@ class GlobalTrackManager:
             last_arrival_ts_s=(
                 float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
             ),
+            camera_endpoints={obs.camera: self._endpoint_from_observation(obs)},
         )
         self.tracks[gid] = track
         key = obs.camera, int(obs.local_id)
@@ -216,57 +281,290 @@ class GlobalTrackManager:
         self.members[gid].add(key)
         return gid
 
-    def _find_local_reconnect(self, obs: CameraObservation) -> int | None:
-        """Reconnect a new local ID to a recently ended track in that camera."""
-        event_ts = float(obs.capture_ts_s)
-        spatial_candidates: list[tuple[float, int, np.ndarray]] = []
-        for gid, track in self.tracks.items():
-            gid = self.resolve_gid(gid)
-            if gid not in self.tracks or obs.camera in track.cameras:
-                continue
-            same_camera_histories = [
-                self.tracklets.get(key)
-                for key in self.members[gid]
-                if key[0] == obs.camera
-            ]
-            same_camera_histories = [history for history in same_camera_histories if history]
-            if not same_camera_histories:
-                continue
-            latest_end = max(history.end_s for history in same_camera_histories)
-            gap_s = event_ts - latest_end
-            if gap_s <= 1e-6 or gap_s > self.cfg.fusion_max_age_s:
-                continue
-            state_ts = track.state_timestamp_s if track.state_timestamp_s is not None else event_ts
-            prediction_dt = max(0.0, event_ts - state_ts)
-            predicted_xy = track.world_xy + track.kf.velocity * prediction_dt
-            distance = float(np.linalg.norm(predicted_xy - obs.world_xy))
-            if distance > self.cfg.fusion_local_reconnect_gate_m:
-                continue
-            spatial_candidates.append((distance, gid, track.kf.velocity.copy()))
-        candidates: list[tuple[float, float, int]] = []
-        for distance, gid, track_velocity in spatial_candidates:
-            motion_cost = self._velocity_pair_cost(
-                track_velocity,
-                obs.world_velocity,
-                require_evidence=False,
-                weight_s=self.cfg.fusion_local_reconnect_velocity_weight_s,
-            )
-            if motion_cost is None:
-                self.metrics["local_reconnect_motion_gate_failed"] += 1
-                continue
-            if motion_cost > 0:
-                self.metrics["local_reconnect_motion_penalties"] += 1
-            candidates.append((distance + motion_cost, distance, gid))
+    @staticmethod
+    def _endpoint_from_observation(obs: CameraObservation) -> TrackEndpoint:
+        velocity = (
+            None
+            if obs.world_velocity is None
+            else np.asarray(obs.world_velocity, dtype=float).copy()
+        )
+        return TrackEndpoint(
+            timestamp_s=float(obs.capture_ts_s),
+            xy=np.asarray(obs.world_xy, dtype=float).copy(),
+            velocity=velocity,
+            near_boundary=bool(obs.near_boundary),
+        )
+
+    def _find_local_reconnect(
+        self,
+        obs: CameraObservation,
+        *,
+        excluded_gid: int | None = None,
+        excluded_gids: set[int] | None = None,
+    ) -> tuple[int, bool] | None:
+        """Find a motion- and covariance-compatible ended same-camera ID."""
+        candidates = self._local_reconnect_candidates(
+            obs,
+            excluded_gid=excluded_gid,
+            excluded_gids=excluded_gids,
+        )
         if not candidates:
             return None
         candidates.sort()
-        best_cost, _best_distance, best_gid = candidates[0]
+        best_cost, _best_distance, best_gid, best_is_long = candidates[0]
         if len(candidates) > 1:
             margin = candidates[1][0] - best_cost
             if margin + 1e-9 < self.cfg.fusion_instant_margin_m:
                 self.metrics["local_reconnect_ambiguous"] += 1
                 return None
-        return best_gid
+        requires_confirmation = best_is_long or len(candidates) > 1
+        return best_gid, requires_confirmation
+
+    def _local_reconnect_candidates(
+        self,
+        obs: CameraObservation,
+        *,
+        excluded_gid: int | None = None,
+        excluded_gids: set[int] | None = None,
+    ) -> list[tuple[float, float, int, bool]]:
+        """Return every statistically plausible same-camera predecessor."""
+        event_ts = float(obs.capture_ts_s)
+        excluded = excluded_gids or set()
+        observation_velocity = self._stable_observation_velocity(obs)
+        candidates: list[tuple[float, float, int, bool]] = []
+        for gid, track in self.tracks.items():
+            gid = self.resolve_gid(gid)
+            if (
+                gid not in self.tracks
+                or gid == excluded_gid
+                or gid in excluded
+                or obs.camera in track.cameras
+            ):
+                continue
+            endpoint = track.camera_endpoints.get(obs.camera)
+            if endpoint is None:
+                continue
+            gap_s = event_ts - endpoint.timestamp_s
+            if gap_s <= 1e-6 or gap_s > self.cfg.fusion_local_reconnect_long_window_s:
+                continue
+            is_long_gap = gap_s > self.cfg.fusion_max_age_s
+            if is_long_gap and not (
+                endpoint.near_boundary and obs.near_boundary
+            ):
+                self.metrics["long_reconnect_boundary_rejected"] += 1
+                continue
+
+            state_ts = (
+                track.state_timestamp_s
+                if track.state_timestamp_s is not None
+                else endpoint.timestamp_s
+            )
+            prediction_dt = max(0.0, event_ts - state_ts)
+            predicted_xy, innovation_covariance = track.kf.projected_measurement(
+                prediction_dt
+            )
+            if (
+                gap_s > self.cfg.fusion_local_reconnect_window_s
+                and endpoint.velocity is not None
+                and np.all(np.isfinite(endpoint.velocity))
+            ):
+                # For a long hidden interval the last camera-track velocity is
+                # usually better established than the global KF's early
+                # velocity state. Keep the KF covariance as uncertainty, but
+                # extrapolate the mean from that stable endpoint trajectory.
+                predicted_xy = endpoint.xy + endpoint.velocity * gap_s
+            innovation = np.asarray(obs.world_xy, dtype=float) - predicted_xy
+            distance = float(np.linalg.norm(innovation))
+            if distance > self.cfg.fusion_local_reconnect_gate_m:
+                continue
+            nis = 0.0
+            if self.cfg.fusion_local_reconnect_covariance_enabled:
+                try:
+                    nis = float(
+                        innovation
+                        @ np.linalg.solve(innovation_covariance, innovation)
+                    )
+                except np.linalg.LinAlgError:
+                    self.metrics["local_reconnect_singular_covariance"] += 1
+                    continue
+                if (
+                    not np.isfinite(nis)
+                    or nis > self.cfg.fusion_local_reconnect_nis_gate
+                ):
+                    self.metrics["local_reconnect_covariance_gate_failed"] += 1
+                    continue
+
+            motion_cost = self._velocity_pair_cost(
+                endpoint.velocity,
+                observation_velocity,
+                require_evidence=is_long_gap,
+                weight_s=self.cfg.fusion_local_reconnect_velocity_weight_s,
+            )
+            if motion_cost is None:
+                self.metrics["local_reconnect_motion_gate_failed"] += 1
+                continue
+            if is_long_gap and not self._reconnect_motion_compatible(
+                endpoint.velocity, observation_velocity
+            ):
+                self.metrics["long_reconnect_motion_rejected"] += 1
+                continue
+            if motion_cost > 0:
+                self.metrics["local_reconnect_motion_penalties"] += 1
+            # Distance remains in metres for the ambiguity margin. NIS is a
+            # small tie-breaker that favours the more certain prediction.
+            cost = distance + motion_cost + 0.01 * np.sqrt(max(nis, 0.0))
+            candidates.append((cost, distance, gid, is_long_gap))
+        return candidates
+
+    def _batch_local_reconnect(
+        self,
+        records: list[tuple[CameraObservation, TrackletKey, int, bool]],
+        active_by_camera: dict[str, set[int]],
+    ) -> dict[TrackletKey, tuple[int, bool]]:
+        """Assign ended fragments to canonical GIDs without input-order bias."""
+        eligible = [
+            record
+            for record in records
+            if record[3]
+            or record[1] in self._fragment_reconnect_votes
+            or not self.tracks[self.resolve_gid(record[2])].emitted
+        ]
+        if not eligible:
+            return {}
+
+        if not self.cfg.fusion_batch_reconnect_enabled:
+            result: dict[TrackletKey, tuple[int, bool]] = {}
+            claimed: set[int] = set()
+            for obs, key, gid, _is_new in eligible:
+                match = self._find_local_reconnect(
+                    obs,
+                    excluded_gid=self.resolve_gid(gid),
+                    excluded_gids=claimed | active_by_camera.get(obs.camera, set()),
+                )
+                if match is not None:
+                    result[key] = match
+                    claimed.add(self.resolve_gid(match[0]))
+            return result
+
+        row_candidates: list[list[tuple[float, float, int, bool]]] = []
+        candidate_gids: set[int] = set()
+        for obs, _key, gid, _is_new in eligible:
+            candidates = self._local_reconnect_candidates(
+                obs,
+                excluded_gid=self.resolve_gid(gid),
+                excluded_gids=active_by_camera.get(obs.camera, set()),
+            )
+            row_candidates.append(candidates)
+            candidate_gids.update(candidate[2] for candidate in candidates)
+        if not candidate_gids:
+            return {}
+
+        columns = sorted(candidate_gids)
+        column_by_gid = {gid: index for index, gid in enumerate(columns)}
+        sentinel = 1e6
+        matrix = np.full((len(eligible), len(columns)), sentinel, dtype=float)
+        details: dict[tuple[int, int], tuple[float, float, int, bool]] = {}
+        for row, candidates in enumerate(row_candidates):
+            for candidate in candidates:
+                column = column_by_gid[candidate[2]]
+                if candidate[0] < matrix[row, column]:
+                    matrix[row, column] = candidate[0]
+                    details[row, column] = candidate
+
+        rows, assigned_columns = linear_sum_assignment(matrix)
+        assignments: dict[TrackletKey, tuple[int, bool]] = {}
+        for row, column in zip(rows, assigned_columns):
+            if matrix[row, column] >= sentinel or (row, column) not in details:
+                continue
+            candidate = details[row, column]
+            alternatives = [
+                matrix[row, other]
+                for other in range(matrix.shape[1])
+                if other != column
+            ] + [
+                matrix[other, column]
+                for other in range(matrix.shape[0])
+                if other != row
+            ]
+            margin = min(alternatives, default=float("inf")) - matrix[row, column]
+            ambiguous = margin + 1e-9 < self.cfg.fusion_instant_margin_m
+            if ambiguous:
+                self.metrics["local_reconnect_ambiguous"] += 1
+            requires_confirmation = candidate[3] or ambiguous or len(row_candidates[row]) > 1
+            assignments[eligible[row][1]] = (candidate[2], requires_confirmation)
+            self.metrics["batch_reconnect_assignments"] += 1
+        return assignments
+
+    def _reconnect_motion_compatible(
+        self,
+        previous_velocity: np.ndarray | None,
+        current_velocity: np.ndarray | None,
+    ) -> bool:
+        if previous_velocity is None or current_velocity is None:
+            return False
+        previous = np.asarray(previous_velocity, dtype=float)
+        current = np.asarray(current_velocity, dtype=float)
+        if not np.all(np.isfinite(previous)) or not np.all(np.isfinite(current)):
+            return False
+        previous_speed = float(np.linalg.norm(previous))
+        current_speed = float(np.linalg.norm(current))
+        if min(previous_speed, current_speed) < self.cfg.fusion_instant_min_speed_mps:
+            return False
+        if (
+            np.linalg.norm(previous - current)
+            > self.cfg.fusion_local_reconnect_velocity_gate_mps
+        ):
+            return False
+        cosine = float(
+            np.dot(previous, current) / (previous_speed * current_speed)
+        )
+        return cosine >= self.cfg.fusion_local_reconnect_direction_cosine
+
+    def _record_fragment_reconnect_vote(
+        self,
+        key: TrackletKey,
+        current_gid: int,
+        candidate_gid: int,
+        event_ts: float,
+    ) -> int | None:
+        previous = self._fragment_reconnect_votes.get(key)
+        count = 1
+        if previous is not None:
+            previous_gid, previous_count, previous_ts = previous
+            if (
+                self.resolve_gid(previous_gid) == self.resolve_gid(candidate_gid)
+                and event_ts - previous_ts
+                <= self.cfg.fusion_local_reconnect_confirmation_window_s + 1e-9
+            ):
+                count = previous_count + 1
+        self._fragment_reconnect_votes[key] = (candidate_gid, count, event_ts)
+        if count < max(1, self.cfg.fusion_local_reconnect_confirmations):
+            self.metrics["local_reconnects_deferred_for_confirmation"] += 1
+            return None
+        return self._commit_fragment_reconnect(key, current_gid, candidate_gid)
+
+    def _commit_fragment_reconnect(
+        self,
+        key: TrackletKey,
+        current_gid: int,
+        candidate_gid: int,
+    ) -> int:
+        current = self.resolve_gid(current_gid)
+        candidate = self.resolve_gid(candidate_gid)
+        reconnected_before_publish = (
+            current in self.tracks and not self.tracks[current].emitted
+        )
+        if current != candidate and self.merge_gids(candidate, current):
+            canonical = self.resolve_gid(candidate)
+            self.affinity[key] = canonical
+            self.members[canonical].add(key)
+            self.metrics["local_fragments_reconnected"] += 1
+            if reconnected_before_publish:
+                self.metrics["provisional_ids_reconnected_before_publish"] += 1
+        else:
+            canonical = self.resolve_gid(current)
+        self._fragment_reconnect_votes.pop(key, None)
+        return canonical
 
     def _update_track(self, track: GlobalTrack, obs: CameraObservation) -> None:
         event_ts = float(obs.capture_ts_s)
@@ -284,6 +582,12 @@ class GlobalTrackManager:
         track.hits += 1
         track.misses = 0
         track.cameras.add(obs.camera)
+        previous_endpoint = track.camera_endpoints.get(obs.camera)
+        if (
+            previous_endpoint is None
+            or event_ts >= previous_endpoint.timestamp_s - 1e-9
+        ):
+            track.camera_endpoints[obs.camera] = self._endpoint_from_observation(obs)
         if track.hits >= self.cfg.fusion_min_hits:
             track.confirmed = True
 
@@ -470,18 +774,54 @@ class GlobalTrackManager:
                     float(left_items[row].capture_ts_s),
                     float(right_items[column].capture_ts_s),
                 )
-                count, previous_ts = self._instant_merge_votes.get(
-                    pair, (0, float("-inf"))
+                left_track = self.tracks[left_gid]
+                right_track = self.tracks[right_gid]
+                published_pair = left_track.emitted and right_track.emitted
+                motion_compatible = self._observation_motion_compatible(
+                    left_items[row],
+                    right_items[column],
+                    self.cfg.fusion_instant_velocity_gate_mps,
                 )
-                if evidence_ts - previous_ts > self.cfg.fusion_instant_confirmation_window_s:
-                    count = 0
-                count += 1
-                self._instant_merge_votes[pair] = (count, evidence_ts)
+                soft_published_motion = False
+                if (
+                    published_pair
+                    and not motion_compatible
+                    and self.cfg.fusion_published_motion_gate_enabled
+                ):
+                    if (
+                        not self.cfg.fusion_adaptive_hysteresis_enabled
+                        or ambiguous_assignment[row, column]
+                    ):
+                        self.metrics["published_merge_motion_rejected"] += 1
+                        continue
+                    # A sole spatial candidate can have noisy homography-derived
+                    # velocity.  Require repeated spatial ownership evidence
+                    # rather than permanently rejecting it from one sample.
+                    soft_published_motion = True
+                    self.metrics["published_merge_motion_softened"] += 1
+                count = self._record_pair_vote(
+                    self._instant_merge_votes,
+                    pair,
+                    evidence_ts,
+                    self.cfg.fusion_instant_confirmation_window_s,
+                )
                 confirmations = (
                     max(1, self.cfg.fusion_instant_confirmations)
                     if ambiguous_assignment[row, column]
                     else 1
                 )
+                if (
+                    self.cfg.fusion_adaptive_hysteresis_enabled
+                    and ambiguous_assignment[row, column]
+                ):
+                    confirmations = max(confirmations, 2)
+                if published_pair:
+                    confirmations = max(
+                        confirmations,
+                        self.cfg.fusion_published_merge_confirmations,
+                    )
+                if soft_published_motion:
+                    confirmations = max(confirmations, 2)
                 if count < confirmations:
                     self.metrics["instant_merges_deferred_for_confirmation"] += 1
                     continue
@@ -508,6 +848,155 @@ class GlobalTrackManager:
             for pair, (_, seen_ts) in list(self._instant_merge_votes.items()):
                 if seen_ts < cutoff:
                     del self._instant_merge_votes[pair]
+
+    @staticmethod
+    def _record_pair_vote(
+        votes: dict[tuple[int, int], tuple[int, float]],
+        pair: tuple[int, int],
+        timestamp_s: float,
+        window_s: float,
+    ) -> int:
+        """Count only consecutive ownership evidence for either GID."""
+        for competing in list(votes):
+            if competing != pair and set(competing) & set(pair):
+                del votes[competing]
+        count, previous_ts = votes.get(pair, (0, float("-inf")))
+        if timestamp_s - previous_ts > window_s + 1e-9:
+            count = 0
+        count += 1
+        votes[pair] = (count, timestamp_s)
+        return count
+
+    def _track_motion_compatible(
+        self,
+        left: GlobalTrack,
+        right: GlobalTrack,
+        velocity_gate_mps: float,
+    ) -> bool:
+        left_velocity = np.asarray(left.kf.velocity, dtype=float)
+        right_velocity = np.asarray(right.kf.velocity, dtype=float)
+        left_speed = float(np.linalg.norm(left_velocity))
+        right_speed = float(np.linalg.norm(right_velocity))
+        if min(left_speed, right_speed) < self.cfg.fusion_instant_min_speed_mps:
+            return True
+        if float(np.linalg.norm(left_velocity - right_velocity)) > velocity_gate_mps:
+            return False
+        cosine = float(
+            np.dot(left_velocity, right_velocity) / (left_speed * right_speed)
+        )
+        return cosine >= self.cfg.fusion_instant_direction_cosine
+
+    def _observation_motion_compatible(
+        self,
+        left: CameraObservation,
+        right: CameraObservation,
+        velocity_gate_mps: float,
+    ) -> bool:
+        left_value = self._stable_observation_velocity(left)
+        right_value = self._stable_observation_velocity(right)
+        if left_value is None or right_value is None:
+            return True
+        left_velocity = np.asarray(left_value, dtype=float)
+        right_velocity = np.asarray(right_value, dtype=float)
+        left_speed = float(np.linalg.norm(left_velocity))
+        right_speed = float(np.linalg.norm(right_velocity))
+        if min(left_speed, right_speed) < self.cfg.fusion_instant_min_speed_mps:
+            return True
+        if float(np.linalg.norm(left_velocity - right_velocity)) > velocity_gate_mps:
+            return False
+        cosine = float(
+            np.dot(left_velocity, right_velocity) / (left_speed * right_speed)
+        )
+        return cosine >= self.cfg.fusion_instant_direction_cosine
+
+    def _consolidate_duplicate_tracks(self) -> None:
+        """Merge repeated close global tracks after stable one-to-one evidence.
+
+        Unlike the immediate camera-pair matcher, this compares current global
+        states. It catches duplicates created by delayed cameras while refusing
+        tracks that currently share a camera, have overlapping same-camera
+        histories, or disagree in motion.
+        """
+        if (
+            self.cfg.fusion_duplicate_merge_m <= 0
+            or not np.isfinite(self._max_event_ts_s)
+        ):
+            return
+        active = [
+            gid
+            for gid, track in self.tracks.items()
+            if self.resolve_gid(gid) == gid
+            and track.confirmed
+            and track.last_seen_ts_s is not None
+            and self._max_event_ts_s - track.last_seen_ts_s
+            <= self.cfg.fusion_output_grace_s + 1e-9
+        ]
+        candidates: list[tuple[float, int, int]] = []
+        for first_gid, second_gid in combinations(active, 2):
+            first = self.tracks[first_gid]
+            second = self.tracks[second_gid]
+            if first.cameras & second.cameras:
+                continue
+            distance = float(np.linalg.norm(first.world_xy - second.world_xy))
+            if distance > self.cfg.fusion_duplicate_merge_m:
+                continue
+            if self._has_same_camera_conflict(first_gid, second_gid):
+                continue
+            if not self._track_motion_compatible(
+                first,
+                second,
+                self.cfg.fusion_duplicate_velocity_gate_mps,
+            ):
+                self.metrics["duplicate_motion_rejected"] += 1
+                continue
+            candidates.append((distance, first_gid, second_gid))
+
+        used: set[int] = set()
+        for _distance, first_gid, second_gid in sorted(candidates):
+            if first_gid in used or second_gid in used:
+                continue
+            if first_gid not in self.tracks or second_gid not in self.tracks:
+                continue
+            used.update((first_gid, second_gid))
+            pair = tuple(sorted((first_gid, second_gid)))
+            count = self._record_pair_vote(
+                self._duplicate_merge_votes,
+                pair,
+                self._max_event_ts_s,
+                self.cfg.fusion_duplicate_confirmation_window_s,
+            )
+            if count < max(1, self.cfg.fusion_duplicate_confirmations):
+                self.metrics["duplicate_merges_deferred"] += 1
+                if (
+                    self.cfg.fusion_duplicate_suppression_enabled
+                    and count
+                    >= max(
+                        1,
+                        self.cfg.fusion_duplicate_suppression_min_confirmations,
+                    )
+                ):
+                    canonical = min(
+                        (first_gid, second_gid),
+                        key=self._canonical_merge_priority,
+                    )
+                    suppressed = (
+                        second_gid if canonical == first_gid else first_gid
+                    )
+                    self._duplicate_suppressed_gids.add(suppressed)
+                continue
+            if self.merge_gids(first_gid, second_gid):
+                self.metrics["duplicate_global_tracks_merged"] += 1
+                for candidate in list(self._duplicate_merge_votes):
+                    if first_gid in candidate or second_gid in candidate:
+                        del self._duplicate_merge_votes[candidate]
+
+        cutoff = (
+            self._max_event_ts_s
+            - self.cfg.fusion_duplicate_confirmation_window_s
+        )
+        for pair, (_, seen_ts) in list(self._duplicate_merge_votes.items()):
+            if seen_ts < cutoff:
+                del self._duplicate_merge_votes[pair]
 
     def _near_same_camera_peer(
         self, observations: list[CameraObservation]
@@ -674,7 +1163,17 @@ class GlobalTrackManager:
         )
         keep.hits += lose.hits
         keep.confirmed = keep.confirmed or lose.confirmed or keep.hits >= self.cfg.fusion_min_hits
+        emitted_times = [
+            value
+            for value in (keep.emitted_at_s, lose.emitted_at_s)
+            if value is not None
+        ]
+        keep.emitted_at_s = min(emitted_times) if emitted_times else None
         keep.cameras.update(lose.cameras)
+        for camera, endpoint in lose.camera_endpoints.items():
+            current = keep.camera_endpoints.get(camera)
+            if current is None or endpoint.timestamp_s > current.timestamp_s:
+                keep.camera_endpoints[camera] = endpoint
         keep.trail.extend(lose.trail)
         self._trim_trail(keep)
 
@@ -737,6 +1236,7 @@ class GlobalTrackManager:
             if self.tracklets.get(key) is None or gid not in self.tracks:
                 del self.affinity[key]
                 self.members[gid].discard(key)
+                self._fragment_reconnect_votes.pop(key, None)
         for gid in list(self.members):
             if gid not in self.tracks:
                 del self.members[gid]
@@ -752,7 +1252,11 @@ class GlobalTrackManager:
     def _expire_event_tracks(self) -> None:
         if not np.isfinite(self._max_event_ts_s):
             return
-        retention_s = max(self.cfg.fusion_max_age_s, self.cfg.tracklet_history_s)
+        retention_s = max(
+            self.cfg.fusion_max_age_s,
+            self.cfg.tracklet_history_s,
+            self.cfg.fusion_identity_retention_s,
+        )
         for gid in list(self.tracks):
             track = self.tracks[gid]
             if track.last_seen_ts_s is None:
@@ -764,6 +1268,7 @@ class GlobalTrackManager:
             for key, mapped_gid in list(self.affinity.items()):
                 if self.resolve_gid(mapped_gid) == gid:
                     del self.affinity[key]
+                    self._fragment_reconnect_votes.pop(key, None)
             self.metrics["global_tracks_expired"] += 1
 
     def metrics_snapshot(self) -> dict[str, int | float | dict[str, dict[str, float]]]:

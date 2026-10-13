@@ -26,6 +26,26 @@ from .timebase import ClockModel, FrameBatch
 from .video import AsyncVideoReader, SyncedVideoReader
 
 
+def _bbox_near_boundary(
+    bbox_xyxy: np.ndarray,
+    width: int,
+    height: int,
+    margin_ratio: float,
+) -> bool:
+    """Whether a detection touches a configured image entry/exit band."""
+    if margin_ratio <= 0:
+        return False
+    x1, y1, x2, y2 = np.asarray(bbox_xyxy, dtype=float)
+    margin_x = width * margin_ratio
+    margin_y = height * margin_ratio
+    return bool(
+        x1 <= margin_x
+        or y1 <= margin_y
+        or x2 >= width - margin_x
+        or y2 >= height - margin_y
+    )
+
+
 def run_pipeline(
     cfg: PipelineConfig,
     max_frames: int | None = None,
@@ -155,6 +175,12 @@ def run_pipeline(
                         capture_ts_s=packet.capture_ts_s,
                         world_velocity=velocity,
                         arrival_ts_s=packet.arrival_ts_s,
+                        near_boundary=_bbox_near_boundary(
+                            track.xyxy,
+                            calibrations[camera].width,
+                            calibrations[camera].height,
+                            cfg.fusion_boundary_margin_ratio,
+                        ),
                     ))
             event_watermark = max(event_watermark, *(batch.packets[camera].capture_ts_s for camera in cameras))
             cutoff = event_watermark - cfg.tracklet_history_s
@@ -182,6 +208,21 @@ def run_pipeline(
                 "calibrations": calibrations,
                 "metrics": {
                     **fusion.metrics_snapshot(),
+                    "local_tracks_created": sum(
+                        tracker.metrics["tracks_created"]
+                        for tracker in trackers.values()
+                    ),
+                    "local_track_reactivations": sum(
+                        tracker.metrics["reactivations"]
+                        for tracker in trackers.values()
+                    ),
+                    "retained_local_tracks": sum(
+                        len(tracker.tracks) for tracker in trackers.values()
+                    ),
+                    "peak_retained_local_tracks": sum(
+                        tracker.metrics["peak_retained_tracks"]
+                        for tracker in trackers.values()
+                    ),
                     "detector_batches": processed_ticks,
                     "ingest_dropped_frames": dict(batch.dropped_frames),
                     "out_of_order_packets_dropped": dict(out_of_order_packets_dropped),

@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .config import PipelineConfig
+from .config import PipelineConfig, TRACKING_PROFILE_OVERRIDES, apply_tracking_profile
 from .demo import run_pipeline
 from .mot_metrics import evaluate_mot
 
@@ -82,10 +82,22 @@ def main() -> None:
     parser.add_argument("--device", default=None, choices=["mps", "cpu", "cuda"])
     parser.add_argument("--cameras", nargs="+", default=None, metavar="CAM")
     parser.add_argument(
+        "--profile",
+        choices=sorted(TRACKING_PROFILE_OVERRIDES),
+        default="identity-v1-baseline",
+        help="Named identity ablation profile (default: identity-v1-baseline)",
+    )
+    parser.add_argument(
         "--match-gate-m",
         type=float,
         default=MATCH_GATE_M,
         help="Maximum world-plane match distance in meters (default: 1.0)",
+    )
+    parser.add_argument(
+        "--metric-window-frames",
+        type=int,
+        default=1000,
+        help="Also report IDF1/MOTA/HOTA per N evaluated ticks (0 disables)",
     )
     parser.add_argument(
         "--track-kf-time-process-noise",
@@ -105,8 +117,11 @@ def main() -> None:
         help="Print the frame/person/GID transition for every measured ID switch",
     )
     args = parser.parse_args()
+    if args.metric_window_frames < 0:
+        parser.error("--metric-window-frames must be >= 0")
 
     cfg = PipelineConfig(data_root=args.data_root, async_ingest=False)
+    apply_tracking_profile(cfg, args.profile)
     available = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())
     if not available:
         raise SystemExit("No cameras found — run `uv run download-data` first.")
@@ -176,6 +191,38 @@ def main() -> None:
     print(f"DetA / AssA / LocA    : {metrics['DetA']:.3f} / {metrics['AssA']:.3f} / {metrics['LocA']:.3f}")
     print(f"AssPr / AssRe         : {metrics['AssPr']:.3f} / {metrics['AssRe']:.3f}")
     print(f"CPU pipeline          : {len(predictions) / max(elapsed, 1e-6):.3f} ticks/s ({elapsed:.2f}s)")
+    print(f"Tracking profile      : {args.profile}")
+    gaps = [event[2] - event[1] for event in switch_events]
+    print(
+        "Switch gaps           : "
+        f"1={sum(gap == 1 for gap in gaps)}, "
+        f"2-30={sum(2 <= gap <= 30 for gap in gaps)}, "
+        f"31-90={sum(31 <= gap <= 90 for gap in gaps)}, "
+        f">90={sum(gap > 90 for gap in gaps)}"
+    )
+    if (
+        args.metric_window_frames > 0
+        and len(predictions) > args.metric_window_frames
+    ):
+        print(
+            f"\nWindow metrics ({args.metric_window_frames} evaluated ticks each)"
+        )
+        print("frames              IDF1   MOTA   HOTA   IDSW")
+        for start in range(0, len(predictions), args.metric_window_frames):
+            window_predictions = predictions[
+                start:start + args.metric_window_frames
+            ]
+            window = evaluate_mot(
+                window_predictions,
+                gt_frames,
+                frame_offset=best_offset,
+                match_gate_m=args.match_gate_m,
+            )
+            print(
+                f"{window_predictions[0][0]:6d}-{window_predictions[-1][0]:6d}  "
+                f"{window['IDF1']:.3f}  {window['MOTA']:.3f}  "
+                f"{window['HOTA']:.3f}  {window['IDSW']:5d}"
+            )
     if args.switch_details:
         print("\nID switch events (person: previous_frame/GID -> frame/GID):")
         for person_id, previous_frame, frame, previous_gid, gid in switch_events:
