@@ -128,6 +128,15 @@ class PipelineConfig:
     hybridsort_max_obs_gap_s: float = 0.80
     # Minimum score required to accept a blended association in round 2.
     hybridsort_min_blended_iou: float = 0.25
+    # At a crossing, one merged person box can overlap two established tracks
+    # almost equally. Updating either Kalman state from that box is effectively
+    # a coin flip and often swaps ownership after the people separate. Optional
+    # ambiguity suppression lets both tracks coast on motion for that tick and
+    # prevents the merged box from spawning a third local ID.
+    hybridsort_ambiguity_suppression_enabled: bool = False
+    hybridsort_ambiguity_min_iou: float = 0.25
+    hybridsort_ambiguity_margin: float = 0.08
+    hybridsort_ambiguity_min_area_ratio: float = 1.10
 
     # --- cross-camera fusion (fusion.py) ---
     fusion_gate_m: float = 2.0      # max world-plane distance (meters) to match
@@ -588,6 +597,49 @@ TRACKING_PROFILE_OVERRIDES["hybridsort-local-v2"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort"],
     "track_tentative_max_misses": 1,
     "ocsort_observation_recovery_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-detect-recall"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    # Keep the high-confidence birth threshold unchanged. Detections in
+    # [0.15, 0.50) are recovery evidence for existing tracks only.
+    "conf_threshold": 0.15,
+    # 768 is a measured-cost candidate for small/far people: 1.44x the input
+    # pixels of 640, materially cheaper than jumping straight to 960 (2.25x).
+    "imgsz": 768,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-low-floor"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "conf_threshold": 0.15,
+    "imgsz": 640,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-mid-floor"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "conf_threshold": 0.20,
+    "imgsz": 640,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-tentative"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "track_tentative_max_misses": 1,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crossing-guard"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "hybridsort_ambiguity_suppression_enabled": True,
+    "hybridsort_ambiguity_min_iou": 0.25,
+    "hybridsort_ambiguity_margin": 0.08,
+    "hybridsort_ambiguity_min_area_ratio": 1.10,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-continuity"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crossing-guard"],
+    # At 30 fps this retains an unconfirmed trajectory for at most ~33 ms;
+    # it reduces duplicate births without keeping false tracks visible.
+    "track_tentative_max_misses": 1,
+    "hybridsort_ambiguity_suppression_enabled": True,
+    "hybridsort_ambiguity_min_iou": 0.25,
+    "hybridsort_ambiguity_margin": 0.04,
+    "hybridsort_ambiguity_min_area_ratio": 1.10,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-tentative"],
 }
 TRACKING_PROFILE_OVERRIDES["hybridsort-trajectory"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort"],

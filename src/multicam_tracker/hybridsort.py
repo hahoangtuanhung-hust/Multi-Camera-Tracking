@@ -272,6 +272,64 @@ def associate_hybrid(
     return final_pairs, final_unmatched_tracks, final_unmatched_dets
 
 
+def find_ambiguous_detections(
+    tracks: list[HybridTrack],
+    detections: np.ndarray,
+    *,
+    min_iou: float,
+    margin: float,
+    min_area_ratio: float = 1.0,
+) -> dict[int, tuple[int, ...]]:
+    """Return detections that cannot safely choose between active owners.
+
+    A high-confidence box is ambiguous when it overlaps at least two confirmed,
+    currently visible track predictions, the two best IoUs differ by no more
+    than ``margin``, and its area is expanded relative to both owner boxes.
+    This is intentionally conservative: normal same-size detections, recently
+    lost tracks and tentative tracks cannot suppress a legitimate observation.
+
+    The returned mapping is ``detection_index -> candidate_track_indices``.
+    Callers can let those established tracks coast for one tick while also
+    preventing a merged detection from creating a duplicate local identity.
+    """
+    detections = np.asarray(detections, dtype=float).reshape((-1, 5))
+    eligible = [
+        index
+        for index, track in enumerate(tracks)
+        if track.confirmed and track.misses == 0
+    ]
+    if len(eligible) < 2 or len(detections) == 0:
+        return {}
+
+    predicted = np.stack([tracks[index].predicted_xyxy for index in eligible])
+    overlap = iou_matrix(predicted, detections[:, :4])
+    ambiguous: dict[int, tuple[int, ...]] = {}
+    for detection_index in range(len(detections)):
+        scores = overlap[:, detection_index]
+        candidate_rows = np.flatnonzero(scores >= min_iou)
+        if len(candidate_rows) < 2:
+            continue
+        ordered_rows = candidate_rows[np.argsort(scores[candidate_rows])[::-1]]
+        if float(scores[ordered_rows[0]] - scores[ordered_rows[1]]) > margin:
+            continue
+        detection = detections[detection_index, :4]
+        detection_area = max(0.0, detection[2] - detection[0]) * max(
+            0.0, detection[3] - detection[1]
+        )
+        owner_areas = []
+        for row in ordered_rows[:2]:
+            owner = predicted[int(row)]
+            owner_areas.append(
+                max(0.0, owner[2] - owner[0]) * max(0.0, owner[3] - owner[1])
+            )
+        if detection_area < min_area_ratio * max(owner_areas):
+            continue
+        ambiguous[detection_index] = tuple(
+            eligible[int(row)] for row in ordered_rows
+        )
+    return ambiguous
+
+
 # ---------------------------------------------------------------------------
 # Tracker
 # ---------------------------------------------------------------------------
@@ -290,6 +348,12 @@ class HybridSortTracker:
             raise ValueError("hybridsort_max_obs_gap_s must be > 0")
         if not (0.0 <= cfg.hybridsort_min_blended_iou <= 1.0):
             raise ValueError("hybridsort_min_blended_iou must be in [0, 1]")
+        if not (0.0 <= cfg.hybridsort_ambiguity_min_iou <= 1.0):
+            raise ValueError("hybridsort_ambiguity_min_iou must be in [0, 1]")
+        if cfg.hybridsort_ambiguity_margin < 0.0:
+            raise ValueError("hybridsort_ambiguity_margin must be >= 0")
+        if cfg.hybridsort_ambiguity_min_area_ratio < 1.0:
+            raise ValueError("hybridsort_ambiguity_min_area_ratio must be >= 1")
         if cfg.ocsort_oru_min_misses < 1:
             raise ValueError("ocsort_oru_min_misses must be >= 1")
         if cfg.track_detection_temporal_confirmation_frames < 1:
@@ -360,10 +424,38 @@ class HybridSortTracker:
         high = detections[detections[:, 4] >= cfg.track_high_conf]
         low = detections[detections[:, 4] < cfg.track_high_conf]
 
+        ambiguous_high = (
+            find_ambiguous_detections(
+                self.tracks,
+                high,
+                min_iou=cfg.hybridsort_ambiguity_min_iou,
+                margin=cfg.hybridsort_ambiguity_margin,
+                min_area_ratio=cfg.hybridsort_ambiguity_min_area_ratio,
+            )
+            if cfg.hybridsort_ambiguity_suppression_enabled
+            else {}
+        )
+        primary_detection_indices = np.asarray(
+            [index for index in range(len(high)) if index not in ambiguous_high],
+            dtype=int,
+        )
+        primary_high = high[primary_detection_indices]
+        for detection_index, candidate_tracks in ambiguous_high.items():
+            self.metrics["ambiguous_detections_suppressed"] += 1
+            for track_index in candidate_tracks:
+                self._record_event(
+                    "local_ambiguous_detection_suppressed",
+                    self.tracks[track_index],
+                    reason="multiple_established_owners",
+                    candidate_count=len(candidate_tracks),
+                    detection_bbox_xyxy=high[detection_index, :4].copy(),
+                    detection_confidence=float(high[detection_index, 4]),
+                )
+
         # ---- Two-round primary association (the Hybrid-SORT addition) ------
-        pairs, unmatched_tracks, unmatched_high = associate_hybrid(
+        pairs, unmatched_tracks, unmatched_primary = associate_hybrid(
             self.tracks,
-            high,
+            primary_high,
             cfg.track_min_iou,
             cfg.hybridsort_alpha,
             cfg.ocsort_inertia,
@@ -372,6 +464,14 @@ class HybridSortTracker:
             min_blended_iou=cfg.hybridsort_min_blended_iou,
             timestamp_s=timestamp_s,
         )
+        pairs = [
+            (track_index, int(primary_detection_indices[detection_index]))
+            for track_index, detection_index in pairs
+        ]
+        unmatched_high = [
+            int(primary_detection_indices[detection_index])
+            for detection_index in unmatched_primary
+        ]
         for track_index, detection_index in pairs:
             self.metrics["high_confidence_matches"] += 1
             self.metrics["hybrid_primary_matches"] += 1

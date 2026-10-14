@@ -21,7 +21,11 @@ from multicam_tracker.config import (
     PipelineConfig,
     apply_tracking_profile,
 )
-from multicam_tracker.hybridsort import HybridSortTracker, associate_hybrid
+from multicam_tracker.hybridsort import (
+    HybridSortTracker,
+    associate_hybrid,
+    find_ambiguous_detections,
+)
 from multicam_tracker.local_tracker import create_local_tracker
 
 
@@ -153,6 +157,64 @@ class HybridSortTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.metrics["low_confidence_matches"], 0)
         self.assertEqual(tracker.tracks[0].misses, 1)
         self.assertAlmostEqual(float(tracker.tracks[0].kf.x[2]), before_width)
+
+    def test_merged_detection_does_not_steal_crossing_ownership(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            ocsort_use_byte=False,
+            ocsort_observation_recovery_enabled=False,
+            hybridsort_ambiguity_suppression_enabled=True,
+            hybridsort_ambiguity_min_iou=0.20,
+            hybridsort_ambiguity_margin=0.10,
+        )
+        tracker = HybridSortTracker(cfg)
+        first = np.vstack((_det(0.0), _det(20.0)))
+        second = np.vstack((_det(4.0), _det(16.0)))
+        tracker.update(first, timestamp_s=0.0)
+        tracker.update(second, timestamp_s=0.1)
+        original_ids = [track.track_id for track in tracker.tracks]
+
+        # One detector box covers both people at the crossing. Updating one
+        # owner would be arbitrary; both established tracks should coast.
+        merged = np.array([[8.0, 0.0, 32.0, 40.0, 0.95]], dtype=float)
+        visible = tracker.update(merged, timestamp_s=0.2)
+
+        self.assertEqual(visible, [])
+        self.assertEqual([track.track_id for track in tracker.tracks], original_ids)
+        self.assertEqual([track.misses for track in tracker.tracks], [1, 1])
+        self.assertEqual(tracker._next_id, 3)
+        self.assertEqual(tracker.metrics["ambiguous_detections_suppressed"], 1)
+
+    def test_clear_detection_is_not_marked_ambiguous(self):
+        cfg = PipelineConfig(track_min_hits=1)
+        tracker = HybridSortTracker(cfg)
+        tracker.update(np.vstack((_det(0.0), _det(80.0))), timestamp_s=0.0)
+
+        ambiguous = find_ambiguous_detections(
+            tracker.tracks,
+            _det(2.0),
+            min_iou=0.25,
+            margin=0.10,
+            min_area_ratio=1.10,
+        )
+
+        self.assertEqual(ambiguous, {})
+
+    def test_same_size_overlap_is_not_treated_as_merged_box(self):
+        cfg = PipelineConfig(track_min_hits=1)
+        tracker = HybridSortTracker(cfg)
+        tracker.update(np.vstack((_det(0.0), _det(10.0))), timestamp_s=0.0)
+
+        ambiguous = find_ambiguous_detections(
+            tracker.tracks,
+            _det(5.0),
+            min_iou=0.25,
+            margin=0.10,
+            min_area_ratio=1.10,
+        )
+
+        self.assertEqual(ambiguous, {})
 
     def test_temporal_confirmation_setting_delays_publication(self):
         cfg = PipelineConfig(
