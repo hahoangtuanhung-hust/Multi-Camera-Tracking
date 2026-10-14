@@ -188,6 +188,7 @@ def evaluate_on_t4(
     seed: int = 0,
 ) -> dict[str, object]:
     """Run the full tracker on CUDA and return world-plane MOT metrics."""
+    from collections import defaultdict
     import json
     import time
 
@@ -196,8 +197,13 @@ def evaluate_on_t4(
 
     from multicam_tracker.config import PipelineConfig, apply_tracking_profile
     from multicam_tracker.demo import run_pipeline
-    from multicam_tracker.evaluate import ground_truth_by_frame, _match_errors
+    from multicam_tracker.evaluate import (
+        _classify_switch_events,
+        _match_errors,
+        ground_truth_by_frame,
+    )
     from multicam_tracker.mot_metrics import (
+        build_identity_error_taxonomy,
         evaluate_mot,
         evaluate_mot_slices,
         identity_trajectory_diagnostics,
@@ -264,6 +270,8 @@ def evaluate_on_t4(
         max_frame=max_frames + 3,
     )
     predictions: list[tuple[int, dict[int, np.ndarray]]] = []
+    source_maps: dict[int, dict[int, list[tuple[str, int]]]] = {}
+    track_exists_not_output = 0
     last_pipeline_metrics: dict[str, object] = {}
     started = time.perf_counter()
     for tick in run_pipeline(cfg, max_frames=max_frames):
@@ -274,6 +282,15 @@ def evaluate_on_t4(
                 for track in tick["global_tracks"]
             },
         ))
+        sources: defaultdict[int, list[tuple[str, int]]] = defaultdict(list)
+        for observation in tick["observations"]:
+            key = observation.camera, int(observation.local_id)
+            gid = tick["local_to_gid"].get(key)
+            if gid is None:
+                track_exists_not_output += 1
+            else:
+                sources[int(gid)].append(key)
+        source_maps[tick["frame_index"]] = dict(sources)
         last_pipeline_metrics = tick["metrics"]
         if len(predictions) % 250 == 0:
             print(
@@ -317,6 +334,20 @@ def evaluate_on_t4(
         frame_offset=best_offset,
         match_gate_m=match_gate_m,
     )
+    switch_diagnostics = _classify_switch_events(
+        metrics["switch_events"],
+        source_maps,
+        predictions,
+        gt_frames,
+        best_offset,
+    )
+    error_taxonomy = build_identity_error_taxonomy(
+        metrics,
+        identity_diagnostics,
+        last_pipeline_metrics,
+        switch_diagnostics=switch_diagnostics,
+        track_exists_not_output=track_exists_not_output,
+    )
     fusion_counter_names = (
         "global_id_merges",
         "provisional_ids_created",
@@ -351,6 +382,8 @@ def evaluate_on_t4(
         "peak_public_identity_slots",
         "public_gid_allocations",
         "new_gid_entry_deferred",
+        "interior_birth_fallbacks",
+        "interior_birth_reachable_dormant_deferred",
         "new_gid_capacity_deferred",
         "new_gid_trajectory_rejected",
         "retirement_deferred_no_exit",
@@ -368,6 +401,9 @@ def evaluate_on_t4(
         "local_tracks_created",
         "local_track_reactivations",
         "peak_retained_local_tracks",
+        "trajectory_smoothing_accepted",
+        "trajectory_smoothing_rejected",
+        "trajectory_smoothing_out_of_order_rejected",
     )
     switch_gaps = [event[2] - event[1] for event in metrics["switch_events"]]
     metrics.update({
@@ -389,6 +425,8 @@ def evaluate_on_t4(
         },
         **metric_slices,
         "identity_diagnostics": identity_diagnostics,
+        "switch_diagnostics": switch_diagnostics,
+        "identity_error_taxonomy": error_taxonomy,
         "fusion_counters": {
             name: last_pipeline_metrics.get(name, 0)
             for name in fusion_counter_names
@@ -403,6 +441,8 @@ def evaluate_on_t4(
                 "peak_retained_local_tracks",
                 "pending_provisional_tracks", "peak_pending_provisional_tracks",
                 "public_identity_slots", "peak_public_identity_slots",
+                "trajectory_smoothing_histories",
+                "trajectory_smoothing_samples",
             )
         },
         "run_metadata": build_run_metadata(cfg, seed=seed),

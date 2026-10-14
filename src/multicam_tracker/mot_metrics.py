@@ -250,6 +250,89 @@ def identity_trajectory_diagnostics(
     }
 
 
+def build_identity_error_taxonomy(
+    metrics: dict[str, object],
+    identity_diagnostics: dict[str, object],
+    pipeline_metrics: dict[str, object],
+    *,
+    switch_diagnostics: list[dict[str, object]] | None = None,
+    track_exists_not_output: int = 0,
+) -> dict[str, dict[str, object]]:
+    """Map available evaluator/runtime evidence to the ten failure classes.
+
+    Some failure causes cannot be uniquely recovered from fused world points.
+    Such values are explicitly marked as proxies instead of pretending that
+    every false negative originated in the detector.
+    """
+    switches = switch_diagnostics or []
+    long_attempts = int(identity_diagnostics.get("long_gap_reconnect_attempts", 0))
+    long_successes = int(identity_diagnostics.get("long_gap_reconnect_successes", 0))
+    trajectory_rejections = int(
+        pipeline_metrics.get("trajectory_matches_rejected", 0)
+    )
+    publication_rejections = int(
+        pipeline_metrics.get("new_gid_trajectory_rejected", 0)
+    )
+    return {
+        "detector_miss": {
+            "count": int(metrics.get("FN", 0)),
+            "evidence": "upper_bound_proxy",
+            "note": "Fused FN also includes local/fusion/output misses.",
+        },
+        "tentative_local_track_deleted": {
+            "count": int(pipeline_metrics.get("local_tracks_removed_tentative", 0)),
+            "evidence": "runtime_counter",
+        },
+        "local_switch_at_crossing": {
+            "count": sum(
+                bool(record.get("near_crossing"))
+                and record.get("classification") == "local_fragmentation"
+                for record in switches
+            ),
+            "evidence": "evaluator_switch_context" if switches else "unavailable",
+        },
+        "local_fragmentation_after_occlusion": {
+            "count": sum(
+                record.get("classification") == "local_fragmentation"
+                and int(record.get("gap_frames", 0)) > 1
+                for record in switches
+            ),
+            "evidence": "evaluator_switch_context" if switches else "unavailable",
+        },
+        "global_reassignment_local_stable": {
+            "count": sum(
+                record.get("classification") == "global_changed_local_stable"
+                for record in switches
+            ),
+            "evidence": "evaluator_switch_context" if switches else "unavailable",
+        },
+        "dormant_reconnect_failed": {
+            "count": max(0, long_attempts - long_successes),
+            "evidence": "trajectory_matching",
+        },
+        "motion_gate_rejection": {
+            "count": int(pipeline_metrics.get("fusion_motion_jump_rejected", 0)),
+            "evidence": "runtime_counter",
+        },
+        "trajectory_verification_rejection": {
+            "count": trajectory_rejections + publication_rejections,
+            "evidence": "runtime_counter",
+            "details": {
+                "association": trajectory_rejections,
+                "publication": publication_rejections,
+            },
+        },
+        "entry_publication_deferred": {
+            "count": int(pipeline_metrics.get("new_gid_entry_deferred", 0)),
+            "evidence": "runtime_counter",
+        },
+        "track_exists_not_output": {
+            "count": int(track_exists_not_output),
+            "evidence": "per_tick_observation_vs_public_affinity",
+        },
+    }
+
+
 def _metric_slice(predictions, ground_truth, frame_offset, match_gate_m):
     metrics = evaluate_mot(
         predictions,

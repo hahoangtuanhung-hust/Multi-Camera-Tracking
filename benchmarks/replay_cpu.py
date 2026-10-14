@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import pickle
 import sys
+from time import perf_counter
+import tracemalloc
 from collections import defaultdict
 from unittest.mock import patch
 
@@ -27,6 +29,7 @@ from multicam_tracker.evaluate import (
     ground_truth_by_frame,
 )
 from multicam_tracker.mot_metrics import (
+    build_identity_error_taxonomy,
     evaluate_mot,
     evaluate_mot_slices,
     identity_trajectory_diagnostics,
@@ -35,6 +38,12 @@ from multicam_tracker.local_tracker import LOCAL_TRACKERS
 from multicam_tracker.reporting import build_run_metadata, configure_determinism
 from multicam_tracker.timebase import FrameBatch, FramePacket
 from evaluate_thresholds import _score
+
+
+def _deterministic_score(result: dict[str, object]) -> dict[str, object]:
+    """Exclude runtime-only values before exact replay comparison."""
+    ignored = {"elapsed_s", "ticks_per_s", "peak_traced_memory_mib"}
+    return {key: value for key, value in result.items() if key not in ignored}
 
 
 def main():
@@ -157,8 +166,11 @@ def main():
 
     def score(name, pipeline=run_pipeline):
         configure_determinism(args.seed)
+        tracemalloc.start()
+        started = perf_counter()
         predictions = []
         source_maps = {}
+        track_exists_not_output = 0
         last_pipeline_metrics = {}
         previous_diagnostics_path = cfg.identity_diagnostics_path
         cfg.identity_diagnostics_path = (
@@ -170,17 +182,21 @@ def main():
                     tick["frame_index"],
                     {track.gid: track.world_xy.copy() for track in tick["global_tracks"]},
                 ))
-                if args.identity_events and name.startswith("current"):
-                    sources = defaultdict(list)
-                    for observation in tick["observations"]:
-                        key = observation.camera, int(observation.local_id)
-                        gid = tick["local_to_gid"].get(key)
-                        if gid is not None:
-                            sources[int(gid)].append(key)
-                    source_maps[tick["frame_index"]] = dict(sources)
+                sources = defaultdict(list)
+                for observation in tick["observations"]:
+                    key = observation.camera, int(observation.local_id)
+                    gid = tick["local_to_gid"].get(key)
+                    if gid is None:
+                        track_exists_not_output += 1
+                    else:
+                        sources[int(gid)].append(key)
+                source_maps[tick["frame_index"]] = dict(sources)
                 last_pipeline_metrics = tick["metrics"]
         finally:
             cfg.identity_diagnostics_path = previous_diagnostics_path
+        elapsed_s = perf_counter() - started
+        _, peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
         scores[name] = _score(predictions, gt)
         best_offset = min(
             (0, 1, 2),
@@ -189,6 +205,14 @@ def main():
             ))) if _match_errors(predictions[:100], gt, offset) else float("inf"),
         )
         full = evaluate_mot(predictions, gt, frame_offset=best_offset)
+        identity_diagnostics = identity_trajectory_diagnostics(
+            predictions,
+            gt,
+            frame_offset=best_offset,
+        )
+        diagnostics = _classify_switch_events(
+            full["switch_events"], source_maps, predictions, gt, best_offset
+        )
         scores[name].update({
             "frame_offset": best_offset,
             **evaluate_mot_slices(
@@ -198,11 +222,20 @@ def main():
                 cumulative_frames=(500, 1000, 1500, 2000, 4000),
                 window_frames=500,
             ),
-            "identity_diagnostics": identity_trajectory_diagnostics(
-                predictions,
-                gt,
-                frame_offset=best_offset,
+            "identity_diagnostics": identity_diagnostics,
+            "switch_diagnostics": diagnostics,
+            "identity_error_taxonomy": build_identity_error_taxonomy(
+                full,
+                identity_diagnostics,
+                last_pipeline_metrics,
+                switch_diagnostics=diagnostics,
+                track_exists_not_output=track_exists_not_output,
             ),
+            "ticks": len(predictions),
+            "elapsed_s": elapsed_s,
+            "ticks_per_s": len(predictions) / max(elapsed_s, 1e-9),
+            "peak_traced_memory_mib": peak_bytes / 2**20,
+            "pipeline_metrics": last_pipeline_metrics,
         })
         for metric in (
             "local_tracks_created",
@@ -218,9 +251,6 @@ def main():
         ):
             scores[name][metric] = last_pipeline_metrics.get(metric, 0)
         if args.identity_events and name.startswith("current"):
-            diagnostics = _classify_switch_events(
-                full["switch_events"], source_maps, predictions, gt, best_offset
-            )
             if name == "current":
                 with args.identity_events.open("a", encoding="utf-8") as destination:
                     for record in diagnostics:
@@ -238,7 +268,7 @@ def main():
         current = score("current")
         if args.verify_determinism:
             repeated = score("current_repeat")
-            if current != repeated:
+            if _deterministic_score(current) != _deterministic_score(repeated):
                 raise RuntimeError("Deterministic replay metric mismatch")
             scores["deterministic_replay_verified"] = True
         scores["run_metadata"] = build_run_metadata(cfg, seed=args.seed)
@@ -281,7 +311,7 @@ def main():
     if args.verify_determinism:
         current = scores["current"]
         repeated = score("current_repeat")
-        if current != repeated:
+        if _deterministic_score(current) != _deterministic_score(repeated):
             raise RuntimeError("Deterministic replay metric mismatch")
         scores["deterministic_replay_verified"] = True
     scores["run_metadata"] = build_run_metadata(cfg, seed=args.seed)

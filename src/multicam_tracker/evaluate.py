@@ -31,6 +31,7 @@ from .config import (
 from .demo import run_pipeline
 from .local_tracker import LOCAL_TRACKERS
 from .mot_metrics import (
+    build_identity_error_taxonomy,
     evaluate_mot,
     evaluate_mot_slices,
     identity_trajectory_diagnostics,
@@ -218,6 +219,7 @@ def main() -> None:
 
     predictions: list[tuple[int, dict[int, np.ndarray]]] = []
     source_maps: dict[int, dict[int, list[tuple[str, int]]]] = {}
+    track_exists_not_output = 0
     last_metrics: dict = {}
     started = time.perf_counter()
     for tick in run_pipeline(cfg, max_frames=args.max_frames):
@@ -232,6 +234,11 @@ def main() -> None:
             if gid is not None:
                 sources[int(gid)].append(key)
         source_maps[tick["frame_index"]] = dict(sources)
+        track_exists_not_output += sum(
+            (observation.camera, int(observation.local_id))
+            not in tick["local_to_gid"]
+            for observation in tick["observations"]
+        )
         last_metrics = tick["metrics"]
         if len(predictions) % 50 == 0:
             print(f"Evaluated {len(predictions)} ticks in {time.perf_counter() - started:.1f}s", flush=True)
@@ -281,6 +288,14 @@ def main() -> None:
             for record in switch_diagnostics:
                 destination.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    error_taxonomy = build_identity_error_taxonomy(
+        metrics,
+        identity_diagnostics,
+        last_metrics,
+        switch_diagnostics=switch_diagnostics,
+        track_exists_not_output=track_exists_not_output,
+    )
+
     metrics.update({
         "frame_offset": best_offset,
         "match_gate_m": args.match_gate_m,
@@ -294,6 +309,7 @@ def main() -> None:
         **metric_slices,
         "identity_diagnostics": identity_diagnostics,
         "switch_diagnostics": switch_diagnostics,
+        "identity_error_taxonomy": error_taxonomy,
         "pipeline_metrics": last_metrics,
         "run_metadata": build_run_metadata(cfg, seed=args.seed),
     })

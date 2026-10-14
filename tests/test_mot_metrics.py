@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from multicam_tracker.mot_metrics import (
+    build_identity_error_taxonomy,
     evaluate_mot,
     evaluate_mot_slices,
     identity_trajectory_diagnostics,
@@ -148,6 +149,43 @@ class MotMetricTests(unittest.TestCase):
         self.assertEqual(report["long_gap_reconnect_attempts"], 2)
         self.assertEqual(report["long_gap_reconnect_successes"], 1)
         self.assertGreater(report["crossing_switch_rate"], 0.0)
+
+    def test_identity_error_taxonomy_preserves_evidence_quality(self) -> None:
+        taxonomy = build_identity_error_taxonomy(
+            {"FN": 12},
+            {
+                "long_gap_reconnect_attempts": 4,
+                "long_gap_reconnect_successes": 1,
+            },
+            {
+                "local_tracks_removed_tentative": 5,
+                "fusion_motion_jump_rejected": 7,
+                "trajectory_matches_rejected": 8,
+                "new_gid_trajectory_rejected": 2,
+                "new_gid_entry_deferred": 9,
+            },
+            switch_diagnostics=[{
+                "near_crossing": True,
+                "classification": "local_fragmentation",
+                "gap_frames": 3,
+            }, {
+                "near_crossing": False,
+                "classification": "global_changed_local_stable",
+                "gap_frames": 1,
+            }],
+            track_exists_not_output=11,
+        )
+
+        self.assertEqual(taxonomy["detector_miss"]["count"], 12)
+        self.assertEqual(
+            taxonomy["detector_miss"]["evidence"], "upper_bound_proxy"
+        )
+        self.assertEqual(taxonomy["local_switch_at_crossing"]["count"], 1)
+        self.assertEqual(taxonomy["dormant_reconnect_failed"]["count"], 3)
+        self.assertEqual(
+            taxonomy["trajectory_verification_rejection"]["count"], 10
+        )
+        self.assertEqual(taxonomy["track_exists_not_output"]["count"], 11)
 
 
 if __name__ == "__main__":
