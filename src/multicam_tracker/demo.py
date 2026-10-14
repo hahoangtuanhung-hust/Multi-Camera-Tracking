@@ -121,6 +121,11 @@ def run_pipeline(
     last_capture_ts: dict[str, float] = {}
     out_of_order_packets_dropped: dict[str, int] = {camera: 0 for camera in cfg.cameras}
     processed_ticks = 0
+    detector_frames = 0
+    detector_detections = 0
+    detector_high_confidence_detections = 0
+    detector_low_confidence_candidates = 0
+    detector_empty_frames = 0
     limited_cameras: set[str] = set()
     event_watermark = float("-inf")
 
@@ -157,6 +162,18 @@ def run_pipeline(
             detections = detector.detect_batch([frames[camera] for camera in cameras])
             if len(detections) != len(cameras):
                 raise ValueError("Detector must return exactly one detection array per camera")
+            detector_frames += len(detections)
+            for camera_detections in detections:
+                camera_detections = np.asarray(camera_detections, dtype=float).reshape((-1, 5))
+                count = len(camera_detections)
+                detector_detections += count
+                detector_empty_frames += int(count == 0)
+                if count:
+                    high_count = int(np.count_nonzero(
+                        camera_detections[:, 4] >= cfg.track_high_conf
+                    ))
+                    detector_high_confidence_detections += high_count
+                    detector_low_confidence_candidates += count - high_count
             processed_ticks += 1
             camera_tracks = {
                 camera: trackers[camera].update(
@@ -327,6 +344,10 @@ def run_pipeline(
                         tracker.metrics["byte_extension_matches"]
                         for tracker in trackers.values()
                     ),
+                    "local_ambiguous_detections_suppressed": sum(
+                        tracker.metrics.get("ambiguous_detections_suppressed", 0)
+                        for tracker in trackers.values()
+                    ),
                     "retained_local_tracks": sum(
                         len(tracker.tracks) for tracker in trackers.values()
                     ),
@@ -335,6 +356,15 @@ def run_pipeline(
                         for tracker in trackers.values()
                     ),
                     "detector_batches": processed_ticks,
+                    "detector_frames": detector_frames,
+                    "detector_detections": detector_detections,
+                    "detector_high_confidence_detections": (
+                        detector_high_confidence_detections
+                    ),
+                    "detector_low_confidence_candidates": (
+                        detector_low_confidence_candidates
+                    ),
+                    "detector_empty_frames": detector_empty_frames,
                     "ingest_dropped_frames": dict(batch.dropped_frames),
                     "out_of_order_packets_dropped": dict(out_of_order_packets_dropped),
                     "world_motion_entries": len(world_motion),

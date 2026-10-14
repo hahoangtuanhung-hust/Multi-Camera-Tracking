@@ -104,6 +104,31 @@ class ContinuousPipelineTests(unittest.TestCase):
         self.assertEqual([tick["tick_index"] for tick in ticks], list(range(1, 76)))
         self.assertEqual(ticks[-1]["metrics"]["detector_batches"], 75)
 
+    @patch("multicam_tracker.ocsort.OCSortTracker.update", return_value=[])
+    @patch("multicam_tracker.demo.load_calibrations", return_value={})
+    def test_detector_confidence_bands_are_reported(self, _load, _update) -> None:
+        detector = _CountingDetector()
+        detector.detect_batch = lambda _images: [
+            np.array([
+                [0.0, 0.0, 10.0, 20.0, 0.85],
+                [1.0, 0.0, 11.0, 20.0, 0.20],
+            ]),
+            np.empty((0, 5), dtype=float),
+        ]
+
+        tick = list(run_pipeline(
+            PipelineConfig(cameras=["a", "b"]),
+            batch_iter=_batches(1),
+            detector=detector,
+        ))[-1]
+        metrics = tick["metrics"]
+
+        self.assertEqual(metrics["detector_frames"], 2)
+        self.assertEqual(metrics["detector_detections"], 2)
+        self.assertEqual(metrics["detector_high_confidence_detections"], 1)
+        self.assertEqual(metrics["detector_low_confidence_candidates"], 1)
+        self.assertEqual(metrics["detector_empty_frames"], 1)
+
     @patch("multicam_tracker.demo.load_calibrations", return_value={"a": object(), "b": object()})
     def test_frame_limit_is_only_applied_when_explicitly_requested(self, _load) -> None:
         cfg = PipelineConfig(cameras=["a", "b"])
