@@ -91,6 +91,14 @@ class PipelineConfig:
     track_association_max_size_log_change: float = 1.10
     track_motion_reactivation_s: float = 1.0
     track_motion_min_speed: float = 0.10
+    # Low-score detections may recover an existing track, but never create a
+    # new one. Their association is additionally gated by the box-space
+    # Kalman covariance because metres/second are not defined before the
+    # camera homography projects the foot point onto the world plane.
+    track_detection_temporal_confirmation_frames: int = 2
+    track_detection_low_conf_recovery_enabled: bool = True
+    track_motion_gate_enabled: bool = True
+    track_max_speed_mps: float = 3.20
     # OC-SORT uses detector observations, rather than only Kalman predictions,
     # to preserve motion direction through crossings and repair the state after
     # an occlusion. ``delta_t`` is the observation look-back in camera ticks.
@@ -111,6 +119,11 @@ class PipelineConfig:
     # association. 0.0 degenerates to OC-SORT; 1.0 ignores Kalman predictions.
     # Paper default is ~0.35–0.45 for appearance-free settings.
     hybridsort_alpha: float = 0.40
+    # Maximum time elapsed since last real observation to be eligible for
+    # observation-IoU recovery. Prevents stale tracks from stealing new identities.
+    hybridsort_max_obs_gap_s: float = 0.80
+    # Minimum score required to accept a blended association in round 2.
+    hybridsort_min_blended_iou: float = 0.25
 
     # --- cross-camera fusion (fusion.py) ---
     fusion_gate_m: float = 2.0      # max world-plane distance (meters) to match
@@ -141,12 +154,51 @@ class PipelineConfig:
     fusion_new_gid_entry_required: bool = False
     # During startup, people may already be inside the scene rather than at an
     # image boundary, so seed the initial population without entry evidence.
-    fusion_new_gid_bootstrap_s: float = 0.0
+    fusion_new_gid_bootstrap_s: float = 2.5
     # Public identities that disappear inside the scene stay dormant for
     # reconnect. Boundary evidence releases them normally; the forced timeout
     # is a bounded-memory safety valve for imperfect boundary calibration.
     fusion_retire_requires_exit_boundary: bool = False
     fusion_forced_retire_s: float = 30.0
+    # Verification of trajectory plausibility before promoting a provisional track to a public GID
+    fusion_trajectory_verification_enabled: bool = False
+    fusion_trajectory_min_points: int = 4
+    fusion_trajectory_min_duration_s: float = 0.30
+    fusion_trajectory_max_jump_m: float = 1.60
+    fusion_trajectory_max_speed_mps: float = 3.20
+    # Hard event-time feasibility gate. Within the short jump window, the
+    # absolute cap dominates even when Kalman covariance grows rapidly.
+    fusion_jump_window_s: float = 1.0
+    fusion_max_jump_m: float = 2.0
+    fusion_max_speed_mps: float = 3.2
+    fusion_max_acceleration_mps2: float = 4.0
+    fusion_motion_uncertainty_sigma: float = 3.0
+    fusion_motion_measurement_tolerance_m: float = 0.25
+    # Multi-point trajectory cost used for dormant/interior reassociation.
+    fusion_trajectory_window_s: float = 2.0
+    fusion_trajectory_position_weight: float = 1.0
+    fusion_trajectory_velocity_weight: float = 0.5
+    fusion_trajectory_direction_weight: float = 1.0
+    fusion_trajectory_acceleration_weight: float = 0.25
+    fusion_trajectory_min_direction_cosine: float = 0.0
+    # World coordinate entry/exit zones on the 2D ground plane (Z=0, in meters)
+    # Each zone can be [xmin, xmax, ymin, ymax] or a polygon [(x1,y1), ...]
+    fusion_world_entry_zones: list[
+        tuple[float, float, float, float] | list[tuple[float, float]]
+    ] = field(default_factory=list)
+    fusion_world_exit_zones: list[
+        tuple[float, float, float, float] | list[tuple[float, float]]
+    ] = field(default_factory=list)
+    # Dormant Identity Pool: Maximum retention for occluded identities inside the scene
+    fusion_dormant_retention_s: float = 8.0
+    # Kinematic matching gate and weights for reconnecting dormant tracks
+    fusion_kinematic_match_gate_m: float = 2.5
+    fusion_kinematic_direction_weight: float = 1.0
+    fusion_kinematic_speed_weight: float = 0.5
+    # Anti-PingPong Hysteresis: lock rapid 1-frame alternations between nearby tracks
+    fusion_anti_pingpong_enabled: bool = True
+    fusion_anti_pingpong_frames: int = 5
+    fusion_anti_pingpong_distance_m: float = 1.2
     fusion_batch_reconnect_enabled: bool = False
     # Experimental. Repeated spatial confirmation after a motion-gate failure
     # increased short-horizon ID switches in the real-scene ablation.
@@ -459,24 +511,62 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
     # for clearly visible tracks while strongly helping after occlusion.
     "hybridsort": {
         "local_tracker": "hybridsort",
+        "track_detection_temporal_confirmation_frames": 2,
+        "track_detection_low_conf_recovery_enabled": True,
+        "track_motion_gate_enabled": True,
+        "track_max_speed_mps": 3.20,
+        "track_kf_robust_nis_threshold": 13.28,
         "hybridsort_alpha": 0.40,
+        "hybridsort_max_obs_gap_s": 0.80,
+        "hybridsort_min_blended_iou": 0.25,
+        "ocsort_observation_recovery_enabled": False,
         "track_motion_association_enabled": False,
         "fusion_identity_retention_s": 3.0,
-        "fusion_provisional_buffer_enabled": False,
-        "fusion_provisional_buffer_bootstrap_s": 0.0,
-        "fusion_batch_reconnect_enabled": False,
+        "fusion_provisional_buffer_enabled": True,
+        "fusion_provisional_min_age_s": 0.50,
+        "fusion_provisional_buffer_bootstrap_s": 1.5,
+        "fusion_deferred_gid_allocation_enabled": True,
+        "fusion_new_gid_entry_required": True,
+        "fusion_new_gid_bootstrap_s": 2.5,
+        "fusion_retire_requires_exit_boundary": True,
+        "fusion_trajectory_verification_enabled": True,
+        "fusion_trajectory_min_points": 4,
+        "fusion_trajectory_min_duration_s": 0.30,
+        "fusion_trajectory_max_jump_m": 1.60,
+        "fusion_trajectory_max_speed_mps": 3.20,
+        "fusion_jump_window_s": 1.0,
+        "fusion_max_jump_m": 2.0,
+        "fusion_max_speed_mps": 3.20,
+        "fusion_max_acceleration_mps2": 4.0,
+        "fusion_motion_uncertainty_sigma": 3.0,
+        "fusion_motion_measurement_tolerance_m": 0.25,
+        "fusion_trajectory_window_s": 2.0,
+        "fusion_trajectory_position_weight": 1.0,
+        "fusion_trajectory_velocity_weight": 0.5,
+        "fusion_trajectory_direction_weight": 1.0,
+        "fusion_trajectory_acceleration_weight": 0.25,
+        "fusion_trajectory_min_direction_cosine": 0.0,
+        "fusion_dormant_retention_s": 8.0,
+        "fusion_kinematic_match_gate_m": 2.5,
+        "fusion_kinematic_direction_weight": 1.0,
+        "fusion_kinematic_speed_weight": 0.5,
+        "fusion_anti_pingpong_enabled": True,
+        "fusion_anti_pingpong_frames": 5,
+        "fusion_anti_pingpong_distance_m": 1.2,
+        "fusion_batch_reconnect_enabled": True,
         "fusion_adaptive_hysteresis_enabled": False,
         "fusion_published_motion_gate_enabled": False,
-        "fusion_duplicate_suppression_enabled": False,
-        "fusion_duplicate_merge_m": 0.0,
+        "fusion_duplicate_suppression_enabled": True,
+        "fusion_duplicate_merge_m": 0.30,
         "fusion_local_reconnect_long_window_s": 3.0,
         "fusion_local_reconnect_window_s": 3.0,
         "fusion_local_reconnect_covariance_enabled": False,
-        "fusion_local_reconnect_confirmations": 1,
+        "fusion_local_reconnect_confirmations": 2,
+        "fusion_local_reconnect_confirmation_window_s": 0.35,
         "fusion_local_reconnect_velocity_weight_s": 0.0,
-        "fusion_gid_ownership_hysteresis_enabled": False,
-        "fusion_instant_confirmations": 1,
-        "fusion_published_merge_confirmations": 1,
+        "fusion_gid_ownership_hysteresis_enabled": True,
+        "fusion_instant_confirmations": 2,
+        "fusion_published_merge_confirmations": 3,
         "clock_max_pair_delta_spread_s": 0.40,
     },
 }
