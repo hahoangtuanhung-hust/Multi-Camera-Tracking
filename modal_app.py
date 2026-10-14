@@ -66,12 +66,14 @@ gpu_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
     .uv_sync(".", frozen=True)
-    .add_local_dir("src/multicam_tracker", "/root/multicam_tracker")
     .env({
         "SOURCE_GIT_SHA": _SOURCE_GIT_SHA,
         "SOURCE_GIT_BRANCH": _SOURCE_GIT_BRANCH,
         "SOURCE_GIT_DIRTY": _SOURCE_GIT_DIRTY,
     })
+    # Modal local mounts must be the final image operation. Keeping this last
+    # also avoids rebuilding dependency layers for source-only changes.
+    .add_local_dir("src/multicam_tracker", "/root/multicam_tracker")
 )
 
 
