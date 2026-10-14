@@ -30,7 +30,12 @@ from .config import (
 )
 from .demo import run_pipeline
 from .local_tracker import LOCAL_TRACKERS
-from .mot_metrics import evaluate_mot
+from .mot_metrics import (
+    evaluate_mot,
+    evaluate_mot_slices,
+    identity_trajectory_diagnostics,
+)
+from .reporting import build_run_metadata, configure_determinism
 
 MATCH_GATE_M = 1.0
 
@@ -151,8 +156,20 @@ def main() -> None:
         "--cumulative-frames",
         type=int,
         nargs="*",
-        default=[300, 1000, 3000, 6000, 9000],
+        default=[500, 1000, 1500, 2000, 4000],
         help="Report from-start metrics at these evaluated tick counts",
+    )
+    parser.add_argument(
+        "--metrics-out",
+        type=Path,
+        default=None,
+        help="Optionally save the complete reproducible metrics report as JSON",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed used by Python, NumPy, OpenCV and PyTorch",
     )
     args = parser.parse_args()
     if args.metric_window_frames < 0:
@@ -163,6 +180,10 @@ def main() -> None:
         parser.error("--identity-events-max must be >= 0")
     if any(value <= 0 for value in args.cumulative_frames):
         parser.error("--cumulative-frames values must be > 0")
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
+
+    configure_determinism(args.seed)
 
     cfg = PipelineConfig(data_root=args.data_root, async_ingest=False)
     apply_tracking_profile(cfg, args.profile)
@@ -204,14 +225,13 @@ def main() -> None:
             tick["frame_index"],
             {t.gid: t.world_xy.copy() for t in tick["global_tracks"]},
         ))
-        if args.identity_events is not None:
-            sources: defaultdict[int, list[tuple[str, int]]] = defaultdict(list)
-            for observation in tick["observations"]:
-                key = observation.camera, int(observation.local_id)
-                gid = tick["local_to_gid"].get(key)
-                if gid is not None:
-                    sources[int(gid)].append(key)
-            source_maps[tick["frame_index"]] = dict(sources)
+        sources: defaultdict[int, list[tuple[str, int]]] = defaultdict(list)
+        for observation in tick["observations"]:
+            key = observation.camera, int(observation.local_id)
+            gid = tick["local_to_gid"].get(key)
+            if gid is not None:
+                sources[int(gid)].append(key)
+        source_maps[tick["frame_index"]] = dict(sources)
         last_metrics = tick["metrics"]
         if len(predictions) % 50 == 0:
             print(f"Evaluated {len(predictions)} ticks in {time.perf_counter() - started:.1f}s", flush=True)
@@ -234,19 +254,49 @@ def main() -> None:
         frame_offset=best_offset,
         match_gate_m=args.match_gate_m,
     )
+    metric_slices = evaluate_mot_slices(
+        predictions,
+        gt_frames,
+        frame_offset=best_offset,
+        match_gate_m=args.match_gate_m,
+        cumulative_frames=args.cumulative_frames,
+        window_frames=args.metric_window_frames,
+    )
+    identity_diagnostics = identity_trajectory_diagnostics(
+        predictions,
+        gt_frames,
+        frame_offset=best_offset,
+        match_gate_m=args.match_gate_m,
+    )
     switch_events = metrics["switch_events"]
-    switch_diagnostics = []
+    switch_diagnostics = _classify_switch_events(
+        switch_events,
+        source_maps,
+        predictions,
+        gt_frames,
+        best_offset,
+    )
     if args.identity_events is not None:
-        switch_diagnostics = _classify_switch_events(
-            switch_events,
-            source_maps,
-            predictions,
-            gt_frames,
-            best_offset,
-        )
         with args.identity_events.open("a", encoding="utf-8") as destination:
             for record in switch_diagnostics:
                 destination.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    metrics.update({
+        "frame_offset": best_offset,
+        "match_gate_m": args.match_gate_m,
+        "max_frames": args.max_frames,
+        "evaluated_ticks": len(predictions),
+        "elapsed_s": elapsed,
+        "ticks_per_s": len(predictions) / max(elapsed, 1e-9),
+        "cameras": cfg.cameras,
+        "tracking_profile": args.profile,
+        "expected_people": cfg.fusion_fixed_population_size,
+        **metric_slices,
+        "identity_diagnostics": identity_diagnostics,
+        "switch_diagnostics": switch_diagnostics,
+        "pipeline_metrics": last_metrics,
+        "run_metadata": build_run_metadata(cfg, seed=args.seed),
+    })
 
     print(f"\nFrame offset used     : {best_offset}")
     print(f"World match gate      : {args.match_gate_m:.2f} m")
@@ -297,49 +347,24 @@ def main() -> None:
         f"31-90={sum(31 <= gap <= 90 for gap in gaps)}, "
         f">90={sum(gap > 90 for gap in gaps)}"
     )
-    if (
-        args.metric_window_frames > 0
-        and len(predictions) > args.metric_window_frames
-    ):
+    if metric_slices["metric_windows"]:
         print(
             f"\nWindow metrics ({args.metric_window_frames} evaluated ticks each)"
         )
         print("frames              IDF1   MOTA   HOTA   IDSW  Frag")
-        for start in range(0, len(predictions), args.metric_window_frames):
-            window_predictions = predictions[
-                start:start + args.metric_window_frames
-            ]
-            window = evaluate_mot(
-                window_predictions,
-                gt_frames,
-                frame_offset=best_offset,
-                match_gate_m=args.match_gate_m,
-            )
+        for window in metric_slices["metric_windows"]:
             print(
-                f"{window_predictions[0][0]:6d}-{window_predictions[-1][0]:6d}  "
+                f"{window['start_frame']:6d}-{window['end_frame']:6d}  "
                 f"{window['IDF1']:.3f}  {window['MOTA']:.3f}  "
                 f"{window['HOTA']:.3f}  {window['IDSW']:5d}  "
                 f"{window['Frag']:4d}"
             )
-    cumulative_counts = sorted({
-        min(value, len(predictions))
-        for value in args.cumulative_frames
-        if predictions and value <= len(predictions)
-    })
-    if predictions and len(predictions) not in cumulative_counts:
-        cumulative_counts.append(len(predictions))
-    if cumulative_counts:
+    if metric_slices["cumulative_metrics"]:
         print("\nCumulative metrics (from frame 0)")
         print("ticks    IDF1   IDP    IDR    HOTA   AssA   MOTA   IDSW  Frag")
-        for count in cumulative_counts:
-            cumulative = evaluate_mot(
-                predictions[:count],
-                gt_frames,
-                frame_offset=best_offset,
-                match_gate_m=args.match_gate_m,
-            )
+        for cumulative in metric_slices["cumulative_metrics"]:
             print(
-                f"{count:5d}  {cumulative['IDF1']:.3f}  "
+                f"{cumulative['ticks']:5d}  {cumulative['IDF1']:.3f}  "
                 f"{cumulative['IDP']:.3f}  {cumulative['IDR']:.3f}  "
                 f"{cumulative['HOTA']:.3f}  {cumulative['AssA']:.3f}  "
                 f"{cumulative['MOTA']:.3f}  {cumulative['IDSW']:5d}  "
@@ -377,6 +402,13 @@ def main() -> None:
         print("\nSwitch diagnostic classes:")
         for name, count in sorted(categories.items()):
             print(f"  {name}: {count}")
+    if args.metrics_out is not None:
+        args.metrics_out.parent.mkdir(parents=True, exist_ok=True)
+        args.metrics_out.write_text(
+            json.dumps(metrics, indent=2, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        print(f"\nSaved metrics to {args.metrics_out.resolve()}")
 
 
 def _classify_switch_events(

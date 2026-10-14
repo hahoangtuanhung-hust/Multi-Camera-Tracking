@@ -23,6 +23,7 @@ on the T4 container's CPU.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import uuid
 
 import modal
@@ -40,6 +41,25 @@ REMOTE_OUTPUT_DIR = f"{VOLUME_MOUNT}/outputs"
 app = modal.App(APP_NAME)
 storage = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
+
+def _local_git_value(*args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+_SOURCE_GIT_SHA = _local_git_value("rev-parse", "HEAD")
+_SOURCE_GIT_BRANCH = _local_git_value("branch", "--show-current")
+_SOURCE_GIT_DIRTY = "1" if _local_git_value("status", "--porcelain") else "0"
+
 # uv_sync installs the exact project lockfile. Source is mounted separately so
 # code-only changes do not rebuild the large PyTorch/Ultralytics image layer.
 gpu_image = (
@@ -47,6 +67,11 @@ gpu_image = (
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
     .uv_sync(".", frozen=True)
     .add_local_dir("src/multicam_tracker", "/root/multicam_tracker")
+    .env({
+        "SOURCE_GIT_SHA": _SOURCE_GIT_SHA,
+        "SOURCE_GIT_BRANCH": _SOURCE_GIT_BRANCH,
+        "SOURCE_GIT_DIRTY": _SOURCE_GIT_DIRTY,
+    })
 )
 
 
@@ -155,10 +180,12 @@ def evaluate_on_t4(
     output_name: str,
     max_frames: int = 1200,
     match_gate_m: float = 1.0,
-    metric_window_frames: int = 1000,
+    metric_window_frames: int = 500,
+    cumulative_frames: list[int] | None = None,
     cameras: list[str] | None = None,
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
     expected_people: int | None = None,
+    seed: int = 0,
 ) -> dict[str, object]:
     """Run the full tracker on CUDA and return world-plane MOT metrics."""
     import json
@@ -170,7 +197,12 @@ def evaluate_on_t4(
     from multicam_tracker.config import PipelineConfig, apply_tracking_profile
     from multicam_tracker.demo import run_pipeline
     from multicam_tracker.evaluate import ground_truth_by_frame, _match_errors
-    from multicam_tracker.mot_metrics import evaluate_mot
+    from multicam_tracker.mot_metrics import (
+        evaluate_mot,
+        evaluate_mot_slices,
+        identity_trajectory_diagnostics,
+    )
+    from multicam_tracker.reporting import build_run_metadata, configure_determinism
 
     if not torch.cuda.is_available():
         raise RuntimeError("Modal assigned a GPU, but PyTorch CUDA is unavailable")
@@ -182,6 +214,13 @@ def evaluate_on_t4(
         raise ValueError("metric_window_frames must be > 0")
     if expected_people is not None and expected_people < 0:
         raise ValueError("expected_people must be >= 0")
+    if seed < 0:
+        raise ValueError("seed must be >= 0")
+    cumulative_frames = cumulative_frames or [500, 1000, 1500, 2000, 4000]
+    if any(value <= 0 for value in cumulative_frames):
+        raise ValueError("cumulative_frames values must be > 0")
+
+    configure_determinism(seed)
 
     safe_name = Path(output_name).name
     if safe_name != output_name or Path(safe_name).suffix.lower() != ".json":
@@ -264,28 +303,20 @@ def evaluate_on_t4(
         frame_offset=best_offset,
         match_gate_m=match_gate_m,
     )
-    window_metrics = []
-    for start in range(0, len(predictions), metric_window_frames):
-        window_predictions = predictions[start:start + metric_window_frames]
-        window = evaluate_mot(
-            window_predictions,
-            gt_frames,
-            frame_offset=best_offset,
-            match_gate_m=match_gate_m,
-        )
-        window_metrics.append({
-            "start_frame": window_predictions[0][0],
-            "end_frame": window_predictions[-1][0],
-            "ticks": len(window_predictions),
-            **{
-                name: window[name]
-                for name in (
-                    "IDF1", "IDP", "IDR", "IDSW", "MOTA", "MOTP",
-                    "MOTP_distance_m", "HOTA", "DetA", "AssA", "LocA",
-                    "precision", "recall", "position_RMSE_m",
-                )
-            },
-        })
+    metric_slices = evaluate_mot_slices(
+        predictions,
+        gt_frames,
+        frame_offset=best_offset,
+        match_gate_m=match_gate_m,
+        cumulative_frames=cumulative_frames,
+        window_frames=metric_window_frames,
+    )
+    identity_diagnostics = identity_trajectory_diagnostics(
+        predictions,
+        gt_frames,
+        frame_offset=best_offset,
+        match_gate_m=match_gate_m,
+    )
     fusion_counter_names = (
         "global_id_merges",
         "provisional_ids_created",
@@ -356,7 +387,8 @@ def evaluate_on_t4(
             "31_90": sum(31 <= gap <= 90 for gap in switch_gaps),
             "over_90": sum(gap > 90 for gap in switch_gaps),
         },
-        "metric_windows": window_metrics,
+        **metric_slices,
+        "identity_diagnostics": identity_diagnostics,
         "fusion_counters": {
             name: last_pipeline_metrics.get(name, 0)
             for name in fusion_counter_names
@@ -373,6 +405,7 @@ def evaluate_on_t4(
                 "public_identity_slots", "peak_public_identity_slots",
             )
         },
+        "run_metadata": build_run_metadata(cfg, seed=seed),
     })
 
     output_dir = Path(REMOTE_OUTPUT_DIR)
@@ -417,9 +450,11 @@ def main(
     max_frames: int = 1200,
     match_gate_m: float = 1.0,
     metrics_out: str = "modal-mot-metrics.json",
-    metric_window_frames: int = 1000,
+    metric_window_frames: int = 500,
+    cumulative_frames: str = "500,1000,1500,2000,4000",
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
     expected_people: int = -1,
+    seed: int = 0,
 ) -> None:
     """Optionally upload inputs, then render MP4 or evaluate MOT metrics."""
     if upload:
@@ -429,6 +464,11 @@ def main(
         raise ValueError("--expected-people must be >= 0, or omitted")
     expected_people_override = None if expected_people == -1 else expected_people
     selected_cameras = [value.strip() for value in cameras.split(",") if value.strip()]
+    selected_cumulative_frames = [
+        int(value.strip())
+        for value in cumulative_frames.split(",")
+        if value.strip()
+    ]
     if evaluate:
         import json
 
@@ -445,9 +485,11 @@ def main(
             max_frames=max_frames,
             match_gate_m=match_gate_m,
             metric_window_frames=metric_window_frames,
+            cumulative_frames=selected_cumulative_frames,
             cameras=selected_cameras or None,
             tracking_profile=tracking_profile,
             expected_people=expected_people_override,
+            seed=seed,
         )
         local_metrics.parent.mkdir(parents=True, exist_ok=True)
         serializable = {

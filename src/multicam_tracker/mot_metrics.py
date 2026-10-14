@@ -12,6 +12,8 @@ averages the standard 19 alpha thresholds from 0.05 through 0.95.
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -32,6 +34,248 @@ def evaluate_mot(
     clear = _clear_metrics(sequence)
     hota = _hota_metrics(sequence)
     return {**identity, **clear, **hota}
+
+
+def evaluate_mot_slices(
+    predictions: list[tuple[int, dict[int, np.ndarray]]],
+    ground_truth: dict[int, dict[int, np.ndarray]],
+    *,
+    frame_offset: int = 0,
+    match_gate_m: float = 1.0,
+    cumulative_frames: tuple[int, ...] | list[int] = (
+        500, 1000, 1500, 2000, 4000
+    ),
+    window_frames: int = 500,
+) -> dict[str, list[dict[str, object]]]:
+    """Evaluate from-start prefixes and independent windows from one run.
+
+    Identity metrics are sequence-global.  Reporting both views makes a GID
+    rename across a window boundary visible instead of accidentally resetting
+    the GT-to-predicted-ID assignment for every benchmark job.
+    """
+    if window_frames < 0:
+        raise ValueError("window_frames must be >= 0")
+    if any(int(value) <= 0 for value in cumulative_frames):
+        raise ValueError("cumulative frame counts must be positive")
+    if not predictions:
+        return {"cumulative_metrics": [], "metric_windows": []}
+
+    counts = {
+        min(int(value), len(predictions))
+        for value in cumulative_frames
+        if int(value) <= len(predictions)
+    }
+    counts.add(len(predictions))
+    cumulative = [
+        _metric_slice(
+            predictions[:count], ground_truth, frame_offset, match_gate_m
+        )
+        for count in sorted(counts)
+    ]
+    windows: list[dict[str, object]] = []
+    if window_frames:
+        for start in range(0, len(predictions), window_frames):
+            windows.append(_metric_slice(
+                predictions[start:start + window_frames],
+                ground_truth,
+                frame_offset,
+                match_gate_m,
+            ))
+    return {"cumulative_metrics": cumulative, "metric_windows": windows}
+
+
+def identity_trajectory_diagnostics(
+    predictions: list[tuple[int, dict[int, np.ndarray]]],
+    ground_truth: dict[int, dict[int, np.ndarray]],
+    *,
+    frame_offset: int = 0,
+    match_gate_m: float = 1.0,
+    long_gap_frames: int = 90,
+    crossing_distance_m: float = 1.5,
+) -> dict[str, object]:
+    """Describe long-sequence GID fragmentation for every ground-truth ID.
+
+    Matching deliberately follows CLEAR's continuity-first assignment.  The
+    resulting diagnostics therefore explain the same switch events reported
+    by :func:`evaluate_mot`, while retaining the full per-person GID lifetime
+    distribution needed to diagnose cumulative-IDF1 collapse.
+    """
+    if long_gap_frames < 1:
+        raise ValueError("long_gap_frames must be >= 1")
+    if not np.isfinite(crossing_distance_m) or crossing_distance_m <= 0:
+        raise ValueError("crossing_distance_m must be finite and positive")
+    sequence = _prepare_sequence(
+        predictions, ground_truth, frame_offset, match_gate_m
+    )
+    people: defaultdict[int, dict[str, object]] = defaultdict(lambda: {
+        "visible_frames": 0,
+        "matched_frames": 0,
+        "matches": defaultdict(lambda: {
+            "matched_frames": 0,
+            "first_frame": None,
+            "last_frame": None,
+        }),
+        "switch_count": 0,
+        "longest_missing_gap": 0,
+    })
+    previous_gid: dict[int, int] = {}
+    previous_frame: dict[int, int] = {}
+    long_gap_attempts = long_gap_successes = crossing_switches = switches = 0
+
+    for frame in sequence["frames"]:
+        frame_index = int(frame["frame_index"])
+        gt_original = frame["gt_original"]
+        tracker_original = frame["tracker_original"]
+        for gt_id in gt_original:
+            people[int(gt_id)]["visible_frames"] += 1
+        if not len(gt_original) or not len(tracker_original):
+            continue
+
+        continuation = np.asarray([
+            previous_gid.get(int(gt_id), -1) for gt_id in gt_original
+        ], dtype=int)[:, None] == tracker_original[None, :]
+        score = 1000.0 * continuation + frame["similarity"]
+        score[frame["similarity"] <= 0.0] = 0.0
+        rows, columns = linear_sum_assignment(-score)
+        accepted = score[rows, columns] > 0.0
+        rows, columns = rows[accepted], columns[accepted]
+
+        frame_gt = ground_truth.get(frame_index + frame_offset, {})
+        for row, column in zip(rows, columns):
+            gt_id = int(gt_original[row])
+            gid = int(tracker_original[column])
+            record = people[gt_id]
+            record["matched_frames"] += 1
+            gid_record = record["matches"][gid]
+            gid_record["matched_frames"] += 1
+            if gid_record["first_frame"] is None:
+                gid_record["first_frame"] = frame_index
+            gid_record["last_frame"] = frame_index
+
+            old_gid = previous_gid.get(gt_id)
+            old_frame = previous_frame.get(gt_id)
+            if old_frame is not None:
+                missing_gap = max(0, frame_index - old_frame - 1)
+                record["longest_missing_gap"] = max(
+                    int(record["longest_missing_gap"]), missing_gap
+                )
+                if frame_index - old_frame > long_gap_frames:
+                    long_gap_attempts += 1
+                    if old_gid == gid:
+                        long_gap_successes += 1
+            if old_gid is not None and old_gid != gid:
+                switches += 1
+                record["switch_count"] += 1
+                point = frame_gt.get(gt_id)
+                if point is not None:
+                    neighbor_distances = [
+                        float(np.linalg.norm(point - other))
+                        for other_id, other in frame_gt.items()
+                        if int(other_id) != gt_id
+                    ]
+                    if (
+                        neighbor_distances
+                        and min(neighbor_distances) <= crossing_distance_m
+                    ):
+                        crossing_switches += 1
+            previous_gid[gt_id] = gid
+            previous_frame[gt_id] = frame_index
+
+    per_gt: list[dict[str, object]] = []
+    gid_counts: list[int] = []
+    coverages: list[float] = []
+    wrong_id_duration = 0
+    for gt_id, record in sorted(people.items()):
+        matched = int(record["matched_frames"])
+        visible = int(record["visible_frames"])
+        predicted_gids = [
+            {
+                "gid": int(gid),
+                "first_frame": int(details["first_frame"]),
+                "last_frame": int(details["last_frame"]),
+                "matched_frames": int(details["matched_frames"]),
+            }
+            for gid, details in sorted(
+                record["matches"].items(),
+                key=lambda item: (-item[1]["matched_frames"], item[0]),
+            )
+        ]
+        dominant = max(
+            (item["matched_frames"] for item in predicted_gids), default=0
+        )
+        coverage = dominant / max(visible, 1)
+        gid_count = len(predicted_gids)
+        gid_counts.append(gid_count)
+        coverages.append(coverage)
+        wrong_id_duration += max(0, matched - dominant)
+        per_gt.append({
+            "gt_id": int(gt_id),
+            "predicted_gids": predicted_gids,
+            "gid_count": gid_count,
+            "visible_frames": visible,
+            "matched_frames": matched,
+            "dominant_gid_coverage": float(coverage),
+            "switch_count": int(record["switch_count"]),
+            "longest_missing_gap": int(record["longest_missing_gap"]),
+        })
+
+    lifetimes: list[dict[str, int]] = []
+    for gid in sorted({gid for _, values in predictions for gid in values}):
+        frames = [frame for frame, values in predictions if gid in values]
+        lifetimes.append({
+            "gid": int(gid),
+            "first_frame": int(frames[0]),
+            "last_frame": int(frames[-1]),
+            "observed_frames": len(frames),
+            "span_frames": int(frames[-1] - frames[0] + 1),
+        })
+
+    return {
+        "per_gt": per_gt,
+        "predicted_gids_per_gt": _distribution_summary(gid_counts),
+        "dominant_gid_coverage": _distribution_summary(coverages),
+        "gid_churn_per_1000_frames": float(
+            1000.0 * sum(max(0, count - 1) for count in gid_counts)
+            / max(len(predictions), 1)
+        ),
+        "wrong_id_duration_frames": int(wrong_id_duration),
+        "long_gap_reconnect_attempts": int(long_gap_attempts),
+        "long_gap_reconnect_successes": int(long_gap_successes),
+        "long_gap_reconnect_success_rate": float(
+            long_gap_successes / max(long_gap_attempts, 1)
+        ),
+        "crossing_switches": int(crossing_switches),
+        "crossing_switch_rate": float(crossing_switches / max(switches, 1)),
+        "public_gid_lifetimes": lifetimes,
+    }
+
+
+def _metric_slice(predictions, ground_truth, frame_offset, match_gate_m):
+    metrics = evaluate_mot(
+        predictions,
+        ground_truth,
+        frame_offset=frame_offset,
+        match_gate_m=match_gate_m,
+    )
+    return {
+        "start_frame": int(predictions[0][0]),
+        "end_frame": int(predictions[-1][0]),
+        "ticks": len(predictions),
+        **{name: value for name, value in metrics.items() if name != "switch_events"},
+    }
+
+
+def _distribution_summary(values) -> dict[str, float | int]:
+    samples = np.asarray(list(values), dtype=float)
+    if not len(samples):
+        return {"count": 0, "mean": 0.0, "median": 0.0, "p95": 0.0, "max": 0.0}
+    return {
+        "count": int(len(samples)),
+        "mean": float(np.mean(samples)),
+        "median": float(np.median(samples)),
+        "p95": float(np.percentile(samples, 95)),
+        "max": float(np.max(samples)),
+    }
 
 
 def _prepare_sequence(predictions, ground_truth, frame_offset, match_gate_m):

@@ -2,7 +2,11 @@ import unittest
 
 import numpy as np
 
-from multicam_tracker.mot_metrics import evaluate_mot
+from multicam_tracker.mot_metrics import (
+    evaluate_mot,
+    evaluate_mot_slices,
+    identity_trajectory_diagnostics,
+)
 
 
 class MotMetricTests(unittest.TestCase):
@@ -95,6 +99,55 @@ class MotMetricTests(unittest.TestCase):
     def test_match_gate_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "positive"):
             evaluate_mot([], {}, match_gate_m=0.0)
+
+    def test_slices_keep_cumulative_and_independent_metrics_separate(self) -> None:
+        predictions = [
+            (frame, {(10 if frame < 2 else 11): self._point(frame)})
+            for frame in range(4)
+        ]
+        ground_truth = {
+            frame: {1: self._point(frame)} for frame in range(4)
+        }
+
+        report = evaluate_mot_slices(
+            predictions,
+            ground_truth,
+            cumulative_frames=[2, 4],
+            window_frames=2,
+        )
+
+        self.assertEqual([item["ticks"] for item in report["cumulative_metrics"]], [2, 4])
+        self.assertEqual(len(report["metric_windows"]), 2)
+        self.assertAlmostEqual(report["metric_windows"][0]["IDF1"], 1.0)
+        self.assertAlmostEqual(report["metric_windows"][1]["IDF1"], 1.0)
+        self.assertAlmostEqual(report["cumulative_metrics"][-1]["IDF1"], 0.5)
+
+    def test_identity_diagnostics_exposes_gid_fragmentation_and_long_gap(self) -> None:
+        predictions = [
+            (0, {10: self._point(0.0), 20: self._point(0.4)}),
+            (1, {11: self._point(1.0), 20: self._point(1.4)}),
+            (4, {12: self._point(4.0), 20: self._point(4.4)}),
+        ]
+        ground_truth = {
+            frame: {1: self._point(float(frame)), 2: self._point(float(frame), 0.4)}
+            for frame in (0, 1, 4)
+        }
+
+        report = identity_trajectory_diagnostics(
+            predictions,
+            ground_truth,
+            long_gap_frames=2,
+            crossing_distance_m=0.5,
+        )
+        person = next(item for item in report["per_gt"] if item["gt_id"] == 1)
+
+        self.assertEqual(person["gid_count"], 3)
+        self.assertEqual(person["switch_count"], 2)
+        self.assertEqual(person["longest_missing_gap"], 2)
+        self.assertEqual(report["predicted_gids_per_gt"]["max"], 3.0)
+        self.assertEqual(report["long_gap_reconnect_attempts"], 2)
+        self.assertEqual(report["long_gap_reconnect_successes"], 1)
+        self.assertGreater(report["crossing_switch_rate"], 0.0)
 
 
 if __name__ == "__main__":
