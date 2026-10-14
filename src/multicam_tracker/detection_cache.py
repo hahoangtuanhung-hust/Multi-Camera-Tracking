@@ -106,6 +106,27 @@ def configure_from_cache(cfg: PipelineConfig, metadata: dict[str, Any]) -> None:
     }
 
 
+def filter_cached_detection_batch(
+    detections: Sequence[np.ndarray],
+    confidence_threshold: float,
+) -> list[np.ndarray]:
+    """Apply a stricter replay floor without rerunning the detector.
+
+    A cache captured at confidence ``c`` contains all boxes required to replay
+    any floor greater than or equal to ``c``. It cannot represent a lower
+    floor because those detections were never stored.
+    """
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("confidence_threshold must be in [0, 1]")
+    filtered: list[np.ndarray] = []
+    for camera_detections in detections:
+        array = np.asarray(camera_detections).reshape((-1, 5))
+        filtered.append(
+            array[array[:, 4] >= confidence_threshold].copy()
+        )
+    return filtered
+
+
 def validate_detection_cache(
     metadata: dict[str, Any],
     rows: Sequence[dict[str, Any]],
@@ -136,13 +157,20 @@ def validate_detection_cache(
         int(detector.get("person_class_id", -1)),
         int(cfg.person_class_id),
     )
-    if not np.isclose(
-        float(detector.get("conf_threshold", np.nan)),
-        float(cfg.conf_threshold),
-        rtol=0.0,
-        atol=1e-12,
+    cached_confidence = float(detector.get("conf_threshold", np.nan))
+    configured_confidence = float(cfg.conf_threshold)
+    if (
+        not np.isfinite(cached_confidence)
+        or cached_confidence < 0.0
+        or cached_confidence > 1.0
     ):
-        raise DetectionCacheError("Detection cache confidence threshold mismatch")
+        raise DetectionCacheError("Detection cache confidence threshold is invalid")
+    if not 0.0 <= configured_confidence <= 1.0:
+        raise DetectionCacheError("Replay confidence threshold is invalid")
+    if configured_confidence + 1e-12 < cached_confidence:
+        raise DetectionCacheError(
+            "Replay confidence threshold is below the detection cache floor"
+        )
 
     if validate_files:
         model_path = Path(cfg.model_name).expanduser().resolve()
@@ -165,10 +193,15 @@ def validate_detection_cache(
                 )
 
     for index, row in enumerate(rows):
-        _validate_row(row, cameras, index)
+        _validate_row(row, cameras, index, cached_confidence)
 
 
-def _validate_row(row: dict[str, Any], cameras: list[str], index: int) -> None:
+def _validate_row(
+    row: dict[str, Any],
+    cameras: list[str],
+    index: int,
+    cached_confidence: float,
+) -> None:
     packets = _mapping(row, "packets")
     if list(packets) != cameras:
         raise DetectionCacheError(
@@ -201,6 +234,7 @@ def _validate_row(row: dict[str, Any], cameras: list[str], index: int) -> None:
             or np.any(array[:, 3] < array[:, 1])
             or np.any(array[:, 4] < 0.0)
             or np.any(array[:, 4] > 1.0)
+            or np.any(array[:, 4] + 1e-12 < cached_confidence)
         ):
             raise DetectionCacheError(f"Cache row {index} contains invalid boxes")
 

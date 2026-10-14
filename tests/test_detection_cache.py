@@ -9,6 +9,7 @@ from multicam_tracker.detection_cache import (
     DetectionCacheError,
     build_detection_cache_metadata,
     configure_from_cache,
+    filter_cached_detection_batch,
     validate_detection_cache,
 )
 
@@ -65,10 +66,13 @@ class DetectionCacheTests(unittest.TestCase):
             cfg, rows, camera_dir = self._fixture(root)
             metadata = build_detection_cache_metadata(cfg, len(rows))
 
+            # A low-floor cache can reproduce stricter floors by filtering.
             cfg.conf_threshold += 0.01
-            with self.assertRaisesRegex(DetectionCacheError, "confidence"):
+            validate_detection_cache(metadata, rows, cfg)
+            cfg.conf_threshold -= 0.02
+            with self.assertRaisesRegex(DetectionCacheError, "below.*floor"):
                 validate_detection_cache(metadata, rows, cfg)
-            cfg.conf_threshold -= 0.01
+            cfg.conf_threshold += 0.01
 
             (camera_dir / "video.mp4").write_bytes(b"different-video-data")
             self.assertEqual(
@@ -86,6 +90,19 @@ class DetectionCacheTests(unittest.TestCase):
 
             with self.assertRaisesRegex(DetectionCacheError, "invalid boxes"):
                 validate_detection_cache(metadata, rows, cfg)
+
+    def test_cached_detection_batch_applies_stricter_floor(self) -> None:
+        batch = [np.array([
+            [0.0, 0.0, 10.0, 20.0, 0.15],
+            [1.0, 0.0, 11.0, 20.0, 0.20],
+            [2.0, 0.0, 12.0, 20.0, 0.80],
+        ], dtype=np.float32)]
+
+        filtered = filter_cached_detection_batch(batch, 0.20)
+
+        self.assertEqual(filtered[0].shape, (2, 5))
+        np.testing.assert_allclose(filtered[0][:, 4], [0.20, 0.80])
+        self.assertFalse(np.shares_memory(filtered[0], batch[0]))
 
 
 if __name__ == "__main__":

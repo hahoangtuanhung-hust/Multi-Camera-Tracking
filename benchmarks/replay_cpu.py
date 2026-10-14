@@ -21,6 +21,7 @@ from multicam_tracker.demo import run_pipeline
 from multicam_tracker.detection_cache import (
     SUPPORTED_CACHE_SCHEMAS,
     configure_from_cache,
+    filter_cached_detection_batch,
     validate_detection_cache,
 )
 from multicam_tracker.evaluate import (
@@ -156,7 +157,7 @@ def main():
         def detect_batch(self, frames):
             result = rows[self.index]["detections"]
             self.index += 1
-            return [np.asarray(detection).copy() for detection in result]
+            return filter_cached_detection_batch(result, cfg.conf_threshold)
 
     def batches():
         image = np.zeros((1, 1, 3), np.uint8)
