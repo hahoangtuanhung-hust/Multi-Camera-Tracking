@@ -18,6 +18,7 @@ from scipy.optimize import linear_sum_assignment
 from .bytetrack import ConstantVelocityKalman
 from .config import PipelineConfig
 from .diagnostics import IdentityEventWriter
+from .spatiotemporal import get_ground_plane_location
 from .tracklets import CameraClockOffsetEstimator, MatchResult, TrackletKey, TrackletMatcher, TrackletStore
 
 
@@ -2797,6 +2798,9 @@ class GlobalTrackManager:
 
 
 def foot_point_xyxy(bbox_xyxy: np.ndarray) -> np.ndarray:
-    """Bottom-center pixel of an xyxy box."""
-    x1, _y1, x2, y2 = bbox_xyxy[:4]
-    return np.array([(x1 + x2) / 2, y2])
+    """Bottom-center pixel fallback for pipelines without pose keypoints."""
+    return get_ground_plane_location(
+        bbox_xyxy,
+        pose_keypoints=None,
+        bbox_format="xyxy",
+    )

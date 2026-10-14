@@ -6,6 +6,7 @@ data/
 *.mp4
 calibration_check/
 *.json
+*.pdf
 
 # Python
 __pycache__/

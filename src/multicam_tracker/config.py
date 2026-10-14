@@ -132,7 +132,7 @@ class PipelineConfig:
     fusion_max_age_s: float = 3.0   # normal short-gap association horizon
     # A hidden identity may remain available longer, but can only be revived
     # after the short horizon by strict motion + image-boundary evidence.
-    fusion_identity_retention_s: float = 3.0
+    fusion_identity_retention_s: float = 5.0
     fusion_output_grace_s: float = 0.25  # retain IDs longer than we publish stale positions
     # A new global identity is already hidden until ``fusion_min_hits``.  This
     # optional additional event-time hold is useful for ablation without
@@ -260,7 +260,7 @@ class PipelineConfig:
 
     # --- asynchronous cross-camera tracklets ---
     timestamp_fusion_enabled: bool = True
-    tracklet_history_s: float = 5.0
+    tracklet_history_s: float = 7.0
     tracklet_late_drop_s: float = 5.0
     tracklet_min_duration_s: float = 1.0
     tracklet_min_overlap_s: float = 0.8
@@ -540,7 +540,7 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "fusion_max_acceleration_mps2": 4.0,
         "fusion_motion_uncertainty_sigma": 3.0,
         "fusion_motion_measurement_tolerance_m": 0.25,
-        "fusion_trajectory_window_s": 2.0,
+        "fusion_trajectory_window_s": 3.0,
         "fusion_trajectory_position_weight": 1.0,
         "fusion_trajectory_velocity_weight": 0.5,
         "fusion_trajectory_direction_weight": 1.0,
