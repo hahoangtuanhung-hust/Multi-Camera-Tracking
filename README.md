@@ -583,6 +583,7 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `local_tracker` | `ocsort` | per-camera backend; set `bytetrack` only for rollback/A/B |
 | `conf_threshold` | 0.25 | detection floor; low values feed OC-SORT's optional BYTE extension |
 | `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
+| `track_tentative_max_misses` | 0 | misses tolerated before an unconfirmed local track is deleted; candidate profiles use 1 |
 | `track_max_age` | 60 ticks | legacy no-timestamp fallback (~2 s at 30 fps) |
 | `track_max_age_s` | 2.0 s | timestamp-mode local-track timeout |
 | `track_kf_process_noise` / `track_kf_time_process_noise` | 2.0 / 2.0 | local Kalman acceleration variance for legacy ticks / timestamped frames |
@@ -595,6 +596,8 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `ocsort_observation_recovery_enabled` | true | enable last-observation recovery (OCR) after prediction mismatch |
 | `ocsort_oru_enabled` | false | optional virtual Kalman re-update; release A/B keeps it off because it reduced IDF1 |
 | `ocsort_oru_min_misses` | 2 ticks | avoid rebuilding motion from a one-frame merged detection at a crossing |
+| `hybridsort_ambiguity_suppression_enabled` | false | optional merged-box crossing guard; experimental because it trades recall for fewer switches |
+| `hybridsort_ambiguity_min_area_ratio` | 1.10 | only classify an ambiguous box as merged when it is larger than both candidate owners |
 | `fusion_gate_m` | 2.0 m | max world distance for cross-camera association |
 | `fusion_merge_m` | 1.0 m | cluster radius when grouping new observations |
 | `fusion_max_age` | 90 ticks | legacy no-timestamp fallback (~3 s at 30 fps) |
@@ -627,6 +630,29 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 
 All timeout values with an `_s` suffix are seconds, not processed-frame
 counts. The older tick knobs are used only by callers that omit timestamps.
+
+### Detector/tracker A/B profiles
+
+`hybridsort-balanced` is the current production candidate: it keeps the
+validated detector floor/resolution (`0.25`, `640`) and lets a tentative local
+track survive one missed frame. On the bundled 300-tick cache it improved IDF1,
+precision and recall, but it is not promoted to the default until a same-run
+2k/4k evaluation passes the long-sequence gates.
+
+`hybridsort-crossing-guard`, `hybridsort-mid-floor`,
+`hybridsort-low-floor`, and `hybridsort-detect-recall` remain explicit
+experiments. The crossing guard reduced switches/fragmentation at the cost of
+ID recall; detector floors below `0.25` and `imgsz=768` did not beat the
+baseline on the current sequence.
+
+```bash
+uv run evaluate --profile hybridsort-balanced --max-frames 2000 \
+  --metric-window-frames 500 --metrics-out mot-balanced-2000.json
+```
+
+A detection cache recorded at a low confidence floor can be replayed at any
+stricter floor; replay rejects attempts below the recorded floor because those
+boxes are absent.
 
 ### Fault simulation and tests
 
