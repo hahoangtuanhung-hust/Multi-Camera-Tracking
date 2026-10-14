@@ -16,13 +16,23 @@ import numpy as np
 from multicam_tracker import bytetrack, fusion, tracklets
 from multicam_tracker.config import PipelineConfig, TRACKING_PROFILE_OVERRIDES, apply_tracking_profile
 from multicam_tracker.demo import run_pipeline
+from multicam_tracker.detection_cache import (
+    SUPPORTED_CACHE_SCHEMAS,
+    configure_from_cache,
+    validate_detection_cache,
+)
 from multicam_tracker.evaluate import (
     _classify_switch_events,
     _match_errors,
     ground_truth_by_frame,
 )
-from multicam_tracker.mot_metrics import evaluate_mot
+from multicam_tracker.mot_metrics import (
+    evaluate_mot,
+    evaluate_mot_slices,
+    identity_trajectory_diagnostics,
+)
 from multicam_tracker.local_tracker import LOCAL_TRACKERS
+from multicam_tracker.reporting import build_run_metadata, configure_determinism
 from multicam_tracker.timebase import FrameBatch, FramePacket
 from evaluate_thresholds import _score
 
@@ -33,6 +43,19 @@ def main():
     parser.add_argument("--detections", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--only-current", action="store_true")
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--model", default="yolo26n.pt")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--allow-legacy-cache",
+        action="store_true",
+        help="Allow an unverifiable pre-v2 trusted local pickle",
+    )
+    parser.add_argument(
+        "--verify-determinism",
+        action="store_true",
+        help="Replay the current configuration twice and fail on any metric drift",
+    )
     parser.add_argument(
         "--profile",
         choices=sorted(TRACKING_PROFILE_OVERRIDES),
@@ -64,6 +87,9 @@ def main():
         default=None,
     )
     args = parser.parse_args()
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
+    configure_determinism(args.seed)
     package = args.baseline_source / "multicam_tracker"
     spec = importlib.util.spec_from_file_location("baseline_tracker", package / "__init__.py",
                                                 submodule_search_locations=[str(package)])
@@ -76,16 +102,25 @@ def main():
     base_fusion = importlib.import_module("baseline_tracker.fusion")
     payload = pickle.loads(args.detections.read_bytes())
     metadata = None
-    if isinstance(payload, dict) and payload.get("metadata", {}).get("schema") == "multicam-detection-cache-v2":
+    if (
+        isinstance(payload, dict)
+        and payload.get("metadata", {}).get("schema") in SUPPORTED_CACHE_SCHEMAS
+    ):
         metadata = payload["metadata"]
         rows = payload["rows"]
-        if metadata.get("ticks") != len(rows):
-            raise ValueError("Detection cache tick count does not match its metadata")
         print(json.dumps(metadata, indent=2), flush=True)
     else:
-        # Backward compatibility for trusted, local v1 cache files.
+        if not args.allow_legacy_cache:
+            raise ValueError(
+                "Unverifiable legacy detection cache; pass --allow-legacy-cache "
+                "only for a trusted local pickle"
+            )
         rows = payload
-    cfg = PipelineConfig(async_ingest=False)
+    cfg = PipelineConfig(
+        data_root=args.data_root,
+        model_name=args.model,
+        async_ingest=False,
+    )
     apply_tracking_profile(cfg, args.profile)
     cfg.local_tracker = args.local_tracker
     if args.ocsort_inertia is not None:
@@ -101,16 +136,8 @@ def main():
     if args.ocsort_oru is not None:
         cfg.ocsort_oru_enabled = args.ocsort_oru
     if metadata is not None:
-        cache_input = metadata.get("input", {})
-        if int(cache_input.get("stride", cfg.stride)) != cfg.stride:
-            raise ValueError("Detection cache stride does not match replay stride")
-        cfg.cameras = list(cache_input.get("cameras", cfg.cameras))
-        cfg.camera_start_frame_offsets = {
-            str(camera): int(offset)
-            for camera, offset in cache_input.get(
-                "camera_start_frame_offsets", cfg.camera_start_frame_offsets
-            ).items()
-        }
+        configure_from_cache(cfg, metadata)
+        validate_detection_cache(metadata, rows, cfg)
     gt = ground_truth_by_frame(cfg.scene_dir, cfg.cameras, cfg.camera_start_frame_offsets)
     scores = {}
 
@@ -120,7 +147,7 @@ def main():
         def detect_batch(self, frames):
             result = rows[self.index]["detections"]
             self.index += 1
-            return result
+            return [np.asarray(detection).copy() for detection in result]
 
     def batches():
         image = np.zeros((1, 1, 3), np.uint8)
@@ -129,6 +156,7 @@ def main():
             yield FrameBatch(packets, max(p.arrival_ts_s for p in packets.values()))
 
     def score(name, pipeline=run_pipeline):
+        configure_determinism(args.seed)
         predictions = []
         source_maps = {}
         last_pipeline_metrics = {}
@@ -142,7 +170,7 @@ def main():
                     tick["frame_index"],
                     {track.gid: track.world_xy.copy() for track in tick["global_tracks"]},
                 ))
-                if args.identity_events and name == "current":
+                if args.identity_events and name.startswith("current"):
                     sources = defaultdict(list)
                     for observation in tick["observations"]:
                         key = observation.camera, int(observation.local_id)
@@ -154,6 +182,28 @@ def main():
         finally:
             cfg.identity_diagnostics_path = previous_diagnostics_path
         scores[name] = _score(predictions, gt)
+        best_offset = min(
+            (0, 1, 2),
+            key=lambda offset: np.sqrt(np.mean(np.square(
+                _match_errors(predictions[:100], gt, offset)
+            ))) if _match_errors(predictions[:100], gt, offset) else float("inf"),
+        )
+        full = evaluate_mot(predictions, gt, frame_offset=best_offset)
+        scores[name].update({
+            "frame_offset": best_offset,
+            **evaluate_mot_slices(
+                predictions,
+                gt,
+                frame_offset=best_offset,
+                cumulative_frames=(500, 1000, 1500, 2000, 4000),
+                window_frames=500,
+            ),
+            "identity_diagnostics": identity_trajectory_diagnostics(
+                predictions,
+                gt,
+                frame_offset=best_offset,
+            ),
+        })
         for metric in (
             "local_tracks_created",
             "local_track_reactivations",
@@ -167,29 +217,33 @@ def main():
             "local_byte_extension_matches",
         ):
             scores[name][metric] = last_pipeline_metrics.get(metric, 0)
-        if args.identity_events and name == "current":
-            best_offset = min(
-                (0, 1, 2),
-                key=lambda offset: np.sqrt(np.mean(np.square(
-                    _match_errors(predictions[:100], gt, offset)
-                ))) if _match_errors(predictions[:100], gt, offset) else float("inf"),
-            )
-            full = evaluate_mot(predictions, gt, frame_offset=best_offset)
+        if args.identity_events and name.startswith("current"):
             diagnostics = _classify_switch_events(
                 full["switch_events"], source_maps, predictions, gt, best_offset
             )
-            with args.identity_events.open("a", encoding="utf-8") as destination:
-                for record in diagnostics:
-                    destination.write(json.dumps(record) + "\n")
+            if name == "current":
+                with args.identity_events.open("a", encoding="utf-8") as destination:
+                    for record in diagnostics:
+                        destination.write(json.dumps(record) + "\n")
             classes = defaultdict(int)
             for record in diagnostics:
                 classes[record["classification"]] += 1
             scores[name]["switch_classes"] = dict(classes)
         print(name, scores[name], flush=True)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(scores, indent=2), encoding="utf-8")
+        return scores[name]
 
     if args.only_current:
-        score("current")
+        current = score("current")
+        if args.verify_determinism:
+            repeated = score("current_repeat")
+            if current != repeated:
+                raise RuntimeError("Deterministic replay metric mismatch")
+            scores["deterministic_replay_verified"] = True
+        scores["run_metadata"] = build_run_metadata(cfg, seed=args.seed)
+        scores["detection_cache_metadata"] = metadata
+        args.out.write_text(json.dumps(scores, indent=2), encoding="utf-8")
         return
 
     score("baseline", base_demo.run_pipeline)
@@ -224,6 +278,15 @@ def main():
     base_tracklets.TrackletHistory._bounds = None
     with patch.object(fusion, "TrackletStore", OldVelocityStore):
         score("old_velocity")
+    if args.verify_determinism:
+        current = scores["current"]
+        repeated = score("current_repeat")
+        if current != repeated:
+            raise RuntimeError("Deterministic replay metric mismatch")
+        scores["deterministic_replay_verified"] = True
+    scores["run_metadata"] = build_run_metadata(cfg, seed=args.seed)
+    scores["detection_cache_metadata"] = metadata
+    args.out.write_text(json.dumps(scores, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

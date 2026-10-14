@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import argparse
 import cProfile
-from datetime import datetime, timezone
-import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -27,53 +25,11 @@ from multicam_tracker.config import (
     apply_tracking_profile,
 )
 from multicam_tracker.demo import run_pipeline
+from multicam_tracker.detection_cache import build_detection_cache_metadata
 from multicam_tracker.detector import PersonDetector
 from multicam_tracker.evaluate import ground_truth_by_frame
 from multicam_tracker.local_tracker import LOCAL_TRACKERS
 from evaluate_thresholds import _score
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _cache_metadata(cfg: PipelineConfig, ticks: int) -> dict[str, object]:
-    """Fingerprint every input that can change cached detector output."""
-    model_path = Path(cfg.model_name).resolve()
-    scene = cfg.scene_dir.resolve()
-    videos = {
-        camera: {
-            "path": str((scene / camera / "video.mp4").resolve()),
-            "bytes": (scene / camera / "video.mp4").stat().st_size,
-            "mtime_ns": (scene / camera / "video.mp4").stat().st_mtime_ns,
-        }
-        for camera in cfg.cameras
-    }
-    return {
-        "schema": "multicam-detection-cache-v2",
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "ticks": ticks,
-        "detector": {
-            "model": str(model_path),
-            "model_sha256": _sha256(model_path),
-            "imgsz": cfg.imgsz,
-            "conf_threshold": cfg.conf_threshold,
-            "person_class_id": cfg.person_class_id,
-            "device": cfg.device,
-        },
-        "input": {
-            "scene": str(scene),
-            "cameras": list(cfg.cameras),
-            "stride": cfg.stride,
-            "camera_start_frame_offsets": dict(cfg.camera_start_frame_offsets),
-            "videos": videos,
-        },
-    }
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -159,7 +115,7 @@ def main() -> None:
     if args.capture_detections:
         args.capture_detections.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "metadata": _cache_metadata(cfg, len(replay)),
+            "metadata": build_detection_cache_metadata(cfg, len(replay)),
             "rows": replay,
         }
         args.capture_detections.write_bytes(
