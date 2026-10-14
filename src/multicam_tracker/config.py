@@ -96,6 +96,10 @@ class PipelineConfig:
     # Kalman covariance because metres/second are not defined before the
     # camera homography projects the foot point onto the world plane.
     track_detection_temporal_confirmation_frames: int = 2
+    # Tentative tracks normally disappear on their first miss. Candidate
+    # profiles may retain them briefly so one dropped detection does not force
+    # a new local ID at an occlusion/crossing.
+    track_tentative_max_misses: int = 0
     track_detection_low_conf_recovery_enabled: bool = True
     track_motion_gate_enabled: bool = True
     track_max_speed_mps: float = 3.20
@@ -155,6 +159,10 @@ class PipelineConfig:
     # During startup, people may already be inside the scene rather than at an
     # image boundary, so seed the initial population without entry evidence.
     fusion_new_gid_bootstrap_s: float = 2.5
+    # Optional escape hatch for a stable trajectory first detected inside the
+    # scene (for example after a long detector miss). Entry evidence remains
+    # preferred; zero keeps the strict closed-world policy.
+    fusion_interior_birth_fallback_s: float = 0.0
     # Public identities that disappear inside the scene stay dormant for
     # reconnect. Boundary evidence releases them normally; the forced timeout
     # is a bounded-memory safety valve for imperfect boundary calibration.
@@ -176,6 +184,9 @@ class PipelineConfig:
     fusion_motion_measurement_tolerance_m: float = 0.25
     # Multi-point trajectory cost used for dormant/interior reassociation.
     fusion_trajectory_window_s: float = 2.0
+    fusion_trajectory_smoothing_enabled: bool = False
+    fusion_trajectory_recency_half_life_s: float = 0.75
+    fusion_trajectory_outlier_gate_m: float = 0.75
     fusion_trajectory_position_weight: float = 1.0
     fusion_trajectory_velocity_weight: float = 0.5
     fusion_trajectory_direction_weight: float = 1.0
@@ -569,6 +580,37 @@ TRACKING_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
         "fusion_published_merge_confirmations": 3,
         "clock_max_pair_delta_spread_s": 0.40,
     },
+}
+
+# Explicit sequential A/B candidates. The validated ``hybridsort`` profile
+# remains untouched until a same-run 2k/4k replay clears the release gates.
+TRACKING_PROFILE_OVERRIDES["hybridsort-local-v2"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "track_tentative_max_misses": 1,
+    "ocsort_observation_recovery_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-trajectory"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "fusion_trajectory_smoothing_enabled": True,
+    "fusion_trajectory_window_s": 3.5,
+    "fusion_trajectory_recency_half_life_s": 0.75,
+    "tracklet_history_s": 7.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-stable"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-local-v2"],
+    "fusion_trajectory_smoothing_enabled": True,
+    "fusion_trajectory_window_s": 3.5,
+    "fusion_trajectory_recency_half_life_s": 0.75,
+    "tracklet_history_s": 7.0,
+    "fusion_identity_retention_s": 5.0,
+    "fusion_output_grace_s": 0.75,
+    "fusion_dormant_retention_s": 8.0,
+    "fusion_interior_birth_fallback_s": 1.5,
+    "fusion_local_reconnect_long_window_s": 5.0,
+    "fusion_local_reconnect_confirmations": 5,
+    "fusion_local_reconnect_confirmation_window_s": 0.50,
+    "fusion_instant_confirmations": 5,
+    "fusion_published_merge_confirmations": 7,
 }
 
 # This branch uses Hybrid-SORT as the default local tracker.

@@ -28,6 +28,7 @@ from .config import (
 from .detector import PersonDetector
 from .fusion import CameraObservation, GlobalTrackManager, foot_point_xyxy
 from .local_tracker import LOCAL_TRACKERS, create_local_tracker
+from .spatiotemporal import SlidingWindowTrajectorySmoother
 from .timebase import ClockModel, FrameBatch
 from .video import AsyncVideoReader, SyncedVideoReader
 
@@ -103,6 +104,19 @@ def run_pipeline(
         batch_iter = reader.iter_batches()
     trackers = {cam: create_local_tracker(cfg) for cam in cfg.cameras}
     fusion = GlobalTrackManager(cfg)
+    trajectory_smoother = (
+        SlidingWindowTrajectorySmoother(
+            window_s=cfg.fusion_trajectory_window_s,
+            recency_half_life_s=cfg.fusion_trajectory_recency_half_life_s,
+            outlier_gate_m=cfg.fusion_trajectory_outlier_gate_m,
+            max_speed_mps=cfg.fusion_max_speed_mps,
+            max_acceleration_mps2=cfg.fusion_max_acceleration_mps2,
+            jump_window_s=cfg.fusion_jump_window_s,
+            max_jump_m=cfg.fusion_max_jump_m,
+        )
+        if cfg.fusion_trajectory_smoothing_enabled
+        else None
+    )
     world_motion: dict[tuple[str, int], tuple[float, np.ndarray, np.ndarray]] = {}
     last_capture_ts: dict[str, float] = {}
     out_of_order_packets_dropped: dict[str, int] = {camera: 0 for camera in cfg.cameras}
@@ -179,23 +193,54 @@ def run_pipeline(
             for camera, tracks in camera_tracks.items():
                 packet = batch.packets[camera]
                 for track in tracks:
-                    world_xy = calibrations[camera].image_to_world(
+                    raw_world_xy = calibrations[camera].image_to_world(
                         foot_point_xyxy(track.xyxy)
                     )[0]
-                    if not np.all(np.isfinite(world_xy)):
+                    if not np.all(np.isfinite(raw_world_xy)):
                         continue
                     key = camera, track.track_id
-                    velocity = None
-                    previous = world_motion.get(key)
-                    if previous is not None:
-                        previous_ts, previous_xy, previous_velocity = previous
-                        dt = packet.capture_ts_s - previous_ts
-                        if dt > 1e-6:
-                            raw_velocity = (world_xy - previous_xy) / dt
-                            velocity = 0.5 * raw_velocity + 0.5 * previous_velocity
-                    if velocity is None:
-                        velocity = world_xy * 0.0
-                    world_motion[key] = (packet.capture_ts_s, world_xy.copy(), velocity.copy())
+                    if trajectory_smoother is not None:
+                        smoothed = trajectory_smoother.update(
+                            key,
+                            packet.capture_ts_s,
+                            raw_world_xy,
+                            confidence=float(track.conf),
+                        )
+                        if not smoothed.accepted:
+                            fusion.record_diagnostic_event(
+                                "trajectory_observation_rejected",
+                                event_ts_s=packet.capture_ts_s,
+                                arrival_ts_s=packet.arrival_ts_s,
+                                camera_id=camera,
+                                local_track_id=int(track.track_id),
+                                raw_xy=smoothed.raw_xy,
+                                predicted_xy=smoothed.predicted_xy,
+                                residual_m=smoothed.residual_m,
+                                allowed_residual_m=smoothed.allowed_residual_m,
+                            )
+                            continue
+                        world_xy = smoothed.smoothed_xy
+                        velocity = smoothed.velocity_xy
+                    else:
+                        world_xy = raw_world_xy
+                        velocity = None
+                        previous = world_motion.get(key)
+                        if previous is not None:
+                            previous_ts, previous_xy, previous_velocity = previous
+                            dt = packet.capture_ts_s - previous_ts
+                            if dt > 1e-6:
+                                raw_velocity = (world_xy - previous_xy) / dt
+                                velocity = (
+                                    0.5 * raw_velocity
+                                    + 0.5 * previous_velocity
+                                )
+                        if velocity is None:
+                            velocity = world_xy * 0.0
+                        world_motion[key] = (
+                            packet.capture_ts_s,
+                            world_xy.copy(),
+                            velocity.copy(),
+                        )
                     observations.append(CameraObservation(
                         camera=camera,
                         local_id=track.track_id,
@@ -213,6 +258,8 @@ def run_pipeline(
                         ),
                     ))
             event_watermark = max(event_watermark, *(batch.packets[camera].capture_ts_s for camera in cameras))
+            if trajectory_smoother is not None:
+                trajectory_smoother.prune(event_watermark)
             cutoff = event_watermark - cfg.tracklet_history_s
             for key, (timestamp, _, _) in list(world_motion.items()):
                 if timestamp < cutoff:
@@ -291,6 +338,30 @@ def run_pipeline(
                     "ingest_dropped_frames": dict(batch.dropped_frames),
                     "out_of_order_packets_dropped": dict(out_of_order_packets_dropped),
                     "world_motion_entries": len(world_motion),
+                    "trajectory_smoothing_enabled": trajectory_smoother is not None,
+                    "trajectory_smoothing_accepted": (
+                        trajectory_smoother.metrics["accepted"]
+                        if trajectory_smoother is not None else 0
+                    ),
+                    "trajectory_smoothing_rejected": (
+                        trajectory_smoother.metrics["outliers_rejected"]
+                        if trajectory_smoother is not None else 0
+                    ),
+                    "trajectory_smoothing_out_of_order_rejected": (
+                        trajectory_smoother.metrics["out_of_order_rejected"]
+                        if trajectory_smoother is not None else 0
+                    ),
+                    "trajectory_smoothing_histories": (
+                        len(trajectory_smoother.histories)
+                        if trajectory_smoother is not None else 0
+                    ),
+                    "trajectory_smoothing_samples": (
+                        sum(
+                            len(history)
+                            for history in trajectory_smoother.histories.values()
+                        )
+                        if trajectory_smoother is not None else 0
+                    ),
                     "ingest_errors": dict(getattr(reader, "errors", {})),
                 },
             }

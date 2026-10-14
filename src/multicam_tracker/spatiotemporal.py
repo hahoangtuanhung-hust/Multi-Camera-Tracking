@@ -253,6 +253,8 @@ class SmoothingResult:
     raw_xy: np.ndarray
     smoothed_xy: np.ndarray
     velocity_xy: np.ndarray
+    acceleration_xy: np.ndarray
+    predicted_xy: np.ndarray
     accepted: bool
     sample_count: int
     residual_m: float
@@ -269,10 +271,10 @@ class _TrajectorySample:
 class SlidingWindowTrajectorySmoother:
     """Confidence- and recency-weighted trajectory smoothing with outlier veto.
 
-    A new point is compared with a constant-velocity prediction from the last
-    two accepted samples.  The residual gate expands with elapsed event time,
-    so a valid long-gap reappearance is not treated like a one-frame teleport.
-    Rejected samples never enter the weighted window.
+    Position and velocity come from weighted least-squares over all accepted
+    samples.  With at least four distinct timestamps, a quadratic term also
+    estimates acceleration.  A new point is checked against that trajectory;
+    rejected or out-of-order samples never enter the weighted window.
     """
 
     def __init__(
@@ -282,12 +284,18 @@ class SlidingWindowTrajectorySmoother:
         recency_half_life_s: float = 0.35,
         outlier_gate_m: float = 0.75,
         max_speed_mps: float = 3.2,
+        max_acceleration_mps2: float = 4.0,
+        jump_window_s: float = 1.0,
+        max_jump_m: float = 2.0,
     ) -> None:
         values = {
             "window_s": window_s,
             "recency_half_life_s": recency_half_life_s,
             "outlier_gate_m": outlier_gate_m,
             "max_speed_mps": max_speed_mps,
+            "max_acceleration_mps2": max_acceleration_mps2,
+            "jump_window_s": jump_window_s,
+            "max_jump_m": max_jump_m,
         }
         for name, value in values.items():
             if not np.isfinite(value) or value <= 0.0:
@@ -296,6 +304,9 @@ class SlidingWindowTrajectorySmoother:
         self.recency_half_life_s = float(recency_half_life_s)
         self.outlier_gate_m = float(outlier_gate_m)
         self.max_speed_mps = float(max_speed_mps)
+        self.max_acceleration_mps2 = float(max_acceleration_mps2)
+        self.jump_window_s = float(jump_window_s)
+        self.max_jump_m = float(max_jump_m)
         self.histories: dict[TrackletKey, deque[_TrajectorySample]] = {}
         self.metrics: defaultdict[str, int] = defaultdict(int)
 
@@ -318,23 +329,61 @@ class SlidingWindowTrajectorySmoother:
         canonical_key = str(key[0]), int(key[1])
         history = self.histories.setdefault(canonical_key, deque())
         if history and timestamp < history[-1].timestamp_s - 1e-9:
-            raise ValueError("trajectory timestamps must be non-decreasing per key")
-        self._prune(history, timestamp)
+            self.metrics["out_of_order_rejected"] += 1
+            position, velocity, acceleration = self._weighted_regression(
+                history, history[-1].timestamp_s
+            )
+            velocity, acceleration = self._bounded_motion(
+                velocity, acceleration
+            )
+            return SmoothingResult(
+                key=canonical_key,
+                timestamp_s=timestamp,
+                raw_xy=raw.copy(),
+                smoothed_xy=position,
+                velocity_xy=velocity,
+                acceleration_xy=acceleration,
+                predicted_xy=position.copy(),
+                accepted=False,
+                sample_count=len(history),
+                residual_m=float(np.linalg.norm(raw - position)),
+                allowed_residual_m=0.0,
+            )
+        self._prune_history(history, timestamp)
 
         predicted = raw.copy()
         elapsed = 0.0
         if history:
             elapsed = max(0.0, timestamp - history[-1].timestamp_s)
-            predicted = history[-1].xy.copy()
-            velocity = self._latest_velocity(history)
-            speed = float(np.linalg.norm(velocity))
-            if speed > self.max_speed_mps:
-                velocity = velocity * (self.max_speed_mps / speed)
-            predicted = predicted + velocity * elapsed
+            position, velocity, acceleration = self._weighted_regression(
+                history, history[-1].timestamp_s
+            )
+            velocity, acceleration = self._bounded_motion(
+                velocity, acceleration
+            )
+            predicted = (
+                position
+                + velocity * elapsed
+                + 0.5 * acceleration * elapsed * elapsed
+            )
 
         residual = float(np.linalg.norm(raw - predicted)) if history else 0.0
-        allowed = self.outlier_gate_m + self.max_speed_mps * elapsed
-        accepted = not history or residual <= allowed + 1e-9
+        allowed = (
+            self.outlier_gate_m
+            + self.max_speed_mps * elapsed
+            + 0.5 * self.max_acceleration_mps2 * elapsed * elapsed
+        )
+        jump = (
+            float(np.linalg.norm(raw - history[-1].xy)) if history else 0.0
+        )
+        exceeds_jump_cap = bool(
+            history
+            and elapsed <= self.jump_window_s + 1e-9
+            and jump > self.max_jump_m + 1e-9
+        )
+        accepted = not history or (
+            residual <= allowed + 1e-9 and not exceeds_jump_cap
+        )
         if accepted:
             sample = _TrajectorySample(timestamp, raw.copy(), float(confidence))
             if history and abs(timestamp - history[-1].timestamp_s) <= 1e-9:
@@ -344,15 +393,21 @@ class SlidingWindowTrajectorySmoother:
             self.metrics["accepted"] += 1
         else:
             self.metrics["outliers_rejected"] += 1
+            if exceeds_jump_cap:
+                self.metrics["jump_cap_rejected"] += 1
 
-        smoothed = self._weighted_location(history, timestamp)
-        velocity = self._latest_velocity(history)
+        smoothed, velocity, acceleration = self._weighted_regression(
+            history, timestamp
+        )
+        velocity, acceleration = self._bounded_motion(velocity, acceleration)
         return SmoothingResult(
             key=canonical_key,
             timestamp_s=timestamp,
             raw_xy=raw.copy(),
             smoothed_xy=smoothed,
             velocity_xy=velocity,
+            acceleration_xy=acceleration,
+            predicted_xy=predicted.copy(),
             accepted=accepted,
             sample_count=len(history),
             residual_m=residual,
@@ -366,33 +421,83 @@ class SlidingWindowTrajectorySmoother:
             return
         self.histories.pop((str(key[0]), int(key[1])), None)
 
-    def _weighted_location(
+    def prune(self, reference_ts_s: float) -> None:
+        """Prune inactive keys and samples against a global event watermark."""
+        reference = float(reference_ts_s)
+        if not np.isfinite(reference):
+            raise ValueError("reference_ts_s must be finite")
+        for key, history in list(self.histories.items()):
+            self._prune_history(history, reference)
+            if not history:
+                del self.histories[key]
+                self.metrics["histories_pruned"] += 1
+        self.metrics["retained_histories"] = len(self.histories)
+        self.metrics["retained_samples"] = sum(
+            len(history) for history in self.histories.values()
+        )
+
+    def _weighted_regression(
         self, history: deque[_TrajectorySample], reference_ts_s: float
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not history:
             raise RuntimeError("cannot smooth an empty trajectory")
-        ages = np.array(
-            [max(0.0, reference_ts_s - sample.timestamp_s) for sample in history]
+        timestamps = np.asarray(
+            [sample.timestamp_s for sample in history], dtype=float
         )
+        times = timestamps - float(reference_ts_s)
+        ages = np.maximum(0.0, float(reference_ts_s) - timestamps)
         recency = np.exp(-log(2.0) * ages / self.recency_half_life_s)
         confidence = np.array(
             [max(sample.confidence, 1e-3) for sample in history], dtype=float
         )
         weights = recency * confidence
         points = np.stack([sample.xy for sample in history])
-        return np.average(points, axis=0, weights=weights)
+        distinct = len(np.unique(np.round(timestamps, decimals=9)))
+        degree = 2 if distinct >= 4 else (1 if distinct >= 2 else 0)
+        if degree == 0:
+            return (
+                np.average(points, axis=0, weights=weights),
+                np.zeros(2, dtype=float),
+                np.zeros(2, dtype=float),
+            )
+        columns = [np.ones(len(times)), times]
+        if degree == 2:
+            columns.append(0.5 * times * times)
+        design = np.column_stack(columns)
+        root_weight = np.sqrt(weights)[:, None]
+        coefficients, _, rank, _ = np.linalg.lstsq(
+            design * root_weight,
+            points * root_weight,
+            rcond=None,
+        )
+        if rank < design.shape[1]:
+            # Degenerate timestamp layouts fall back to a stable weighted mean.
+            return (
+                np.average(points, axis=0, weights=weights),
+                np.zeros(2, dtype=float),
+                np.zeros(2, dtype=float),
+            )
+        position = coefficients[0]
+        velocity = coefficients[1]
+        acceleration = (
+            coefficients[2] if degree == 2 else np.zeros(2, dtype=float)
+        )
+        return position.copy(), velocity.copy(), acceleration.copy()
 
-    @staticmethod
-    def _latest_velocity(history: deque[_TrajectorySample]) -> np.ndarray:
-        if len(history) < 2:
-            return np.zeros(2, dtype=float)
-        previous, latest = history[-2], history[-1]
-        dt = latest.timestamp_s - previous.timestamp_s
-        if dt <= 1e-9:
-            return np.zeros(2, dtype=float)
-        return (latest.xy - previous.xy) / dt
+    def _bounded_motion(
+        self, velocity: np.ndarray, acceleration: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        velocity = np.asarray(velocity, dtype=float).copy()
+        acceleration = np.asarray(acceleration, dtype=float).copy()
+        speed = float(np.linalg.norm(velocity))
+        if speed > self.max_speed_mps:
+            velocity *= self.max_speed_mps / speed
+        acceleration_norm = float(np.linalg.norm(acceleration))
+        if acceleration_norm > self.max_acceleration_mps2:
+            acceleration *= self.max_acceleration_mps2 / acceleration_norm
+        return velocity, acceleration
 
-    def _prune(
+    def _prune_history(
         self, history: deque[_TrajectorySample], reference_ts_s: float
     ) -> None:
         cutoff = reference_ts_s - self.window_s

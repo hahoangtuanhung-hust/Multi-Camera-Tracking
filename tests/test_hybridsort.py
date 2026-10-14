@@ -168,6 +168,24 @@ class HybridSortTrackerTests(unittest.TestCase):
         self.assertEqual(len(visible), 1)
         self.assertTrue(visible[0].confirmed)
 
+    def test_tentative_track_survives_one_detection_miss(self):
+        cfg = PipelineConfig(
+            track_min_hits=3,
+            track_tentative_max_misses=1,
+            ocsort_use_byte=False,
+        )
+        tracker = HybridSortTracker(cfg)
+
+        tracker.update(_det(0.0), timestamp_s=0.0)
+        original_id = tracker.tracks[0].track_id
+        tracker.update(np.empty((0, 5)), timestamp_s=0.1)
+        self.assertEqual([track.track_id for track in tracker.tracks], [original_id])
+
+        tracker.update(_det(0.5), timestamp_s=0.2)
+        visible = tracker.update(_det(1.0), timestamp_s=0.3)
+        self.assertEqual([track.track_id for track in visible], [original_id])
+        self.assertEqual(tracker.metrics["tracks_removed_tentative"], 0)
+
     def test_id_switches_reduced_on_reentry(self):
         """Observed boxes provide a stronger signal than drifted Kalman when
         a person exits and re-enters from the same direction.  Hybrid-SORT

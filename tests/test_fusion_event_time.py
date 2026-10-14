@@ -935,6 +935,30 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertGreater(manager.affinity[("a", 2)], 0, "Entry zone birth must be granted public GID")
         self.assertEqual(len(visible), 1)
 
+    def test_stable_interior_birth_fallback_is_not_deferred_forever(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.20,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_new_gid_entry_required=True,
+            fusion_new_gid_bootstrap_s=0.10,
+            fusion_interior_birth_fallback_s=0.60,
+            fusion_trajectory_min_points=3,
+            fusion_trajectory_min_duration_s=0.50,
+            fusion_instant_merge_enabled=False,
+        ))
+        manager.step([], timestamp_s=0.0, arrival_timestamp_s=0.0)
+
+        manager.step([_obs("a", 1, 0.5, (0.0, 0.0))])
+        manager.step([_obs("a", 1, 0.8, (0.1, 0.0))])
+        visible = manager.step([_obs("a", 1, 1.1, (0.2, 0.0))])
+
+        self.assertGreater(manager.affinity[("a", 1)], 0)
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(manager.metrics["interior_birth_fallbacks"], 1)
+
     def test_dormant_identity_reconnected_via_kinematic_matching(self) -> None:
         manager = GlobalTrackManager(self._config(
             cameras=["a"],

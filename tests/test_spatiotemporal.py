@@ -97,8 +97,55 @@ class SlidingWindowSmoothingTests(unittest.TestCase):
         self.assertTrue(normal.accepted)
         self.assertFalse(outlier.accepted)
         self.assertEqual(outlier.sample_count, 2)
-        self.assertLess(outlier.smoothed_xy[0], 0.1)
+        np.testing.assert_allclose(outlier.smoothed_xy, [0.2, 0.0])
         self.assertEqual(smoother.metrics["outliers_rejected"], 1)
+
+        recovered = smoother.update(("a", 1), 0.3, [0.3, 0.0])
+        self.assertTrue(recovered.accepted)
+        self.assertEqual(recovered.sample_count, 3)
+
+    def test_weighted_regression_estimates_velocity_and_acceleration(self) -> None:
+        linear = SlidingWindowTrajectorySmoother(
+            window_s=4.0,
+            recency_half_life_s=1.0,
+            outlier_gate_m=20.0,
+            max_jump_m=100.0,
+        )
+        linear.update(("a", 1), 0.0, [0.0, 0.0], confidence=1.0)
+        linear.update(("a", 1), 1.0, [10.0, 0.0], confidence=0.001)
+        estimate = linear.update(("a", 1), 2.0, [2.0, 0.0], confidence=1.0)
+        self.assertAlmostEqual(estimate.velocity_xy[0], 1.0, delta=0.02)
+
+        accelerated = SlidingWindowTrajectorySmoother(
+            window_s=4.0,
+            outlier_gate_m=5.0,
+            max_jump_m=100.0,
+            max_speed_mps=10.0,
+            max_acceleration_mps2=5.0,
+        )
+        result = None
+        for timestamp in (0.0, 0.5, 1.0, 1.5):
+            result = accelerated.update(
+                ("a", 2), timestamp, [timestamp * timestamp, 0.0]
+            )
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(result.smoothed_xy, [2.25, 0.0], atol=1e-8)
+        np.testing.assert_allclose(result.velocity_xy, [3.0, 0.0], atol=1e-8)
+        np.testing.assert_allclose(result.acceleration_xy, [2.0, 0.0], atol=1e-8)
+
+    def test_out_of_order_sample_does_not_rewind_or_mutate_history(self) -> None:
+        smoother = SlidingWindowTrajectorySmoother(window_s=3.5)
+        smoother.update(("a", 1), 1.0, [1.0, 0.0])
+        smoother.update(("a", 1), 2.0, [2.0, 0.0])
+
+        late = smoother.update(("a", 1), 1.5, [100.0, 0.0])
+        recovered = smoother.update(("a", 1), 3.0, [3.0, 0.0])
+
+        self.assertFalse(late.accepted)
+        self.assertTrue(recovered.accepted)
+        self.assertEqual(recovered.sample_count, 3)
+        np.testing.assert_allclose(recovered.velocity_xy, [1.0, 0.0])
+        self.assertEqual(smoother.metrics["out_of_order_rejected"], 1)
 
     def test_window_prunes_old_samples(self) -> None:
         smoother = SlidingWindowTrajectorySmoother(
@@ -112,6 +159,16 @@ class SlidingWindowSmoothingTests(unittest.TestCase):
         self.assertEqual(result.sample_count, 1)
         np.testing.assert_allclose(result.smoothed_xy, [1.0, 0.0])
         self.assertEqual(smoother.metrics["samples_pruned"], 1)
+
+    def test_global_prune_bounds_inactive_tracklet_state(self) -> None:
+        smoother = SlidingWindowTrajectorySmoother(window_s=1.0)
+        smoother.update(("a", 1), 0.0, [0.0, 0.0])
+        smoother.update(("b", 2), 0.5, [1.0, 0.0])
+
+        smoother.prune(2.0)
+
+        self.assertEqual(smoother.histories, {})
+        self.assertEqual(smoother.metrics["histories_pruned"], 2)
 
 
 class SpatialConsistencyTests(unittest.TestCase):

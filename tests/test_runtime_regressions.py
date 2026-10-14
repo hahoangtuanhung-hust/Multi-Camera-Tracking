@@ -52,6 +52,27 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(cfg.fusion_local_reconnect_confirmations, 1)
         self.assertEqual(cfg.fusion_published_merge_confirmations, 1)
 
+    def test_hybridsort_ablation_profiles_do_not_mutate_baseline(self) -> None:
+        baseline = PipelineConfig()
+        apply_tracking_profile(baseline, "hybridsort")
+        self.assertFalse(baseline.fusion_trajectory_smoothing_enabled)
+        self.assertEqual(baseline.track_tentative_max_misses, 0)
+
+        trajectory = PipelineConfig()
+        apply_tracking_profile(trajectory, "hybridsort-trajectory")
+        self.assertTrue(trajectory.fusion_trajectory_smoothing_enabled)
+        self.assertEqual(trajectory.fusion_trajectory_window_s, 3.5)
+        self.assertEqual(trajectory.tracklet_history_s, 7.0)
+
+        combined = PipelineConfig()
+        apply_tracking_profile(combined, "hybridsort-stable")
+        self.assertEqual(combined.track_tentative_max_misses, 1)
+        self.assertTrue(combined.ocsort_observation_recovery_enabled)
+        self.assertEqual(combined.fusion_identity_retention_s, 5.0)
+        self.assertEqual(combined.fusion_max_jump_m, 2.0)
+        self.assertEqual(combined.fusion_max_speed_mps, 3.2)
+        self.assertEqual(combined.fusion_max_acceleration_mps2, 4.0)
+
     def test_zero_trail_length_disables_history(self):
         manager = GlobalTrackManager(PipelineConfig(cameras=["a"], fusion_min_hits=1, trail_length=0))
         for sequence in range(40):
@@ -129,8 +150,10 @@ class LifecycleRegressionTests(unittest.TestCase):
         for timestamp in range(80):
             manager.step([observation("a", timestamp, timestamp, timestamp * 10.),
                           observation("b", timestamp, timestamp, timestamp * 10.)])
-        self.assertLessEqual(len(manager.aliases), 6)
-        self.assertLessEqual(len(manager.affinity), 12)
+        retained_seconds = max(cfg.tracklet_history_s, cfg.tracklet_late_drop_s)
+        retained_steps = int(np.ceil(retained_seconds)) + 1
+        self.assertLessEqual(len(manager.aliases), retained_steps)
+        self.assertLessEqual(len(manager.affinity), 2 * retained_steps)
 
     def test_supplied_velocity_is_not_overwritten_on_next_append(self):
         store = TrackletStore(PipelineConfig())

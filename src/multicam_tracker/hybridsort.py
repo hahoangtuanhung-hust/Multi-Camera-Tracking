@@ -296,6 +296,8 @@ class HybridSortTracker:
             raise ValueError(
                 "track_detection_temporal_confirmation_frames must be >= 1"
             )
+        if cfg.track_tentative_max_misses < 0:
+            raise ValueError("track_tentative_max_misses must be >= 0")
         if cfg.track_max_speed_mps <= 0:
             raise ValueError("track_max_speed_mps must be > 0")
         self.cfg = cfg
@@ -459,7 +461,7 @@ class HybridSortTracker:
                     else track.misses <= cfg.track_max_age
                 )
                 if track.confirmed
-                else track.misses <= 0
+                else track.misses <= cfg.track_tentative_max_misses
             )
             if keep:
                 retained.append(track)
@@ -468,7 +470,7 @@ class HybridSortTracker:
             self.metrics["tracks_removed_tentative" if tentative else "tracks_removed_timeout"] += 1
             self._record_event(
                 "local_removed", track,
-                reason="tentative_first_miss" if tentative else "timeout",
+                reason="tentative_miss_budget" if tentative else "timeout",
             )
         self.tracks = retained
 

@@ -109,6 +109,8 @@ class GlobalTrackManager:
             raise ValueError("fusion_fixed_population_size must be >= 0")
         if cfg.fusion_new_gid_bootstrap_s < 0:
             raise ValueError("fusion_new_gid_bootstrap_s must be >= 0")
+        if cfg.fusion_interior_birth_fallback_s < 0:
+            raise ValueError("fusion_interior_birth_fallback_s must be >= 0")
         if cfg.fusion_forced_retire_s < 0:
             raise ValueError("fusion_forced_retire_s must be >= 0")
         if cfg.identity_diagnostics_max_events < 0:
@@ -711,8 +713,21 @@ class GlobalTrackManager:
                 else:
                     has_entry = track.birth_near_boundary
                 if not has_entry:
-                    self.metrics["new_gid_entry_deferred"] += 1
-                    continue
+                    fallback_ready = (
+                        self.cfg.fusion_interior_birth_fallback_s > 0
+                        and age_s + 1e-9
+                        >= self.cfg.fusion_interior_birth_fallback_s
+                        and self._verify_trajectory_plausibility(track)
+                    )
+                    if (
+                        not fallback_ready
+                        or self._has_reachable_dormant_candidate(
+                            track, self._max_event_ts_s
+                        )
+                    ):
+                        self.metrics["new_gid_entry_deferred"] += 1
+                        continue
+                    self.metrics["interior_birth_fallbacks"] += 1
             capacity = self.cfg.fusion_fixed_population_size
             if capacity > 0 and public_slots >= capacity:
                 self.metrics["new_gid_capacity_deferred"] += 1
@@ -729,6 +744,33 @@ class GlobalTrackManager:
                 continue
             self._promote_provisional_gid(track.gid)
             public_slots += 1
+
+    def _has_reachable_dormant_candidate(
+        self, provisional: GlobalTrack, event_ts: float
+    ) -> bool:
+        """Keep a provisional private while an old public GID is reachable."""
+        samples = self._ordered_track_samples(provisional)
+        observed = samples[-1][1] if samples else provisional.world_xy
+        for gid, dormant in self.dormant_tracks.items():
+            if (
+                gid <= 0
+                or gid not in self.tracks
+                or self.resolve_gid(gid) != gid
+                or not dormant.dormant
+                or dormant.last_seen_ts_s is None
+                or event_ts - dormant.last_seen_ts_s
+                > self.cfg.fusion_dormant_retention_s + 1e-9
+            ):
+                continue
+            feasibility = self._motion_feasibility(dormant, observed, event_ts)
+            if (
+                feasibility.feasible
+                and feasibility.distance_m
+                <= self.cfg.fusion_kinematic_match_gate_m + 1e-9
+            ):
+                self.metrics["interior_birth_reachable_dormant_deferred"] += 1
+                return True
+        return False
 
     def _verify_trajectory_plausibility(self, track: GlobalTrack) -> bool:
         """Verify that a provisional track has a physically consistent, logically valid
