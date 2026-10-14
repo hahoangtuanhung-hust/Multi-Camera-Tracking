@@ -283,6 +283,126 @@ def match_tracks_motion(
     )
 
 
+def match_low_confidence_motion(
+    tracks: list,
+    detections: np.ndarray,
+    cfg: PipelineConfig,
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Hungarian BYTE recovery with IoU, covariance, size and direction gates.
+
+    This operates in image space: metric speed limits are deliberately left to
+    world-plane fusion after homography projection. Low-confidence detections
+    can update an existing track but are never returned as birth candidates.
+    """
+    if (
+        not tracks
+        or len(detections) == 0
+        or not cfg.track_detection_low_conf_recovery_enabled
+    ):
+        return [], list(range(len(tracks))), list(range(len(detections)))
+
+    detections = np.asarray(detections, dtype=float).reshape((-1, 5))
+    track_boxes = np.stack([
+        np.asarray(
+            track.predicted_xyxy
+            if hasattr(track, "predicted_xyxy")
+            else track.xyxy,
+            dtype=float,
+        )
+        for track in tracks
+    ])
+    overlap = iou_matrix(track_boxes, detections[:, :4])
+    sentinel = 1e6
+    cost = np.full(overlap.shape, sentinel, dtype=float)
+    nis_gate = max(float(cfg.track_association_nis_gate), 1e-9)
+    size_gate = max(float(cfg.track_association_max_size_log_change), 1e-9)
+
+    for row, track in enumerate(tracks):
+        predicted, covariance = track.kf.projected_measurement(0.0)
+        for column, detection in enumerate(detections):
+            if overlap[row, column] < cfg.track_min_iou:
+                continue
+            measurement = _xyxy_to_box_state(detection)
+            if np.any(measurement[2:] <= 0.0):
+                continue
+            nis = 0.0
+            size_change = 0.0
+            if cfg.track_motion_gate_enabled:
+                innovation = measurement - predicted
+                try:
+                    nis = float(innovation @ np.linalg.solve(covariance, innovation))
+                except np.linalg.LinAlgError:
+                    continue
+                predicted_size = np.maximum(predicted[2:], 1.0)
+                measured_size = np.maximum(measurement[2:], 1.0)
+                size_change = float(
+                    np.mean(np.abs(np.log(measured_size / predicted_size)))
+                )
+                if (
+                    not np.isfinite(nis)
+                    or nis > nis_gate
+                    or size_change > size_gate
+                ):
+                    continue
+
+                velocity = getattr(track, "velocity", None)
+                previous = getattr(track, "last_observation", None)
+                if velocity is None and hasattr(track, "last_measurement"):
+                    velocity = np.asarray(track.kf.velocity[:2], dtype=float)
+                    previous_state = getattr(track, "last_measurement", None)
+                    previous = (
+                        None
+                        if previous_state is None
+                        else _box_state_to_xyxy(previous_state)
+                    )
+                if velocity is not None and previous is not None:
+                    velocity = np.asarray(velocity, dtype=float)[:2]
+                    speed = float(np.linalg.norm(velocity))
+                    displacement = measurement[:2] - _xyxy_to_box_state(previous)[:2]
+                    travel = float(np.linalg.norm(displacement))
+                    if speed > cfg.track_motion_min_speed and travel > 1e-6:
+                        direction_cosine = float(
+                            np.dot(velocity, displacement) / (speed * travel)
+                        )
+                        if direction_cosine < -0.45:
+                            continue
+
+            cost[row, column] = (
+                1.0 - overlap[row, column]
+                + 0.05 * min(nis / nis_gate, 1.0)
+                + 0.05 * min(size_change / size_gate, 1.0)
+            )
+
+    rows, columns = linear_sum_assignment(cost)
+    pairs = [
+        (int(row), int(column))
+        for row, column in zip(rows, columns)
+        if cost[row, column] < sentinel
+    ]
+    matched_tracks = {row for row, _column in pairs}
+    matched_detections = {column for _row, column in pairs}
+    return (
+        pairs,
+        [index for index in range(len(tracks)) if index not in matched_tracks],
+        [index for index in range(len(detections)) if index not in matched_detections],
+    )
+
+
+def required_confirmation_hits(cfg: PipelineConfig) -> int:
+    """Return the explicit temporal confirmation threshold.
+
+    ``track_min_hits=1`` remains an intentional opt-out used by low-latency
+    deployments and existing tests. Otherwise the dedicated temporal setting
+    can only make confirmation stricter, never weaker than ``track_min_hits``.
+    """
+    if cfg.track_min_hits <= 1:
+        return 1
+    return max(
+        int(cfg.track_min_hits),
+        int(cfg.track_detection_temporal_confirmation_frames),
+    )
+
+
 def _xyxy_to_box_state(box: np.ndarray) -> np.ndarray:
     """Convert xyxy to the stable [center_x, center_y, width, height] state."""
     x1, y1, x2, y2 = box[:4]
@@ -315,6 +435,12 @@ class ByteTracker:
     """Per-camera tracker: feed detections each tick, get back stable IDs."""
 
     def __init__(self, cfg: PipelineConfig):
+        if cfg.track_detection_temporal_confirmation_frames < 1:
+            raise ValueError(
+                "track_detection_temporal_confirmation_frames must be >= 1"
+            )
+        if cfg.track_max_speed_mps <= 0:
+            raise ValueError("track_max_speed_mps must be > 0")
         self.cfg = cfg
         self.tracks: list[Track] = []
         self._next_id = 1
@@ -449,15 +575,8 @@ class ByteTracker:
         #    tracks were not updated in stage one, so their boxes are
         #    still the stage-one predictions.)
         leftover = [self.tracks[index] for index in unmatched_tracks]
-        if cfg.track_motion_association_enabled:
-            pairs2, still_unmatched, _ = match_tracks_motion(leftover, low, cfg)
-        else:
-            leftover_boxes = (
-                np.stack([track.xyxy for track in leftover])
-                if leftover else np.empty((0, 4))
-            )
-            pairs2, still_unmatched, _ = match_by_iou(
-                leftover_boxes, low[:, :4], cfg.track_min_iou
+        pairs2, still_unmatched, _ = match_low_confidence_motion(
+            leftover, low, cfg
         )
         for local_t, d_idx in pairs2:
             track = self.tracks[unmatched_tracks[local_t]]
@@ -476,7 +595,7 @@ class ByteTracker:
                     "local_match",
                     track,
                     stage="low_confidence",
-                    association="motion" if cfg.track_motion_association_enabled else "iou",
+                    association="motion_gated_low_confidence",
                     iou=overlap,
                     association_cost=1.0 - overlap,
                     minimum_iou=cfg.track_min_iou,
@@ -530,7 +649,7 @@ class ByteTracker:
                     measurement_noise=cfg.track_kf_measurement_noise,
                 ),
                 conf=float(det[4]),
-                confirmed=cfg.track_min_hits <= 1,
+                confirmed=required_confirmation_hits(cfg) <= 1,
                 last_measurement=measurement.copy(),
             )
             self.tracks.append(track)
@@ -566,7 +685,7 @@ class ByteTracker:
         track.misses = 0
         track.missed_seconds = 0.0
         track.last_measurement = measurement.copy()
-        if track.hits >= self.cfg.track_min_hits:
+        if track.hits >= required_confirmation_hits(self.cfg):
             track.confirmed = True
 
     def _box_noise_scale(self, height_px: float) -> float:

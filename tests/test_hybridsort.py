@@ -131,6 +131,43 @@ class HybridSortTrackerTests(unittest.TestCase):
         self.assertEqual(fresh.update(_det(0.0, confidence=0.25), timestamp_s=0.0), [])
         self.assertEqual(fresh.tracks, [])
 
+    def test_low_confidence_recovery_must_pass_motion_size_gate(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            ocsort_use_byte=True,
+            track_motion_gate_enabled=True,
+            track_association_max_size_log_change=0.20,
+        )
+        tracker = HybridSortTracker(cfg)
+        original = tracker.update(_det(0.0), timestamp_s=0.0)[0]
+        before_width = float(original.kf.x[2])
+
+        # Same centre and sufficient overlap, but a 3x wider low-score box is
+        # typical of two people being merged into one detector output.
+        merged_box = np.array([[-20.0, 0.0, 40.0, 40.0, 0.25]], dtype=float)
+        visible = tracker.update(merged_box, timestamp_s=0.1)
+
+        self.assertEqual(visible, [])
+        self.assertEqual(tracker._next_id, 2)
+        self.assertEqual(tracker.metrics["low_confidence_matches"], 0)
+        self.assertEqual(tracker.tracks[0].misses, 1)
+        self.assertAlmostEqual(float(tracker.tracks[0].kf.x[2]), before_width)
+
+    def test_temporal_confirmation_setting_delays_publication(self):
+        cfg = PipelineConfig(
+            track_min_hits=2,
+            track_detection_temporal_confirmation_frames=3,
+        )
+        tracker = HybridSortTracker(cfg)
+
+        self.assertEqual(tracker.update(_det(0.0), timestamp_s=0.0), [])
+        self.assertEqual(tracker.update(_det(0.5), timestamp_s=0.1), [])
+        visible = tracker.update(_det(1.0), timestamp_s=0.2)
+
+        self.assertEqual(len(visible), 1)
+        self.assertTrue(visible[0].confirmed)
+
     def test_id_switches_reduced_on_reentry(self):
         """Observed boxes provide a stronger signal than drifted Kalman when
         a person exits and re-enters from the same direction.  Hybrid-SORT
@@ -216,6 +253,55 @@ class AssociateHybridTests(unittest.TestCase):
             min_iou=0.20, alpha=0.40, inertia=0.0, delta_t=3,
         )
         self.assertEqual(len(unmatched_d), 0)
+
+    def test_stale_observation_rejected_by_max_obs_gap(self):
+        """A track lost longer than max_obs_gap_s must not be matched via observation-IoU."""
+        tracker = self._make_tracker_with_observation(x=50.0)
+        for track in tracker.tracks:
+            track.kf.x[0] += 200.0
+            track.kf.x[1] += 200.0
+            track.missed_seconds = 1.5  # exceed max_obs_gap_s (0.8s)
+
+        detections = np.array([[50.0, 0.0, 70.0, 40.0, 0.90]])
+        pairs, unmatched_t, unmatched_d = associate_hybrid(
+            tracker.tracks, detections,
+            min_iou=0.20, alpha=0.80, inertia=0.0, delta_t=3,
+            max_obs_gap_s=0.80,
+        )
+        self.assertEqual(len(pairs), 0, "Stale track must not steal the detection")
+        self.assertEqual(len(unmatched_d), 1)
+
+    def test_scale_mismatch_rejected_in_round2(self):
+        """A detection with drastic size change (e.g. 3x height) must be rejected."""
+        tracker = self._make_tracker_with_observation(x=50.0)
+        for track in tracker.tracks:
+            track.kf.x[0] += 200.0
+            track.kf.x[1] += 200.0
+
+        # Detection has height 150 (3.75x of original height 40)
+        detections = np.array([[50.0, 0.0, 70.0, 150.0, 0.90]])
+        pairs, _, unmatched_d = associate_hybrid(
+            tracker.tracks, detections,
+            min_iou=0.20, alpha=0.80, inertia=0.0, delta_t=3,
+        )
+        self.assertEqual(len(pairs), 0, "Severe scale mismatch must be rejected")
+        self.assertEqual(len(unmatched_d), 1)
+
+    def test_reverse_direction_rejected_in_round2(self):
+        """A detection moving in reverse against track velocity must be rejected."""
+        tracker = self._make_tracker_with_observation(x=50.0)
+        for track in tracker.tracks:
+            track.kf.x[0] += 200.0
+            track.kf.x[1] += 200.0
+            track.velocity = np.array([1.0, 0.0])  # moving rightwards
+
+        # Detection placed 30 px to the LEFT of observation (opposite direction)
+        detections = np.array([[20.0, 0.0, 40.0, 40.0, 0.90]])
+        pairs, _, unmatched_d = associate_hybrid(
+            tracker.tracks, detections,
+            min_iou=0.20, alpha=0.80, inertia=0.0, delta_t=3,
+        )
+        self.assertEqual(len(pairs), 0, "Reverse motion must be rejected")
 
 
 if __name__ == "__main__":

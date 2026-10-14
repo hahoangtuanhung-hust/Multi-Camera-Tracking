@@ -26,7 +26,9 @@ from .bytetrack import (
     _box_state_to_xyxy,
     _xyxy_to_box_state,
     iou_matrix,
+    match_low_confidence_motion,
     match_by_iou,
+    required_confirmation_hits,
 )
 from .config import PipelineConfig
 
@@ -154,6 +156,12 @@ class OCSortTracker:
             raise ValueError("ocsort_inertia must be >= 0")
         if cfg.ocsort_oru_min_misses < 1:
             raise ValueError("ocsort_oru_min_misses must be >= 1")
+        if cfg.track_detection_temporal_confirmation_frames < 1:
+            raise ValueError(
+                "track_detection_temporal_confirmation_frames must be >= 1"
+            )
+        if cfg.track_max_speed_mps <= 0:
+            raise ValueError("track_max_speed_mps must be > 0")
         self.cfg = cfg
         self.tracks: list[OCTrack] = []
         self._next_id = 1
@@ -253,9 +261,8 @@ class OCSortTracker:
         # partially occluded person alive without allowing low-score births.
         if cfg.ocsort_use_byte and unmatched_tracks and len(low):
             leftover = [self.tracks[index] for index in unmatched_tracks]
-            boxes = np.stack([track.predicted_xyxy for track in leftover])
-            pairs_low, still_unmatched, _ = match_by_iou(
-                boxes, low[:, :4], cfg.track_min_iou
+            pairs_low, still_unmatched, _ = match_low_confidence_motion(
+                leftover, low, cfg
             )
             for local_track_index, detection_index in pairs_low:
                 track = self.tracks[unmatched_tracks[local_track_index]]
@@ -267,7 +274,7 @@ class OCSortTracker:
                     dt,
                     timestamp_s,
                     stage="low_confidence",
-                    association="ocsort_byte_extension",
+                    association="ocsort_motion_gated_byte_extension",
                 )
             unmatched_tracks = [
                 unmatched_tracks[index] for index in still_unmatched
@@ -416,7 +423,7 @@ class OCSortTracker:
         track.hits += 1
         track.misses = 0
         track.missed_seconds = 0.0
-        if track.hits >= self.cfg.track_min_hits:
+        if track.hits >= required_confirmation_hits(self.cfg):
             track.confirmed = True
         track.last_observation = detection.copy()
         track.last_observation_ts = (
@@ -503,7 +510,7 @@ class OCSortTracker:
             track_id=self._next_id,
             kf=kf,
             conf=float(detection[4]),
-            confirmed=self.cfg.track_min_hits <= 1,
+            confirmed=required_confirmation_hits(self.cfg) <= 1,
             last_observation=detection.copy(),
             last_observation_ts=(
                 float(timestamp_s) if timestamp_s is not None else None

@@ -38,7 +38,9 @@ from .bytetrack import (
     _box_state_to_xyxy,
     _xyxy_to_box_state,
     iou_matrix,
+    match_low_confidence_motion,
     match_by_iou,
+    required_confirmation_hits,
 )
 from .config import PipelineConfig
 from .ocsort import _box_center, _previous_observation, _unit_direction
@@ -97,12 +99,16 @@ def associate_hybrid(
     alpha: float,
     inertia: float,
     delta_t: int,
+    max_obs_gap_s: float = 0.80,
+    min_blended_iou: float = 0.25,
+    timestamp_s: float | None = None,
 ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
     """Two-round primary association combining Kalman-IoU and observation-IoU.
 
     Round 1: standard IoU against predicted boxes (all tracks, high dets).
-    Round 2: blended cost for still-unmatched tracks that have a real last
-             observation available.
+    Round 2: blended cost for recently lost tracks with observation history.
+             Includes scale/aspect-ratio gating, direction consistency,
+             and temporal decay to prevent identity theft.
 
     Returns (pairs, unmatched_track_indices, unmatched_detection_indices).
     """
@@ -146,19 +152,24 @@ def associate_hybrid(
     unmatched_det_r1 = [i for i in range(len(detections)) if i not in matched_dets_r1]
 
     if not unmatched_track_r1 or not unmatched_det_r1:
-        return (
-            pairs_r1,
-            unmatched_track_r1,
-            unmatched_det_r1,
-        )
+        return pairs_r1, unmatched_track_r1, unmatched_det_r1
 
-    # ---- Round 2: blended (Kalman-IoU + last-observation-IoU) -------------
-    # Only tracks that have a real previous observation participate.
-    eligible_local = [
-        local_i
-        for local_i, track_i in enumerate(unmatched_track_r1)
-        if tracks[track_i].last_observation is not None
-    ]
+    # ---- Round 2: guarded blended (Kalman-IoU + last-observation-IoU) -----
+    # Only tracks with recent observations are eligible. Stale tracks (> max_obs_gap_s)
+    # are excluded to prevent identity theft when another person crosses the area.
+    eligible_local = []
+    for local_i, track_i in enumerate(unmatched_track_r1):
+        track = tracks[track_i]
+        if track.last_observation is None:
+            continue
+        gap_s = (
+            float(timestamp_s) - track.last_observation_ts
+            if timestamp_s is not None and track.last_observation_ts is not None
+            else track.missed_seconds
+        )
+        if gap_s <= max_obs_gap_s:
+            eligible_local.append(local_i)
+
     if not eligible_local or not unmatched_det_r1:
         return pairs_r1, unmatched_track_r1, unmatched_det_r1
 
@@ -173,20 +184,77 @@ def associate_hybrid(
     obs_sub = np.stack([tracks[i].last_observation[:4] for i in eligible_track_indices])
     iou_obs_sub = iou_matrix(obs_sub, remaining_dets[:, :4])
 
-    # Blended IoU: (1-alpha)*kalman_iou + alpha*observation_iou
-    blended = (1.0 - float(alpha)) * iou_pred_sub + float(alpha) * iou_obs_sub
-    # Gate: at least one of the two IoU components must be >= min_iou
-    gate_mask = (iou_pred_sub >= min_iou) | (iou_obs_sub >= min_iou)
-    blended[~gate_mask] = 0.0
+    num_tracks = len(eligible_track_indices)
+    num_dets = len(remaining_dets)
+    blended = np.zeros((num_tracks, num_dets), dtype=float)
+    valid_mask = np.zeros((num_tracks, num_dets), dtype=bool)
+
+    for r, track_i in enumerate(eligible_track_indices):
+        track = tracks[track_i]
+        gap_s = (
+            float(timestamp_s) - track.last_observation_ts
+            if timestamp_s is not None and track.last_observation_ts is not None
+            else track.missed_seconds
+        )
+        # Piecewise temporal decay: for short occlusions (<= 0.4s) weight is full;
+        # then decays smoothly to 0 at max_obs_gap_s.
+        if gap_s <= 0.40:
+            decay = 1.0
+        else:
+            decay = max(0.0, 1.0 - (gap_s - 0.40) / max(max_obs_gap_s - 0.40, 1e-6))
+        effective_alpha = float(alpha) * decay
+
+        obs_box = track.last_observation[:4]
+        obs_w = max(1.0, obs_box[2] - obs_box[0])
+        obs_h = max(1.0, obs_box[3] - obs_box[1])
+        obs_center = _box_center(obs_box)
+
+        for c in range(num_dets):
+            det_box = remaining_dets[c, :4]
+            det_w = max(1.0, det_box[2] - det_box[0])
+            det_h = max(1.0, det_box[3] - det_box[1])
+
+            # Scale / aspect-ratio consistency check: reject severe box size mismatch
+            scale_w = det_w / obs_w
+            scale_h = det_h / obs_h
+            if scale_w < 0.45 or scale_w > 2.2 or scale_h < 0.45 or scale_h > 2.2:
+                continue
+
+            # Motion direction check: reject detections moving backwards from established velocity
+            if track.velocity is not None:
+                disp = _box_center(det_box) - obs_center
+                norm = float(np.linalg.norm(disp))
+                if norm > 15.0:
+                    unit_disp = disp / norm
+                    cos_dir = float(unit_disp @ track.velocity)
+                    if cos_dir < -0.45:
+                        continue
+
+            pred_iou = iou_pred_sub[r, c]
+            obs_iou = iou_obs_sub[r, c]
+            score = (1.0 - effective_alpha) * pred_iou + effective_alpha * obs_iou
+
+            # Robust gating: accept match if blended score meets threshold, or
+            # strong observation IoU meets threshold with sufficient blended confidence
+            is_valid = (
+                (score >= min_blended_iou)
+                or (obs_iou >= max(min_iou, 0.30) and score >= min_blended_iou * 0.50)
+                or (pred_iou >= min_iou and obs_iou >= 0.15)
+            )
+            if is_valid:
+                blended[r, c] = max(score, obs_iou * effective_alpha)
+                valid_mask[r, c] = True
+
+    if not np.any(valid_mask):
+        return pairs_r1, unmatched_track_r1, unmatched_det_r1
 
     rows2, cols2 = linear_sum_assignment(-blended)
     pairs_r2_local = [
         (int(r), int(c))
         for r, c in zip(rows2, cols2)
-        if gate_mask[r, c]
+        if valid_mask[r, c] and blended[r, c] > 0.0
     ]
 
-    # Re-map local → global indices
     pairs_r2 = [
         (eligible_track_indices[r], unmatched_det_r1[c])
         for r, c in pairs_r2_local
@@ -218,8 +286,18 @@ class HybridSortTracker:
             raise ValueError("ocsort_inertia must be >= 0")
         if not (0.0 <= cfg.hybridsort_alpha <= 1.0):
             raise ValueError("hybridsort_alpha must be in [0, 1]")
+        if cfg.hybridsort_max_obs_gap_s <= 0:
+            raise ValueError("hybridsort_max_obs_gap_s must be > 0")
+        if not (0.0 <= cfg.hybridsort_min_blended_iou <= 1.0):
+            raise ValueError("hybridsort_min_blended_iou must be in [0, 1]")
         if cfg.ocsort_oru_min_misses < 1:
             raise ValueError("ocsort_oru_min_misses must be >= 1")
+        if cfg.track_detection_temporal_confirmation_frames < 1:
+            raise ValueError(
+                "track_detection_temporal_confirmation_frames must be >= 1"
+            )
+        if cfg.track_max_speed_mps <= 0:
+            raise ValueError("track_max_speed_mps must be > 0")
         self.cfg = cfg
         self.tracks: list[HybridTrack] = []
         self._next_id = 1
@@ -288,6 +366,9 @@ class HybridSortTracker:
             cfg.hybridsort_alpha,
             cfg.ocsort_inertia,
             cfg.ocsort_delta_t,
+            max_obs_gap_s=cfg.hybridsort_max_obs_gap_s,
+            min_blended_iou=cfg.hybridsort_min_blended_iou,
+            timestamp_s=timestamp_s,
         )
         for track_index, detection_index in pairs:
             self.metrics["high_confidence_matches"] += 1
@@ -304,9 +385,8 @@ class HybridSortTracker:
         # ---- Optional BYTE extension (low-confidence rescue) ---------------
         if cfg.ocsort_use_byte and unmatched_tracks and len(low):
             leftover = [self.tracks[i] for i in unmatched_tracks]
-            boxes = np.stack([t.predicted_xyxy for t in leftover])
-            pairs_low, still_unmatched, _ = match_by_iou(
-                boxes, low[:, :4], cfg.track_min_iou
+            pairs_low, still_unmatched, _ = match_low_confidence_motion(
+                leftover, low, cfg
             )
             for local_i, det_i in pairs_low:
                 track = self.tracks[unmatched_tracks[local_i]]
@@ -314,7 +394,8 @@ class HybridSortTracker:
                 self.metrics["byte_extension_matches"] += 1
                 self._apply_match(
                     track, low[det_i], dt, timestamp_s,
-                    stage="low_confidence", association="hybrid_byte_extension",
+                    stage="low_confidence",
+                    association="hybrid_motion_gated_byte_extension",
                 )
             unmatched_tracks = [unmatched_tracks[i] for i in still_unmatched]
 
@@ -328,6 +409,11 @@ class HybridSortTracker:
             valid_local = [
                 li for li, t in enumerate(recovery_tracks)
                 if t.last_observation is not None
+                and (
+                    (timestamp_s - t.last_observation_ts <= cfg.hybridsort_max_obs_gap_s)
+                    if timestamp_s is not None and t.last_observation_ts is not None
+                    else t.missed_seconds <= cfg.hybridsort_max_obs_gap_s
+                )
             ]
             if valid_local:
                 last_boxes = np.stack([
@@ -456,7 +542,7 @@ class HybridSortTracker:
         track.hits += 1
         track.misses = 0
         track.missed_seconds = 0.0
-        if track.hits >= self.cfg.track_min_hits:
+        if track.hits >= required_confirmation_hits(self.cfg):
             track.confirmed = True
         track.last_observation = detection.copy()
         track.last_observation_ts = float(timestamp_s) if timestamp_s is not None else None
@@ -536,7 +622,7 @@ class HybridSortTracker:
             track_id=self._next_id,
             kf=kf,
             conf=float(detection[4]),
-            confirmed=self.cfg.track_min_hits <= 1,
+            confirmed=required_confirmation_hits(self.cfg) <= 1,
             last_observation=detection.copy(),
             last_observation_ts=float(timestamp_s) if timestamp_s is not None else None,
             observations=deque([(0, detection.copy())]),
