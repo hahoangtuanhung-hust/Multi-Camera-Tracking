@@ -268,6 +268,137 @@ class _TrajectorySample:
     confidence: float
 
 
+@dataclass(frozen=True)
+class TrajectoryFit:
+    """Robust confidence/recency-weighted state at one reference timestamp."""
+
+    position_xy: np.ndarray
+    velocity_xy: np.ndarray
+    acceleration_xy: np.ndarray
+    acceleration_reliable: bool
+    effective_samples: float
+
+
+def fit_weighted_trajectory(
+    timestamps: Sequence[float] | np.ndarray,
+    points_xy: Sequence[Sequence[float]] | np.ndarray,
+    confidences: Sequence[float] | np.ndarray,
+    *,
+    reference_ts_s: float,
+    recency_half_life_s: float,
+    min_acceleration_duration_s: float = 1.0,
+) -> TrajectoryFit:
+    """Fit a robust polynomial trajectory without clipping its derivatives.
+
+    Base weights are exactly confidence times exponential recency. Three Huber
+    reweighting passes prevent one previously accepted calibration/bbox error
+    from dominating the fit. Acceleration is exposed only with enough temporal
+    span and effective weighted support.
+    """
+    times_abs = np.asarray(timestamps, dtype=float).reshape(-1)
+    points = np.asarray(points_xy, dtype=float).reshape((-1, 2))
+    confidence = np.asarray(confidences, dtype=float).reshape(-1)
+    if not len(times_abs) or len(points) != len(times_abs) or len(confidence) != len(times_abs):
+        raise ValueError("trajectory arrays must be non-empty and have equal length")
+    if recency_half_life_s <= 0.0 or not np.isfinite(recency_half_life_s):
+        raise ValueError("recency_half_life_s must be finite and > 0")
+    if min_acceleration_duration_s < 0.0:
+        raise ValueError("min_acceleration_duration_s must be >= 0")
+    if not (
+        np.all(np.isfinite(times_abs))
+        and np.all(np.isfinite(points))
+        and np.all(np.isfinite(confidence))
+    ):
+        raise ValueError("trajectory arrays must be finite")
+
+    reference = float(reference_ts_s)
+    relative = times_abs - reference
+    ages = np.maximum(0.0, reference - times_abs)
+    recency = np.exp(-log(2.0) * ages / recency_half_life_s)
+    base_weights = recency * np.clip(confidence, 0.0, 1.0)
+    if float(np.sum(base_weights)) <= 1e-12:
+        latest = int(np.argmax(times_abs))
+        return TrajectoryFit(
+            points[latest].copy(),
+            np.zeros(2, dtype=float),
+            np.zeros(2, dtype=float),
+            False,
+            0.0,
+        )
+    effective_samples = float(
+        np.sum(base_weights) ** 2 / max(np.sum(base_weights**2), 1e-12)
+    )
+    distinct = len(np.unique(np.round(times_abs, decimals=9)))
+    duration = float(np.ptp(times_abs)) if len(times_abs) > 1 else 0.0
+    acceleration_reliable = bool(
+        distinct >= 4
+        and duration + 1e-9 >= min_acceleration_duration_s
+        and float(np.sum(np.clip(confidence, 0.0, 1.0))) >= 3.0
+    )
+    degree = 2 if acceleration_reliable else (1 if distinct >= 2 else 0)
+    if degree == 0:
+        return TrajectoryFit(
+            np.average(points, axis=0, weights=base_weights),
+            np.zeros(2, dtype=float),
+            np.zeros(2, dtype=float),
+            False,
+            effective_samples,
+        )
+
+    columns = [np.ones(len(relative)), relative]
+    if degree == 2:
+        columns.append(0.5 * relative * relative)
+    design = np.column_stack(columns)
+
+    def solve(weights: np.ndarray) -> tuple[np.ndarray, int]:
+        root_weight = np.sqrt(weights)[:, None]
+        coefficients, _, rank, _ = np.linalg.lstsq(
+            design * root_weight,
+            points * root_weight,
+            rcond=None,
+        )
+        return coefficients, int(rank)
+
+    weights = base_weights.copy()
+    coefficients, rank = solve(weights)
+    if rank < design.shape[1]:
+        return TrajectoryFit(
+            np.average(points, axis=0, weights=base_weights),
+            np.zeros(2, dtype=float),
+            np.zeros(2, dtype=float),
+            False,
+            effective_samples,
+        )
+    for _ in range(3):
+        residuals = np.linalg.norm(points - design @ coefficients, axis=1)
+        median = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - median)))
+        huber_cutoff = max(0.05, median + 2.5 * 1.4826 * mad)
+        robust = np.minimum(
+            1.0,
+            huber_cutoff / np.maximum(residuals, 1e-12),
+        )
+        updated = base_weights * robust
+        coefficients, rank = solve(updated)
+        if rank < design.shape[1]:
+            acceleration_reliable = False
+            break
+        weights = updated
+
+    acceleration = (
+        coefficients[2].copy()
+        if acceleration_reliable and len(coefficients) > 2
+        else np.zeros(2, dtype=float)
+    )
+    return TrajectoryFit(
+        coefficients[0].copy(),
+        coefficients[1].copy(),
+        acceleration,
+        acceleration_reliable,
+        float(np.sum(weights) ** 2 / max(np.sum(weights**2), 1e-12)),
+    )
+
+
 class SlidingWindowTrajectorySmoother:
     """Confidence- and recency-weighted trajectory smoothing with outlier veto.
 
@@ -285,6 +416,7 @@ class SlidingWindowTrajectorySmoother:
         outlier_gate_m: float = 0.75,
         max_speed_mps: float = 3.2,
         max_acceleration_mps2: float = 4.0,
+        min_acceleration_duration_s: float = 1.0,
         jump_window_s: float = 1.0,
         max_jump_m: float = 2.0,
     ) -> None:
@@ -305,6 +437,9 @@ class SlidingWindowTrajectorySmoother:
         self.outlier_gate_m = float(outlier_gate_m)
         self.max_speed_mps = float(max_speed_mps)
         self.max_acceleration_mps2 = float(max_acceleration_mps2)
+        if not np.isfinite(min_acceleration_duration_s) or min_acceleration_duration_s < 0:
+            raise ValueError("min_acceleration_duration_s must be finite and >= 0")
+        self.min_acceleration_duration_s = float(min_acceleration_duration_s)
         self.jump_window_s = float(jump_window_s)
         self.max_jump_m = float(max_jump_m)
         self.histories: dict[TrackletKey, deque[_TrajectorySample]] = {}
@@ -353,10 +488,19 @@ class SlidingWindowTrajectorySmoother:
 
         predicted = raw.copy()
         elapsed = 0.0
+        fit_speed_exceeded = False
+        fit_acceleration_exceeded = False
         if history:
             elapsed = max(0.0, timestamp - history[-1].timestamp_s)
             position, velocity, acceleration = self._weighted_regression(
                 history, history[-1].timestamp_s
+            )
+            fit_speed_exceeded = bool(
+                np.linalg.norm(velocity) > self.max_speed_mps + 1e-9
+            )
+            fit_acceleration_exceeded = bool(
+                np.linalg.norm(acceleration)
+                > self.max_acceleration_mps2 + 1e-9
             )
             velocity, acceleration = self._bounded_motion(
                 velocity, acceleration
@@ -376,13 +520,22 @@ class SlidingWindowTrajectorySmoother:
         jump = (
             float(np.linalg.norm(raw - history[-1].xy)) if history else 0.0
         )
+        segment_speed_exceeded = bool(
+            history
+            and elapsed > 1e-6
+            and jump / elapsed > self.max_speed_mps + 1e-9
+        )
         exceeds_jump_cap = bool(
             history
             and elapsed <= self.jump_window_s + 1e-9
             and jump > self.max_jump_m + 1e-9
         )
         accepted = not history or (
-            residual <= allowed + 1e-9 and not exceeds_jump_cap
+            residual <= allowed + 1e-9
+            and not exceeds_jump_cap
+            and not segment_speed_exceeded
+            and not fit_speed_exceeded
+            and not fit_acceleration_exceeded
         )
         if accepted:
             sample = _TrajectorySample(timestamp, raw.copy(), float(confidence))
@@ -395,6 +548,10 @@ class SlidingWindowTrajectorySmoother:
             self.metrics["outliers_rejected"] += 1
             if exceeds_jump_cap:
                 self.metrics["jump_cap_rejected"] += 1
+            if segment_speed_exceeded or fit_speed_exceeded:
+                self.metrics["speed_limit_rejected"] += 1
+            if fit_acceleration_exceeded:
+                self.metrics["acceleration_limit_rejected"] += 1
 
         smoothed, velocity, acceleration = self._weighted_regression(
             history, timestamp
@@ -444,45 +601,23 @@ class SlidingWindowTrajectorySmoother:
         timestamps = np.asarray(
             [sample.timestamp_s for sample in history], dtype=float
         )
-        times = timestamps - float(reference_ts_s)
-        ages = np.maximum(0.0, float(reference_ts_s) - timestamps)
-        recency = np.exp(-log(2.0) * ages / self.recency_half_life_s)
         confidence = np.array(
-            [max(sample.confidence, 1e-3) for sample in history], dtype=float
+            [sample.confidence for sample in history], dtype=float
         )
-        weights = recency * confidence
         points = np.stack([sample.xy for sample in history])
-        distinct = len(np.unique(np.round(timestamps, decimals=9)))
-        degree = 2 if distinct >= 4 else (1 if distinct >= 2 else 0)
-        if degree == 0:
-            return (
-                np.average(points, axis=0, weights=weights),
-                np.zeros(2, dtype=float),
-                np.zeros(2, dtype=float),
-            )
-        columns = [np.ones(len(times)), times]
-        if degree == 2:
-            columns.append(0.5 * times * times)
-        design = np.column_stack(columns)
-        root_weight = np.sqrt(weights)[:, None]
-        coefficients, _, rank, _ = np.linalg.lstsq(
-            design * root_weight,
-            points * root_weight,
-            rcond=None,
+        fit = fit_weighted_trajectory(
+            timestamps,
+            points,
+            confidence,
+            reference_ts_s=reference_ts_s,
+            recency_half_life_s=self.recency_half_life_s,
+            min_acceleration_duration_s=self.min_acceleration_duration_s,
         )
-        if rank < design.shape[1]:
-            # Degenerate timestamp layouts fall back to a stable weighted mean.
-            return (
-                np.average(points, axis=0, weights=weights),
-                np.zeros(2, dtype=float),
-                np.zeros(2, dtype=float),
-            )
-        position = coefficients[0]
-        velocity = coefficients[1]
-        acceleration = (
-            coefficients[2] if degree == 2 else np.zeros(2, dtype=float)
+        return (
+            fit.position_xy.copy(),
+            fit.velocity_xy.copy(),
+            fit.acceleration_xy.copy(),
         )
-        return position.copy(), velocity.copy(), acceleration.copy()
 
     def _bounded_motion(
         self, velocity: np.ndarray, acceleration: np.ndarray

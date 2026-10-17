@@ -101,6 +101,63 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(balanced.track_tentative_max_misses, 1)
         self.assertFalse(balanced.hybridsort_ambiguity_suppression_enabled)
 
+        robust_local = PipelineConfig()
+        apply_tracking_profile(robust_local, "hybridsort-a1-robust-local")
+        self.assertTrue(robust_local.hybridsort_trusted_observation_enabled)
+        self.assertEqual(
+            robust_local.hybridsort_trusted_observation_nis_multiplier, 4.0
+        )
+        self.assertEqual(robust_local.track_tentative_max_misses, 1)
+
+        robust_trajectory = PipelineConfig()
+        apply_tracking_profile(robust_trajectory, "hybridsort-a2-trajectory")
+        self.assertTrue(robust_trajectory.fusion_trajectory_smoothing_enabled)
+        self.assertTrue(
+            robust_trajectory.fusion_robust_trajectory_motion_enabled
+        )
+
+        common_time = PipelineConfig()
+        apply_tracking_profile(common_time, "hybridsort-a3-common-time")
+        self.assertTrue(
+            common_time.fusion_common_timestamp_instant_merge_enabled
+        )
+
+        crossing_long = PipelineConfig()
+        apply_tracking_profile(crossing_long, "hybridsort-a4-crossing")
+        self.assertTrue(crossing_long.hybridsort_ambiguity_suppression_enabled)
+        self.assertEqual(crossing_long.hybridsort_ambiguity_owner_grace_s, 0.20)
+        self.assertTrue(
+            crossing_long.hybridsort_lost_observation_prediction_enabled
+        )
+
+        lifecycle = PipelineConfig()
+        apply_tracking_profile(lifecycle, "hybridsort-a5-lifecycle")
+        self.assertEqual(lifecycle.fusion_interior_birth_fallback_s, 1.5)
+        self.assertEqual(lifecycle.fusion_reachable_dormant_max_defer_s, 1.5)
+
+        late_binding = PipelineConfig()
+        apply_tracking_profile(late_binding, "hybridsort-late-binding")
+        self.assertTrue(late_binding.fusion_late_identity_binding_enabled)
+        self.assertEqual(late_binding.fusion_provisional_min_age_s, 1.0)
+        self.assertEqual(late_binding.fusion_identity_commit_delay_s, 2.0)
+        self.assertEqual(late_binding.fusion_late_identity_max_defer_s, 2.0)
+
+        late_binding_balanced = PipelineConfig()
+        apply_tracking_profile(
+            late_binding_balanced, "hybridsort-late-binding-balanced"
+        )
+        self.assertTrue(
+            late_binding_balanced.fusion_late_identity_binding_enabled
+        )
+        self.assertFalse(late_binding_balanced.fusion_new_gid_entry_required)
+
+        crowd = PipelineConfig()
+        apply_tracking_profile(crowd, "hybridsort-crowd-recovery")
+        self.assertTrue(crowd.hybridsort_reappearance_enabled)
+        self.assertTrue(crowd.fusion_reconnect_appearance_enabled)
+        self.assertTrue(crowd.fusion_stationary_reconnect_enabled)
+        self.assertTrue(crowd.render_occluded_tracks_enabled)
+
         trajectory = PipelineConfig()
         apply_tracking_profile(trajectory, "hybridsort-trajectory")
         self.assertTrue(trajectory.fusion_trajectory_smoothing_enabled)

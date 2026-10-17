@@ -3,22 +3,29 @@
 The legacy synchronous geometry path remains available when observations do
 not carry timestamps. Timestamped observations first receive provisional
 global IDs, then bounded tracklet history can merge those IDs after enough
-motion evidence exists. No appearance, ReID or face feature is used.
+motion evidence exists. Optional same-camera colour descriptors protect
+reappearance ownership; no face feature or cross-camera colour comparison is
+used.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from itertools import combinations
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from .appearance import (
+    appearance_similarity,
+    normalize_descriptor,
+    update_appearance_prototype,
+)
 from .bytetrack import ConstantVelocityKalman
 from .config import PipelineConfig
 from .diagnostics import IdentityEventWriter
-from .spatiotemporal import get_ground_plane_location
+from .spatiotemporal import fit_weighted_trajectory, get_ground_plane_location
 from .tracklets import CameraClockOffsetEstimator, MatchResult, TrackletKey, TrackletMatcher, TrackletStore
 
 
@@ -35,6 +42,7 @@ class CameraObservation:
     world_velocity: np.ndarray | None = None
     arrival_ts_s: float | None = None
     near_boundary: bool = False
+    appearance: np.ndarray | None = None
 
 
 @dataclass
@@ -45,6 +53,7 @@ class TrackEndpoint:
     xy: np.ndarray
     velocity: np.ndarray | None
     near_boundary: bool
+    appearance: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,19 @@ class TrajectoryMotion:
     acceleration: np.ndarray
     samples: int
     duration_s: float
+    acceleration_reliable: bool = False
+
+
+@dataclass(frozen=True, order=True)
+class ReconnectCandidate:
+    """One same-camera predecessor proposal, sorted by total cost."""
+
+    cost: float
+    distance_m: float
+    gid: int
+    is_long_gap: bool
+    appearance_similarity: float | None = field(compare=False, default=None)
+    stationary_appearance_supported: bool = field(compare=False, default=False)
 
 
 @dataclass
@@ -83,6 +105,7 @@ class GlobalTrack:
     state_timestamp_s: float | None = None
     last_seen_ts_s: float | None = None
     last_arrival_ts_s: float | None = None
+    last_output_ts_s: float | None = None
     emitted: bool = False
     emitted_at_s: float | None = None
     birth_near_boundary: bool = False
@@ -91,6 +114,13 @@ class GlobalTrack:
     dormant: bool = False
     dormant_since_s: float | None = None
     camera_endpoints: dict[str, TrackEndpoint] = field(default_factory=dict)
+    appearance_by_camera: dict[str, np.ndarray] = field(default_factory=dict)
+    # Hot-path physical-cap history. This contains accepted world positions
+    # only; it is independent of raw/late TrackletStore metadata and bounded
+    # even for unexpectedly high-rate inputs.
+    accepted_positions: deque[tuple[float, np.ndarray]] = field(
+        default_factory=lambda: deque(maxlen=512)
+    )
 
     @property
     def world_xy(self) -> np.ndarray:
@@ -111,6 +141,14 @@ class GlobalTrackManager:
             raise ValueError("fusion_new_gid_bootstrap_s must be >= 0")
         if cfg.fusion_interior_birth_fallback_s < 0:
             raise ValueError("fusion_interior_birth_fallback_s must be >= 0")
+        if cfg.fusion_reachable_dormant_max_defer_s < 0:
+            raise ValueError(
+                "fusion_reachable_dormant_max_defer_s must be >= 0"
+            )
+        if cfg.fusion_identity_commit_delay_s < 0:
+            raise ValueError("fusion_identity_commit_delay_s must be >= 0")
+        if cfg.fusion_late_identity_max_defer_s < 0:
+            raise ValueError("fusion_late_identity_max_defer_s must be >= 0")
         if cfg.fusion_forced_retire_s < 0:
             raise ValueError("fusion_forced_retire_s must be >= 0")
         if cfg.identity_diagnostics_max_events < 0:
@@ -119,12 +157,34 @@ class GlobalTrackManager:
             raise ValueError("clock_max_pair_delta_spread_s must be >= 0")
         if cfg.fusion_dormant_retention_s < 0:
             raise ValueError("fusion_dormant_retention_s must be >= 0")
+        if cfg.fusion_output_time_policy not in {"arrival", "event"}:
+            raise ValueError(
+                "fusion_output_time_policy must be 'arrival' or 'event'"
+            )
         if cfg.fusion_kinematic_match_gate_m < 0:
             raise ValueError("fusion_kinematic_match_gate_m must be >= 0")
         if cfg.fusion_kinematic_direction_weight < 0:
             raise ValueError("fusion_kinematic_direction_weight must be >= 0")
         if cfg.fusion_kinematic_speed_weight < 0:
             raise ValueError("fusion_kinematic_speed_weight must be >= 0")
+        if not -1.0 <= cfg.fusion_reconnect_appearance_min_similarity <= 1.0:
+            raise ValueError(
+                "fusion_reconnect_appearance_min_similarity must be in [-1, 1]"
+            )
+        if cfg.fusion_reconnect_appearance_weight_m < 0:
+            raise ValueError("fusion_reconnect_appearance_weight_m must be >= 0")
+        if not 0.0 < cfg.fusion_appearance_update_alpha <= 1.0:
+            raise ValueError("fusion_appearance_update_alpha must be in (0, 1]")
+        if cfg.fusion_appearance_conflict_confirmations < 1:
+            raise ValueError(
+                "fusion_appearance_conflict_confirmations must be >= 1"
+            )
+        if cfg.fusion_appearance_conflict_window_s <= 0:
+            raise ValueError("fusion_appearance_conflict_window_s must be > 0")
+        if cfg.fusion_stationary_speed_mps < 0:
+            raise ValueError("fusion_stationary_speed_mps must be >= 0")
+        if cfg.fusion_stationary_reconnect_max_gap_s <= 0:
+            raise ValueError("fusion_stationary_reconnect_max_gap_s must be > 0")
         if cfg.fusion_anti_pingpong_frames < 1:
             raise ValueError("fusion_anti_pingpong_frames must be >= 1")
         if cfg.fusion_anti_pingpong_distance_m < 0:
@@ -151,6 +211,12 @@ class GlobalTrackManager:
             raise ValueError("fusion_motion_measurement_tolerance_m must be >= 0")
         if cfg.fusion_trajectory_window_s <= 0:
             raise ValueError("fusion_trajectory_window_s must be > 0")
+        if cfg.fusion_trajectory_recency_half_life_s <= 0:
+            raise ValueError("fusion_trajectory_recency_half_life_s must be > 0")
+        if cfg.fusion_trajectory_min_acceleration_duration_s < 0:
+            raise ValueError(
+                "fusion_trajectory_min_acceleration_duration_s must be >= 0"
+            )
         trajectory_weights = (
             cfg.fusion_trajectory_position_weight,
             cfg.fusion_trajectory_velocity_weight,
@@ -183,12 +249,14 @@ class GlobalTrackManager:
         self.clock_estimator = CameraClockOffsetEstimator(cfg, reference)
         self.matcher = TrackletMatcher(cfg)
         self.metrics: defaultdict[str, int | float] = defaultdict(int)
+        self.last_accepted_observation_keys: set[TrackletKey] = set()
         self._next_gid = 1
         self._next_provisional_gid = -1
         self._event_mode_started = False
         self._event_start_ts_s: float | None = None
         self._max_event_ts_s = float("-inf")
         self._max_arrival_ts_s = float("-inf")
+        self._max_output_ts_s = float("-inf")
         self._last_match_run_s = float("-inf")
         self._instant_merge_votes: dict[tuple[int, int], tuple[int, float]] = {}
         self._duplicate_merge_votes: dict[tuple[int, int], tuple[int, float]] = {}
@@ -197,6 +265,7 @@ class GlobalTrackManager:
             TrackletKey, tuple[int, int, float]
         ] = {}
         self._anti_pingpong_locks: dict[TrackletKey, tuple[int, int, float]] = {}
+        self._appearance_conflict_votes: dict[TrackletKey, tuple[int, float]] = {}
         self._identity_event(
             "run_start",
             cameras=list(cfg.cameras),
@@ -225,6 +294,12 @@ class GlobalTrackManager:
             arrival_ts_s=arrival_ts_s,
             **fields,
         )
+
+    def _output_timestamp(self, event_ts_s: float, arrival_ts_s: float) -> float:
+        """Return the clock used only for freshness/publication decisions."""
+        if self.cfg.fusion_output_time_policy == "event":
+            return float(event_ts_s)
+        return float(arrival_ts_s)
 
     def close(self) -> None:
         self._diagnostics.close()
@@ -322,6 +397,30 @@ class GlobalTrackManager:
         if dt <= self.cfg.fusion_jump_window_s + 1e-9:
             allowed = min(allowed, self.cfg.fusion_max_jump_m)
         distance = float(np.linalg.norm(observed - predicted))
+        cutoff = float(timestamp_s) - self.cfg.fusion_jump_window_s
+        while (
+            track.accepted_positions
+            and track.accepted_positions[0][0] < cutoff - 1e-9
+        ):
+            track.accepted_positions.popleft()
+        rolling_distance = max(
+            (
+                float(np.linalg.norm(observed - point))
+                for sample_ts, point in track.accepted_positions
+                if sample_ts <= float(timestamp_s) + 1e-9
+            ),
+            default=0.0,
+        )
+        if rolling_distance > self.cfg.fusion_max_jump_m + 1e-9:
+            return MotionFeasibilityResult(
+                False,
+                "rolling_physical_jump",
+                dt,
+                rolling_distance,
+                float(self.cfg.fusion_max_jump_m),
+                float(uncertainty),
+                predicted.copy(),
+            )
         feasible = bool(
             np.isfinite(distance)
             and np.isfinite(allowed)
@@ -348,6 +447,8 @@ class GlobalTrackManager:
                 self.metrics["fusion_motion_gate_accepted"] += 1
             return
         self.metrics["fusion_motion_jump_rejected"] += 1
+        if result.reason == "rolling_physical_jump":
+            self.metrics["fusion_rolling_jump_rejected"] += 1
         self._identity_event(
             "motion_gate_rejected",
             event_ts_s=float(observation.capture_ts_s),
@@ -367,6 +468,73 @@ class GlobalTrackManager:
             predicted_xy=result.predicted_xy,
             observed_xy=observation.world_xy,
         )
+
+    def _appearance_ownership_status(
+        self,
+        key: TrackletKey,
+        track: GlobalTrack,
+        observation: CameraObservation,
+    ) -> str:
+        """Return ``accept``, ``defer`` or ``takeover`` for an owned local ID.
+
+        Only descriptors from the same camera are compared. A mismatch must be
+        consecutive before the old public owner is detached; until then the
+        observation is withheld rather than corrupting the canonical GID.
+        """
+        if not self.cfg.fusion_reconnect_appearance_enabled:
+            self._appearance_conflict_votes.pop(key, None)
+            return "accept"
+        prototype = track.appearance_by_camera.get(observation.camera)
+        similarity = appearance_similarity(prototype, observation.appearance)
+        if similarity is None:
+            self._appearance_conflict_votes.pop(key, None)
+            return "accept"
+        if (
+            similarity + 1e-9
+            >= self.cfg.fusion_reconnect_appearance_min_similarity
+        ):
+            self._appearance_conflict_votes.pop(key, None)
+            return "accept"
+
+        event_ts = float(observation.capture_ts_s)
+        previous_count, previous_ts = self._appearance_conflict_votes.get(
+            key, (0, float("-inf"))
+        )
+        consecutive = (
+            event_ts >= previous_ts - 1e-9
+            and event_ts - previous_ts
+            <= self.cfg.fusion_appearance_conflict_window_s + 1e-9
+        )
+        count = previous_count + 1 if consecutive else 1
+        self._appearance_conflict_votes[key] = (count, event_ts)
+        self.metrics["global_appearance_conflicts"] += 1
+        if count < self.cfg.fusion_appearance_conflict_confirmations:
+            self.metrics["global_appearance_conflicts_deferred"] += 1
+            self._identity_event(
+                "appearance_ownership_deferred",
+                event_ts_s=event_ts,
+                arrival_ts_s=observation.arrival_ts_s,
+                camera=observation.camera,
+                local_id=int(observation.local_id),
+                gid=track.gid,
+                similarity=similarity,
+                confirmations=count,
+            )
+            return "defer"
+
+        self._appearance_conflict_votes.pop(key, None)
+        self.metrics["global_ids_protected_from_local_takeover"] += 1
+        self._identity_event(
+            "appearance_ownership_takeover",
+            event_ts_s=event_ts,
+            arrival_ts_s=observation.arrival_ts_s,
+            camera=observation.camera,
+            local_id=int(observation.local_id),
+            protected_gid=track.gid,
+            similarity=similarity,
+            confirmations=count,
+        )
+        return "takeover"
 
     def step(
         self,
@@ -389,6 +557,7 @@ class GlobalTrackManager:
         arrival_timestamp_s: float | None,
     ) -> list[GlobalTrack]:
         self._duplicate_suppressed_gids.clear()
+        self.last_accepted_observation_keys.clear()
         for track in self.tracks.values():
             track.cameras = set()
 
@@ -398,8 +567,16 @@ class GlobalTrackManager:
         )
         if timestamp_s is not None:
             self._max_event_ts_s = max(self._max_event_ts_s, float(timestamp_s))
+            if self.cfg.fusion_output_time_policy == "event":
+                self._max_output_ts_s = max(
+                    self._max_output_ts_s, float(timestamp_s)
+                )
         if arrival_timestamp_s is not None:
             self._max_arrival_ts_s = max(self._max_arrival_ts_s, float(arrival_timestamp_s))
+            if self.cfg.fusion_output_time_policy == "arrival":
+                self._max_output_ts_s = max(
+                    self._max_output_ts_s, float(arrival_timestamp_s)
+                )
         if ordered:
             self._max_event_ts_s = max(self._max_event_ts_s, float(ordered[-1].capture_ts_s))
         if self._event_start_ts_s is None:
@@ -418,10 +595,27 @@ class GlobalTrackManager:
             arrival_ts = float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
             self._max_event_ts_s = max(self._max_event_ts_s, event_ts)
             self._max_arrival_ts_s = max(self._max_arrival_ts_s, arrival_ts)
+            self._max_output_ts_s = max(
+                self._max_output_ts_s,
+                self._output_timestamp(event_ts, arrival_ts),
+            )
             key = obs.camera, int(obs.local_id)
             mapped_gid = self.affinity.get(key)
             if mapped_gid is not None:
                 mapped_gid = self.resolve_gid(mapped_gid)
+            if mapped_gid is not None and mapped_gid in self.tracks:
+                ownership = self._appearance_ownership_status(
+                    key, self.tracks[mapped_gid], obs
+                )
+                if ownership == "defer":
+                    # Keep the canonical GID alive, but do not let one
+                    # inconsistent crop contaminate its motion or appearance.
+                    continue
+                if ownership == "takeover":
+                    self.affinity.pop(key, None)
+                    self.members[mapped_gid].discard(key)
+                    self.tracklets.reset(key)
+                    mapped_gid = None
             if mapped_gid is not None and mapped_gid in self.tracks:
                 feasibility = self._motion_feasibility(
                     self.tracks[mapped_gid], obs.world_xy, event_ts
@@ -450,6 +644,7 @@ class GlobalTrackManager:
                 self.metrics["late_observations_dropped"] += 1
                 continue
             accepted.append(obs)
+            self.last_accepted_observation_keys.add(key)
             changed_keys.add(key)
             gid = mapped_gid
             is_new = gid is None or self.resolve_gid(gid) not in self.tracks
@@ -573,9 +768,9 @@ class GlobalTrackManager:
             if self._publication_buffer_active(track):
                 self.metrics["provisional_publication_deferred"] += 1
                 continue
-            output_age = self._max_arrival_ts_s - (
-                track.last_arrival_ts_s
-                if track.last_arrival_ts_s is not None else track.last_seen_ts_s
+            output_age = self._max_output_ts_s - (
+                track.last_output_ts_s
+                if track.last_output_ts_s is not None else track.last_seen_ts_s
             )
             if output_age <= self.cfg.fusion_output_grace_s + 1e-9:
                 if not track.emitted:
@@ -646,9 +841,22 @@ class GlobalTrackManager:
             last_arrival_ts_s=(
                 float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
             ),
+            last_output_ts_s=self._output_timestamp(
+                event_ts,
+                float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts,
+            ),
             birth_near_boundary=bool(obs.near_boundary),
             birth_world_xy=np.asarray(obs.world_xy, dtype=float).copy(),
             camera_endpoints={obs.camera: self._endpoint_from_observation(obs)},
+            appearance_by_camera=(
+                {obs.camera: descriptor}
+                if (descriptor := normalize_descriptor(obs.appearance)) is not None
+                else {}
+            ),
+            accepted_positions=deque(
+                [(event_ts, np.asarray(obs.world_xy, dtype=float).copy())],
+                maxlen=512,
+            ),
         )
         self.tracks[gid] = track
         key = obs.camera, int(obs.local_id)
@@ -693,12 +901,28 @@ class GlobalTrackManager:
             if age_s + 1e-9 < self.cfg.fusion_provisional_min_age_s:
                 self.metrics["provisional_publication_deferred"] += 1
                 continue
-            last_arrival = (
-                track.last_arrival_ts_s
-                if track.last_arrival_ts_s is not None else track.last_seen_ts_s
+            last_output = (
+                track.last_output_ts_s
+                if track.last_output_ts_s is not None else track.last_seen_ts_s
             )
-            if self._max_arrival_ts_s - last_arrival > self.cfg.fusion_output_grace_s + 1e-9:
+            if self._max_output_ts_s - last_output > self.cfg.fusion_output_grace_s + 1e-9:
                 continue
+            if self.cfg.fusion_late_identity_binding_enabled:
+                reachable_gid = self._reachable_public_owner(
+                    track, self._max_event_ts_s
+                )
+                if reachable_gid is not None:
+                    max_defer_s = self.cfg.fusion_late_identity_max_defer_s
+                    if max_defer_s <= 0 or age_s + 1e-9 < max_defer_s:
+                        self.metrics["late_identity_binding_deferred"] += 1
+                        self._identity_event(
+                            "late_identity_binding_deferred",
+                            gid=track.gid,
+                            candidate_gid=reachable_gid,
+                            age_s=age_s,
+                        )
+                        continue
+                    self.metrics["late_identity_binding_timeout_releases"] += 1
             in_bootstrap = (
                 self._event_start_ts_s is not None
                 and track.created_at_s - self._event_start_ts_s
@@ -719,14 +943,27 @@ class GlobalTrackManager:
                         >= self.cfg.fusion_interior_birth_fallback_s
                         and self._verify_trajectory_plausibility(track)
                     )
-                    if (
-                        not fallback_ready
-                        or self._has_reachable_dormant_candidate(
+                    reachable_dormant = (
+                        fallback_ready
+                        and self._has_reachable_dormant_candidate(
                             track, self._max_event_ts_s
                         )
+                    )
+                    reachable_timeout = (
+                        self.cfg.fusion_reachable_dormant_max_defer_s > 0
+                        and age_s + 1e-9
+                        >= self.cfg.fusion_interior_birth_fallback_s
+                        + self.cfg.fusion_reachable_dormant_max_defer_s
+                    )
+                    if not fallback_ready or (
+                        reachable_dormant and not reachable_timeout
                     ):
                         self.metrics["new_gid_entry_deferred"] += 1
                         continue
+                    if reachable_dormant and reachable_timeout:
+                        self.metrics[
+                            "interior_birth_reachable_dormant_timeout_releases"
+                        ] += 1
                     self.metrics["interior_birth_fallbacks"] += 1
             capacity = self.cfg.fusion_fixed_population_size
             if capacity > 0 and public_slots >= capacity:
@@ -744,6 +981,46 @@ class GlobalTrackManager:
                 continue
             self._promote_provisional_gid(track.gid)
             public_slots += 1
+
+    def _reachable_public_owner(
+        self, provisional: GlobalTrack, event_ts: float
+    ) -> int | None:
+        """Return the best plausible public owner for a private fragment.
+
+        This is deliberately a defer-only test. A weakly plausible candidate
+        must never trigger an irreversible merge, but it should give the
+        normal reconnect/tracklet matchers enough time to collect evidence.
+        The defer is bounded by ``fusion_late_identity_max_defer_s``.
+        """
+        samples = self._ordered_track_samples(provisional)
+        observed = samples[-1][1] if samples else provisional.world_xy
+        candidates: list[tuple[float, int]] = []
+        retention_s = max(
+            self.cfg.fusion_identity_retention_s,
+            self.cfg.fusion_dormant_retention_s,
+        )
+        for gid, candidate in self.tracks.items():
+            if (
+                gid <= 0
+                or gid == provisional.gid
+                or self.resolve_gid(gid) != gid
+                or not candidate.emitted
+                or candidate.last_seen_ts_s is None
+                or event_ts - candidate.last_seen_ts_s > retention_s + 1e-9
+                or self._has_same_camera_conflict(gid, provisional.gid)
+            ):
+                continue
+            feasibility = self._motion_feasibility(candidate, observed, event_ts)
+            if (
+                feasibility.feasible
+                and feasibility.distance_m
+                <= self.cfg.fusion_kinematic_match_gate_m + 1e-9
+            ):
+                candidates.append((feasibility.distance_m, gid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
 
     def _has_reachable_dormant_candidate(
         self, provisional: GlobalTrack, event_ts: float
@@ -882,6 +1159,44 @@ class GlobalTrackManager:
             ]
         return [(timestamp, point.copy()) for timestamp, point in samples]
 
+    def _ordered_track_samples_with_confidence(
+        self,
+        track: GlobalTrack,
+        *,
+        reference_ts_s: float,
+        window_s: float,
+    ) -> list[tuple[float, np.ndarray, float]]:
+        raw: list[tuple[float, np.ndarray, float]] = []
+        for key in self.members.get(track.gid, ()):
+            history = self.tracklets.get(key)
+            if history is None:
+                continue
+            raw.extend(
+                (
+                    float(point.timestamp_s),
+                    np.asarray(point.xy, dtype=float).copy(),
+                    float(point.confidence),
+                )
+                for point in history.points
+            )
+        cutoff = float(reference_ts_s) - max(0.0, float(window_s))
+        grouped: defaultdict[float, list[tuple[np.ndarray, float]]] = defaultdict(list)
+        for timestamp, point, confidence in raw:
+            if (
+                cutoff - 1e-9 <= timestamp <= float(reference_ts_s) + 1e-9
+                and np.all(np.isfinite(point))
+                and np.isfinite(confidence)
+            ):
+                grouped[timestamp].append((point, confidence))
+        return [
+            (
+                timestamp,
+                np.mean([point for point, _confidence in values], axis=0),
+                float(np.mean([confidence for _point, confidence in values])),
+            )
+            for timestamp, values in sorted(grouped.items())
+        ]
+
     def _ordered_track_positions(self, track: GlobalTrack) -> list[np.ndarray]:
         """Return de-duplicated observed positions in temporal order."""
         samples = self._ordered_track_samples(track)
@@ -900,6 +1215,32 @@ class GlobalTrackManager:
     def _trajectory_motion(
         self, track: GlobalTrack, reference_ts_s: float
     ) -> TrajectoryMotion:
+        if self.cfg.fusion_robust_trajectory_motion_enabled:
+            weighted_samples = self._ordered_track_samples_with_confidence(
+                track,
+                reference_ts_s=reference_ts_s,
+                window_s=self.cfg.fusion_trajectory_window_s,
+            )
+            if len(weighted_samples) >= 2:
+                fit = fit_weighted_trajectory(
+                    [sample[0] for sample in weighted_samples],
+                    [sample[1] for sample in weighted_samples],
+                    [sample[2] for sample in weighted_samples],
+                    reference_ts_s=reference_ts_s,
+                    recency_half_life_s=(
+                        self.cfg.fusion_trajectory_recency_half_life_s
+                    ),
+                    min_acceleration_duration_s=(
+                        self.cfg.fusion_trajectory_min_acceleration_duration_s
+                    ),
+                )
+                return TrajectoryMotion(
+                    fit.velocity_xy,
+                    fit.acceleration_xy,
+                    len(weighted_samples),
+                    max(0.0, weighted_samples[-1][0] - weighted_samples[0][0]),
+                    fit.acceleration_reliable,
+                )
         samples = self._ordered_track_samples(
             track,
             reference_ts_s=reference_ts_s,
@@ -912,6 +1253,7 @@ class GlobalTrackManager:
                 np.zeros(2, dtype=float),
                 len(samples),
                 0.0,
+                False,
             )
 
         segment_velocities: list[tuple[float, np.ndarray]] = []
@@ -939,6 +1281,7 @@ class GlobalTrackManager:
             np.asarray(acceleration, dtype=float),
             len(samples),
             max(0.0, samples[-1][0] - samples[0][0]),
+            False,
         )
 
     def _latest_track_velocity(
@@ -1113,6 +1456,11 @@ class GlobalTrackManager:
         if not provisional_gids:
             return
 
+        self.metrics["dormant_match_cycles_attempted"] += 1
+        self.metrics["dormant_match_pairs_evaluated"] += (
+            len(dormant_gids) * len(provisional_gids)
+        )
+
         gate_m = self.cfg.fusion_kinematic_match_gate_m
         sentinel = 1e6
 
@@ -1153,9 +1501,11 @@ class GlobalTrackManager:
                     self.metrics["trajectory_matches_rejected"] += 1
                     continue
                 if (
-                    p_motion.samples >= 3
-                    and np.linalg.norm(p_motion.acceleration)
-                    > self.cfg.fusion_max_acceleration_mps2
+                    (p_motion.acceleration_reliable or d_motion.acceleration_reliable)
+                    and max(
+                        np.linalg.norm(p_motion.acceleration),
+                        np.linalg.norm(d_motion.acceleration),
+                    ) > self.cfg.fusion_max_acceleration_mps2
                 ):
                     self.metrics["trajectory_acceleration_rejected"] += 1
                     self.metrics["trajectory_matches_rejected"] += 1
@@ -1178,10 +1528,15 @@ class GlobalTrackManager:
                     dir_cost = max(0.0, 1.0 - cos_sim)
 
                 speed_diff = abs(d_speed - p_speed)
-                acceleration_diff = float(
-                    np.linalg.norm(
+                acceleration_diff = (
+                    float(np.linalg.norm(
                         d_motion.acceleration - p_motion.acceleration
+                    ))
+                    if (
+                        d_motion.acceleration_reliable
+                        and p_motion.acceleration_reliable
                     )
+                    else 0.0
                 )
                 cost = (
                     self.cfg.fusion_trajectory_position_weight * dist
@@ -1201,9 +1556,11 @@ class GlobalTrackManager:
                 }
 
         if not np.any(cost_matrix < sentinel):
+            self.metrics["dormant_match_cycles_without_acceptance"] += 1
             return
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        accepted_reconnects = 0
         for r, c in zip(row_ind, col_ind):
             cost = cost_matrix[r, c]
             if cost >= sentinel or spatial_matrix[r, c] > gate_m:
@@ -1280,6 +1637,10 @@ class GlobalTrackManager:
                     canonical_track.retirement_deferred = False
                 self.metrics["dormant_reconnects_accepted"] += 1
                 self.metrics["trajectory_matches_accepted"] += 1
+                accepted_reconnects += 1
+
+        if accepted_reconnects == 0:
+            self.metrics["dormant_match_cycles_without_acceptance"] += 1
 
     def _promote_provisional_gid(self, provisional_gid: int) -> int:
         provisional_gid = self.resolve_gid(provisional_gid)
@@ -1316,6 +1677,66 @@ class GlobalTrackManager:
                 published[key] = gid
         return published
 
+    def identity_hypotheses_snapshot(self) -> dict[int, np.ndarray]:
+        """Return fresh confirmed public and private identity hypotheses.
+
+        Negative IDs are intentionally included for bounded offline commit
+        buffers. They remain internal and are dropped unless a later promotion
+        or merge supplies a positive canonical alias before the frame commits.
+        """
+        hypotheses: dict[int, np.ndarray] = {}
+        for gid, track in self.tracks.items():
+            if (
+                self.resolve_gid(gid) != gid
+                or not track.confirmed
+                or track.last_seen_ts_s is None
+                or (gid > 0 and not track.emitted)
+                or gid in self._duplicate_suppressed_gids
+            ):
+                continue
+            last_output = (
+                track.last_output_ts_s
+                if track.last_output_ts_s is not None
+                else track.last_seen_ts_s
+            )
+            if (
+                self._max_output_ts_s - last_output
+                > self.cfg.fusion_output_grace_s + 1e-9
+            ):
+                continue
+            hypotheses[int(gid)] = np.asarray(track.world_xy, dtype=float).copy()
+        return hypotheses
+
+    def public_identity_tracks_snapshot(self) -> list[GlobalTrack]:
+        """Return retained public identities, including dormant identities."""
+        return [
+            track
+            for gid, track in sorted(self.tracks.items())
+            if (
+                gid > 0
+                and self.resolve_gid(gid) == gid
+                and track.confirmed
+                and track.emitted
+            )
+        ]
+
+    def render_tracks_snapshot(self) -> list[GlobalTrack]:
+        """Return observed public tracks plus optional occlusion predictions."""
+        identities = self.public_identity_tracks_snapshot()
+        if not self.cfg.render_occluded_tracks_enabled:
+            return [track for track in identities if bool(track.cameras)]
+        return [
+            track for track in identities
+            if (
+                bool(track.cameras)
+                or (
+                    track.last_seen_ts_s is not None
+                    and self._max_event_ts_s - track.last_seen_ts_s
+                    <= self.cfg.render_occluded_max_age_s + 1e-9
+                )
+            )
+        ]
+
     def _update_population_metrics(self) -> None:
         pending = sum(
             gid < 0 and self.resolve_gid(gid) == gid for gid in self.tracks
@@ -1345,6 +1766,7 @@ class GlobalTrackManager:
             xy=np.asarray(obs.world_xy, dtype=float).copy(),
             velocity=velocity,
             near_boundary=bool(obs.near_boundary),
+            appearance=normalize_descriptor(obs.appearance),
         )
 
     def _find_local_reconnect(
@@ -1363,20 +1785,26 @@ class GlobalTrackManager:
         if not candidates:
             return None
         candidates.sort()
-        best_cost, _best_distance, best_gid, best_is_long = candidates[0]
+        best = candidates[0]
         candidate_details = [
             {
-                "gid": gid,
-                "cost": cost,
-                "distance_m": distance,
-                "long_gap": is_long,
-                "emitted": self.tracks[gid].emitted,
-                "covariance_trace": float(np.trace(self.tracks[gid].kf.P)),
+                "gid": candidate.gid,
+                "cost": candidate.cost,
+                "distance_m": candidate.distance_m,
+                "long_gap": candidate.is_long_gap,
+                "appearance_similarity": candidate.appearance_similarity,
+                "stationary_appearance_supported": (
+                    candidate.stationary_appearance_supported
+                ),
+                "emitted": self.tracks[candidate.gid].emitted,
+                "covariance_trace": float(
+                    np.trace(self.tracks[candidate.gid].kf.P)
+                ),
             }
-            for cost, distance, gid, is_long in candidates[:3]
+            for candidate in candidates[:3]
         ]
         if len(candidates) > 1:
-            margin = candidates[1][0] - best_cost
+            margin = candidates[1].cost - best.cost
             if margin + 1e-9 < self.cfg.fusion_instant_margin_m:
                 self.metrics["local_reconnect_ambiguous"] += 1
                 self._identity_event(
@@ -1396,9 +1824,9 @@ class GlobalTrackManager:
                     velocity=self._stable_observation_velocity(obs),
                 )
                 return None
-        published_owner = self.tracks[best_gid].emitted
+        published_owner = self.tracks[best.gid].emitted
         requires_confirmation = (
-            best_is_long
+            best.is_long_gap
             or len(candidates) > 1
             or (
                 self.cfg.fusion_gid_ownership_hysteresis_enabled
@@ -1414,14 +1842,14 @@ class GlobalTrackManager:
             camera=obs.camera,
             local_id=int(obs.local_id),
             current_gid=excluded_gid,
-            selected_gid=best_gid,
+            selected_gid=best.gid,
             published_owner=published_owner,
             requires_confirmation=requires_confirmation,
             candidates=candidate_details,
             xy=obs.world_xy,
             velocity=self._stable_observation_velocity(obs),
         )
-        return best_gid, requires_confirmation
+        return best.gid, requires_confirmation
 
     def _local_reconnect_candidates(
         self,
@@ -1429,12 +1857,12 @@ class GlobalTrackManager:
         *,
         excluded_gid: int | None = None,
         excluded_gids: set[int] | None = None,
-    ) -> list[tuple[float, float, int, bool]]:
+    ) -> list[ReconnectCandidate]:
         """Return every statistically plausible same-camera predecessor."""
         event_ts = float(obs.capture_ts_s)
         excluded = excluded_gids or set()
         observation_velocity = self._stable_observation_velocity(obs)
-        candidates: list[tuple[float, float, int, bool]] = []
+        candidates: list[ReconnectCandidate] = []
         for gid, track in self.tracks.items():
             gid = self.resolve_gid(gid)
             if (
@@ -1451,11 +1879,23 @@ class GlobalTrackManager:
             if gap_s <= 1e-6 or gap_s > self.cfg.fusion_local_reconnect_long_window_s:
                 continue
             is_long_gap = gap_s > self.cfg.fusion_max_age_s
-            if is_long_gap and not (
+            descriptor_similarity = None
+            appearance_supported = False
+            if self.cfg.fusion_reconnect_appearance_enabled:
+                descriptor_similarity = appearance_similarity(
+                    endpoint.appearance, obs.appearance
+                )
+                if (
+                    descriptor_similarity is not None
+                    and descriptor_similarity + 1e-9
+                    < self.cfg.fusion_reconnect_appearance_min_similarity
+                ):
+                    self.metrics["local_reconnect_appearance_rejected"] += 1
+                    continue
+                appearance_supported = descriptor_similarity is not None
+            interior_long_gap = is_long_gap and not (
                 endpoint.near_boundary and obs.near_boundary
-            ):
-                self.metrics["long_reconnect_boundary_rejected"] += 1
-                continue
+            )
 
             feasibility = self._motion_feasibility(track, obs.world_xy, event_ts)
             self._record_motion_feasibility(track, obs, feasibility)
@@ -1503,6 +1943,7 @@ class GlobalTrackManager:
                     self.metrics["local_reconnect_covariance_gate_failed"] += 1
                     continue
 
+            previous_speed = current_speed = None
             if endpoint.velocity is not None and observation_velocity is not None:
                 previous_velocity = np.asarray(endpoint.velocity, dtype=float)
                 current_velocity = np.asarray(observation_velocity, dtype=float)
@@ -1532,17 +1973,37 @@ class GlobalTrackManager:
                         self.metrics["trajectory_matches_rejected"] += 1
                         continue
 
+            stationary_appearance_supported = bool(
+                self.cfg.fusion_stationary_reconnect_enabled
+                and appearance_supported
+                and previous_speed is not None
+                and current_speed is not None
+                and max(previous_speed, current_speed)
+                <= self.cfg.fusion_stationary_speed_mps + 1e-9
+                and gap_s
+                <= self.cfg.fusion_stationary_reconnect_max_gap_s + 1e-9
+            )
+            if interior_long_gap and not stationary_appearance_supported:
+                self.metrics["long_reconnect_boundary_rejected"] += 1
+                continue
+
             motion_cost = self._velocity_pair_cost(
                 endpoint.velocity,
                 observation_velocity,
-                require_evidence=is_long_gap,
+                require_evidence=(
+                    is_long_gap and not stationary_appearance_supported
+                ),
                 weight_s=self.cfg.fusion_local_reconnect_velocity_weight_s,
             )
             if motion_cost is None:
                 self.metrics["local_reconnect_motion_gate_failed"] += 1
                 continue
-            if is_long_gap and not self._reconnect_motion_compatible(
-                endpoint.velocity, observation_velocity
+            if (
+                is_long_gap
+                and not stationary_appearance_supported
+                and not self._reconnect_motion_compatible(
+                    endpoint.velocity, observation_velocity
+                )
             ):
                 self.metrics["long_reconnect_motion_rejected"] += 1
                 continue
@@ -1551,7 +2012,20 @@ class GlobalTrackManager:
             # Distance remains in metres for the ambiguity margin. NIS is a
             # small tie-breaker that favours the more certain prediction.
             cost = distance + motion_cost + 0.01 * np.sqrt(max(nis, 0.0))
-            candidates.append((cost, distance, gid, is_long_gap))
+            if descriptor_similarity is not None:
+                cost += self.cfg.fusion_reconnect_appearance_weight_m * (
+                    1.0 - descriptor_similarity
+                )
+            candidates.append(ReconnectCandidate(
+                cost=float(cost),
+                distance_m=distance,
+                gid=gid,
+                is_long_gap=is_long_gap,
+                appearance_similarity=descriptor_similarity,
+                stationary_appearance_supported=(
+                    stationary_appearance_supported
+                ),
+            ))
         return candidates
 
     def _batch_local_reconnect(
@@ -1584,7 +2058,7 @@ class GlobalTrackManager:
                     claimed.add(self.resolve_gid(match[0]))
             return result
 
-        row_candidates: list[list[tuple[float, float, int, bool]]] = []
+        row_candidates: list[list[ReconnectCandidate]] = []
         candidate_gids: set[int] = set()
         for obs, _key, gid, _is_new in eligible:
             candidates = self._local_reconnect_candidates(
@@ -1593,7 +2067,7 @@ class GlobalTrackManager:
                 excluded_gids=active_by_camera.get(obs.camera, set()),
             )
             row_candidates.append(candidates)
-            candidate_gids.update(candidate[2] for candidate in candidates)
+            candidate_gids.update(candidate.gid for candidate in candidates)
         if not candidate_gids:
             return {}
 
@@ -1601,12 +2075,12 @@ class GlobalTrackManager:
         column_by_gid = {gid: index for index, gid in enumerate(columns)}
         sentinel = 1e6
         matrix = np.full((len(eligible), len(columns)), sentinel, dtype=float)
-        details: dict[tuple[int, int], tuple[float, float, int, bool]] = {}
+        details: dict[tuple[int, int], ReconnectCandidate] = {}
         for row, candidates in enumerate(row_candidates):
             for candidate in candidates:
-                column = column_by_gid[candidate[2]]
-                if candidate[0] < matrix[row, column]:
-                    matrix[row, column] = candidate[0]
+                column = column_by_gid[candidate.gid]
+                if candidate.cost < matrix[row, column]:
+                    matrix[row, column] = candidate.cost
                     details[row, column] = candidate
 
         rows, assigned_columns = linear_sum_assignment(matrix)
@@ -1628,9 +2102,9 @@ class GlobalTrackManager:
             ambiguous = margin + 1e-9 < self.cfg.fusion_instant_margin_m
             if ambiguous:
                 self.metrics["local_reconnect_ambiguous"] += 1
-            published_owner = self.tracks[candidate[2]].emitted
+            published_owner = self.tracks[candidate.gid].emitted
             requires_confirmation = (
-                candidate[3]
+                candidate.is_long_gap
                 or ambiguous
                 or len(row_candidates[row]) > 1
                 or (
@@ -1638,7 +2112,9 @@ class GlobalTrackManager:
                     and published_owner
                 )
             )
-            assignments[eligible[row][1]] = (candidate[2], requires_confirmation)
+            assignments[eligible[row][1]] = (
+                candidate.gid, requires_confirmation
+            )
             self.metrics["batch_reconnect_assignments"] += 1
         return assignments
 
@@ -1746,6 +2222,8 @@ class GlobalTrackManager:
         track.last_seen_ts_s = max(track.last_seen_ts_s or event_ts, event_ts)
         arrival_ts = float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
         track.last_arrival_ts_s = max(track.last_arrival_ts_s or arrival_ts, arrival_ts)
+        output_ts = self._output_timestamp(event_ts, arrival_ts)
+        track.last_output_ts_s = max(track.last_output_ts_s or output_ts, output_ts)
         track.hits += 1
         track.misses = 0
         track.dormant = False
@@ -1753,6 +2231,15 @@ class GlobalTrackManager:
         track.retirement_deferred = False
         self.dormant_tracks.pop(track.gid, None)
         track.cameras.add(obs.camera)
+        descriptor = normalize_descriptor(obs.appearance)
+        if descriptor is not None:
+            updated = update_appearance_prototype(
+                track.appearance_by_camera.get(obs.camera),
+                descriptor,
+                alpha=self.cfg.fusion_appearance_update_alpha,
+            )
+            if updated is not None:
+                track.appearance_by_camera[obs.camera] = updated
         previous_endpoint = track.camera_endpoints.get(obs.camera)
         if (
             previous_endpoint is None
@@ -1761,6 +2248,20 @@ class GlobalTrackManager:
             track.camera_endpoints[obs.camera] = self._endpoint_from_observation(obs)
         if track.hits >= self.cfg.fusion_min_hits:
             track.confirmed = True
+        if (
+            not track.accepted_positions
+            or event_ts > track.accepted_positions[-1][0] + 1e-9
+        ):
+            track.accepted_positions.append((
+                event_ts,
+                np.asarray(obs.world_xy, dtype=float).copy(),
+            ))
+        elif abs(event_ts - track.accepted_positions[-1][0]) <= 1e-9:
+            previous_ts, previous_xy = track.accepted_positions[-1]
+            track.accepted_positions[-1] = (
+                previous_ts,
+                0.5 * (previous_xy + np.asarray(obs.world_xy, dtype=float)),
+            )
 
     def _match_tracklets(self) -> None:
         by_camera: defaultdict[str, list] = defaultdict(list)
@@ -1940,6 +2441,16 @@ class GlobalTrackManager:
                 left_clock.confidence >= self.cfg.offset_min_confidence
                 and right_clock.confidence >= self.cfg.offset_min_confidence
             )
+            if self.cfg.fusion_common_timestamp_instant_merge_enabled:
+                left_velocities = [
+                    self._stable_observation_velocity(item) for item in left_items
+                ]
+                right_velocities = [
+                    self._stable_observation_velocity(item) for item in right_items
+                ]
+            else:
+                left_velocities = [None] * len(left_items)
+                right_velocities = [None] * len(right_items)
             spatial = np.full((len(left_items), len(right_items)), 1e6, dtype=float)
             for row, left in enumerate(left_items):
                 for column, right in enumerate(right_items):
@@ -1950,7 +2461,35 @@ class GlobalTrackManager:
                         right_ts += self.clock_estimator.correction_at(right_camera, right_ts)
                     if abs(left_ts - right_ts) > self.cfg.fusion_event_time_gate_s:
                         continue
-                    world_distance = float(np.linalg.norm(left.world_xy - right.world_xy))
+                    left_xy = np.asarray(left.world_xy, dtype=float)
+                    right_xy = np.asarray(right.world_xy, dtype=float)
+                    if self.cfg.fusion_common_timestamp_instant_merge_enabled:
+                        reference_ts = max(left_ts, right_ts)
+                        left_velocity = left_velocities[row]
+                        right_velocity = right_velocities[column]
+                        left_scale = left_clock.scale if clocks_known else 1.0
+                        right_scale = right_clock.scale if clocks_known else 1.0
+                        left_velocity = (
+                            np.asarray(left_velocity, dtype=float)
+                            / max(left_scale, 1e-9)
+                            if left_velocity is not None
+                            else np.zeros(2, dtype=float)
+                        )
+                        right_velocity = (
+                            np.asarray(right_velocity, dtype=float)
+                            / max(right_scale, 1e-9)
+                            if right_velocity is not None
+                            else np.zeros(2, dtype=float)
+                        )
+                        left_xy = left_xy + left_velocity * (
+                            reference_ts - left_ts
+                        )
+                        right_xy = right_xy + right_velocity * (
+                            reference_ts - right_ts
+                        )
+                        if abs(left_ts - right_ts) > 1e-9:
+                            self.metrics["instant_common_time_predictions"] += 1
+                    world_distance = float(np.linalg.norm(left_xy - right_xy))
                     if world_distance > self.cfg.fusion_merge_m:
                         continue
                     spatial[row, column] = world_distance
@@ -2474,6 +3013,12 @@ class GlobalTrackManager:
             for value in (keep.last_arrival_ts_s, lose.last_arrival_ts_s)
             if value is not None
         )
+        output_times = [
+            value
+            for value in (keep.last_output_ts_s, lose.last_output_ts_s)
+            if value is not None
+        ]
+        keep.last_output_ts_s = max(output_times) if output_times else None
         keep.created_at_s = min(
             value for value in (keep.created_at_s, lose.created_at_s) if value is not None
         )
@@ -2513,8 +3058,32 @@ class GlobalTrackManager:
             current = keep.camera_endpoints.get(camera)
             if current is None or endpoint.timestamp_s > current.timestamp_s:
                 keep.camera_endpoints[camera] = endpoint
+        for camera, descriptor in lose.appearance_by_camera.items():
+            combined = update_appearance_prototype(
+                keep.appearance_by_camera.get(camera),
+                descriptor,
+                alpha=0.5,
+            )
+            if combined is not None:
+                keep.appearance_by_camera[camera] = combined
         keep.trail.extend(lose.trail)
         self._trim_trail(keep)
+        merged_positions: defaultdict[float, list[np.ndarray]] = defaultdict(list)
+        for timestamp, point in (
+            list(keep.accepted_positions) + list(lose.accepted_positions)
+        ):
+            merged_positions[float(timestamp)].append(
+                np.asarray(point, dtype=float)
+            )
+        keep.accepted_positions = deque(
+            [(
+                timestamp,
+                np.mean(points, axis=0),
+            )
+            for timestamp, points in sorted(merged_positions.items())
+            ],
+            maxlen=512,
+        )
 
         self.aliases[retired] = canonical
         self._alias_created_s[retired] = self._max_event_ts_s
@@ -2594,6 +3163,7 @@ class GlobalTrackManager:
                 self.members[gid].discard(key)
                 self._fragment_reconnect_votes.pop(key, None)
                 self._anti_pingpong_locks.pop(key, None)
+                self._appearance_conflict_votes.pop(key, None)
         for gid in list(self.members):
             if gid not in self.tracks:
                 del self.members[gid]
@@ -2669,6 +3239,7 @@ class GlobalTrackManager:
                     del self.affinity[key]
                     self._fragment_reconnect_votes.pop(key, None)
                     self._anti_pingpong_locks.pop(key, None)
+                    self._appearance_conflict_votes.pop(key, None)
             self.metrics["global_tracks_expired"] += 1
             self._identity_event(
                 "expiry",
@@ -2682,7 +3253,13 @@ class GlobalTrackManager:
             )
 
     def _has_exit_evidence(self, track: GlobalTrack) -> bool:
-        """True when a final observation was at a camera image boundary or in a world exit zone."""
+        """Return whether the latest multi-camera evidence supports a world exit.
+
+        An image boundary is only a camera-FOV boundary.  If another camera
+        observes the same GID in its interior at the same event time, retiring
+        the public identity would turn an ordinary handoff into a world exit.
+        Explicit world exit zones remain authoritative when configured.
+        """
         if track.last_seen_ts_s is None:
             return False
         if self.cfg.fusion_world_exit_zones:
@@ -2693,16 +3270,34 @@ class GlobalTrackManager:
             if abs(endpoint.timestamp_s - track.last_seen_ts_s)
             <= self.cfg.fusion_event_time_gate_s + 1e-9
         ]
-        return bool(latest) and any(endpoint.near_boundary for endpoint in latest)
+        return bool(latest) and all(endpoint.near_boundary for endpoint in latest)
 
     def metrics_snapshot(self) -> dict[str, int | float | dict[str, dict[str, float]]]:
         snapshot: dict = dict(self.metrics)
         snapshot.update({
             "tracklet_late_dropped": self.tracklets.metrics["late_dropped"],
             "tracklet_out_of_order_accepted": self.tracklets.metrics["out_of_order_accepted"],
+            "tracklet_segments_reset": self.tracklets.metrics["segments_reset"],
+            "tracklet_points_reset": self.tracklets.metrics["points_reset"],
             "tracklet_points": self.tracklets.metrics["points_stored"],
             "tracklet_bytes": self.tracklets.approximate_bytes,
             "retained_global_tracks": len(self.tracks),
+            "retained_occluded_global_tracks": sum(
+                int(track.emitted and track.confirmed and not track.cameras)
+                for track in self.tracks.values()
+            ),
+            "retained_appearance_prototypes": sum(
+                len(track.appearance_by_camera)
+                for track in self.tracks.values()
+            ),
+            "appearance_prototype_bytes": sum(
+                descriptor.nbytes
+                for track in self.tracks.values()
+                for descriptor in track.appearance_by_camera.values()
+            ),
+            "accepted_position_points": sum(
+                len(track.accepted_positions) for track in self.tracks.values()
+            ),
             "dormant_identity_count": len(self.dormant_tracks),
             "pending_provisional_tracks": sum(
                 gid < 0 and self.resolve_gid(gid) == gid for gid in self.tracks

@@ -3,7 +3,12 @@ import unittest
 import numpy as np
 
 from multicam_tracker.config import PipelineConfig
-from multicam_tracker.tracklets import CameraClockOffsetEstimator, TrackletMatcher, TrackletStore
+from multicam_tracker.tracklets import (
+    CameraClockOffsetEstimator,
+    ClockEstimate,
+    TrackletMatcher,
+    TrackletStore,
+)
 
 
 def _history(
@@ -126,6 +131,28 @@ class TrackletTests(unittest.TestCase):
         self.assertAlmostEqual(after.offset_s, before.offset_s, delta=0.05)
         self.assertGreater(after.scale, 1.0)
         self.assertGreater(after.confidence, 0.8)
+
+    def test_clock_learning_can_be_disabled_or_limited_to_offset(self) -> None:
+        fixed_cfg = PipelineConfig(clock_learning_enabled=False)
+        fixed = CameraClockOffsetEstimator(fixed_cfg, reference_camera="a")
+        for timestamp in (0.0, 5.0, 10.0):
+            fixed.observe("b", timestamp, 0.5 + 0.001 * timestamp, 0.9)
+        self.assertEqual(fixed.estimate("b"), ClockEstimate())
+
+        offset_cfg = PipelineConfig(
+            offset_max_drift_ppm=0.0,
+            offset_min_drift_span_s=1.0,
+        )
+        offset_only = CameraClockOffsetEstimator(
+            offset_cfg, reference_camera="a"
+        )
+        for timestamp in (0.0, 5.0, 10.0):
+            offset_only.observe(
+                "b", timestamp, 0.5 + 0.001 * timestamp, 0.9
+            )
+        estimate = offset_only.estimate("b")
+        self.assertEqual(estimate.scale, 1.0)
+        self.assertGreater(estimate.samples, 0)
 
 
 if __name__ == "__main__":

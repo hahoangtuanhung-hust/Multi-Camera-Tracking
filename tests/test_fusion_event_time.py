@@ -19,6 +19,7 @@ def _obs(
     xy: tuple[float, float],
     velocity: tuple[float, float] | None = None,
     near_boundary: bool = False,
+    appearance: np.ndarray | None = None,
 ):
     return CameraObservation(
         camera=camera,
@@ -31,6 +32,7 @@ def _obs(
             None if velocity is None else np.asarray(velocity, dtype=float)
         ),
         near_boundary=near_boundary,
+        appearance=appearance,
     )
 
 
@@ -200,6 +202,34 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertEqual(visible, [])
         self.assertIn(manager.affinity[("a", 1)], manager.tracks)
 
+    def test_offline_output_uses_event_time_not_processing_speed(self) -> None:
+        cfg = self._config(
+            fusion_output_grace_s=0.25,
+            fusion_output_time_policy="event",
+        )
+        fast = GlobalTrackManager(cfg)
+        slow = GlobalTrackManager(cfg)
+        fast_obs = _obs("a", 1, 1.0, (0.0, 0.0))
+        slow_obs = _obs("a", 1, 1.0, (0.0, 0.0))
+        fast_obs.arrival_ts_s = 10.0
+        slow_obs.arrival_ts_s = 1000.0
+
+        fast.step([fast_obs], timestamp_s=1.0, arrival_timestamp_s=10.0)
+        slow.step([slow_obs], timestamp_s=1.0, arrival_timestamp_s=1000.0)
+        fast_visible = fast.step(
+            [], timestamp_s=1.2, arrival_timestamp_s=10.2
+        )
+        slow_visible = slow.step(
+            [], timestamp_s=1.2, arrival_timestamp_s=1005.0
+        )
+
+        self.assertEqual([track.gid for track in fast_visible], [1])
+        self.assertEqual([track.gid for track in slow_visible], [1])
+
+    def test_invalid_output_time_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "output_time_policy"):
+            GlobalTrackManager(self._config(fusion_output_time_policy="wall_clock"))
+
     def test_confident_clock_enables_instant_geometry_for_short_tracks(self) -> None:
         manager = GlobalTrackManager(self._config())
         for timestamp in range(5):
@@ -210,6 +240,22 @@ class EventTimeFusionTests(unittest.TestCase):
         ])
         self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 7)])
         self.assertEqual(manager.metrics["instant_geometry_merges"], 1)
+
+    def test_instant_geometry_predicts_observations_to_common_timestamp(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            fusion_merge_m=0.20,
+            fusion_event_time_gate_s=0.50,
+            fusion_common_timestamp_instant_merge_enabled=True,
+        ))
+        manager.step([
+            _obs("a", 1, 1.0, (1.0, 0.0), (1.0, 0.0)),
+            _obs("b", 7, 1.4, (1.4, 0.0), (1.0, 0.0)),
+        ])
+
+        self.assertEqual(manager.affinity[("a", 1)], manager.affinity[("b", 7)])
+        self.assertEqual(manager.metrics["instant_geometry_merges"], 1)
+        self.assertGreater(manager.metrics["instant_common_time_predictions"], 0)
 
     def test_crossing_defers_opposite_motion_then_merges_after_separation(self) -> None:
         manager = GlobalTrackManager(self._config(
@@ -599,6 +645,157 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertEqual(manager.public_affinity_snapshot()[("a", 1)], 1)
         self.assertEqual(manager.metrics["public_gid_allocations"], 1)
 
+    def test_late_binding_defers_boundary_birth_with_reachable_public_owner(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.1,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_late_identity_binding_enabled=True,
+            fusion_late_identity_max_defer_s=1.0,
+            fusion_new_gid_entry_required=True,
+            fusion_new_gid_bootstrap_s=0.0,
+            fusion_batch_reconnect_enabled=False,
+            fusion_local_reconnect_gate_m=0.05,
+            fusion_instant_merge_enabled=False,
+            tracklet_match_interval_s=10.0,
+        ))
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0), near_boundary=True)])
+        manager.step([_obs("a", 1, 0.1, (0.1, 0.0), near_boundary=True)])
+        original_gid = manager.affinity[("a", 1)]
+        self.assertGreater(original_gid, 0)
+
+        manager.step([_obs("a", 2, 0.3, (0.3, 0.0), near_boundary=True)])
+        manager.step([_obs("a", 2, 0.5, (0.5, 0.0), near_boundary=True)])
+
+        self.assertLess(manager.affinity[("a", 2)], 0)
+        self.assertEqual(manager.metrics["public_gid_allocations"], 1)
+        self.assertGreater(manager.metrics["late_identity_binding_deferred"], 0)
+
+        manager.step([_obs("a", 2, 1.4, (1.4, 0.0), near_boundary=True)])
+
+        self.assertGreater(manager.affinity[("a", 2)], 0)
+        self.assertEqual(manager.metrics["public_gid_allocations"], 2)
+        self.assertEqual(
+            manager.metrics["late_identity_binding_timeout_releases"], 1
+        )
+
+    def test_appearance_mismatch_protects_public_gid_from_local_id_takeover(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_reconnect_appearance_enabled=True,
+            fusion_appearance_conflict_confirmations=2,
+            fusion_appearance_conflict_window_s=0.35,
+            fusion_batch_reconnect_enabled=False,
+            fusion_instant_merge_enabled=False,
+            tracklet_match_interval_s=10.0,
+        ))
+        red = np.array([1.0, 0.0, 0.0])
+        blue = np.array([0.0, 1.0, 0.0])
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0), appearance=red)])
+        original_gid = manager.affinity[("a", 1)]
+        original_position = manager.tracks[original_gid].world_xy.copy()
+
+        manager.step([_obs("a", 1, 0.1, (0.1, 0.0), appearance=blue)])
+        self.assertEqual(manager.affinity[("a", 1)], original_gid)
+        np.testing.assert_allclose(
+            manager.tracks[original_gid].world_xy, original_position
+        )
+
+        manager.step([_obs("a", 1, 0.2, (0.2, 0.0), appearance=blue)])
+
+        replacement_gid = manager.affinity[("a", 1)]
+        self.assertNotEqual(replacement_gid, original_gid)
+        self.assertIn(original_gid, manager.tracks)
+        np.testing.assert_allclose(
+            manager.tracks[original_gid].world_xy, original_position
+        )
+        self.assertEqual(
+            manager.metrics["global_ids_protected_from_local_takeover"], 1
+        )
+        self.assertEqual(manager.tracklets.metrics["segments_reset"], 1)
+
+    def test_stationary_interior_fragment_reconnects_by_same_camera_appearance(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_max_age_s=0.2,
+            fusion_identity_retention_s=0.2,
+            fusion_dormant_retention_s=2.0,
+            fusion_retire_requires_exit_boundary=True,
+            fusion_local_reconnect_window_s=0.2,
+            fusion_local_reconnect_long_window_s=2.0,
+            fusion_local_reconnect_confirmations=2,
+            fusion_reconnect_appearance_enabled=True,
+            fusion_stationary_reconnect_enabled=True,
+            fusion_stationary_reconnect_max_gap_s=2.0,
+            fusion_batch_reconnect_enabled=False,
+            fusion_instant_merge_enabled=False,
+            tracklet_match_interval_s=10.0,
+        ))
+        red = np.array([1.0, 0.0, 0.0])
+        manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), (0.0, 0.0), appearance=red)
+        ])
+        manager.step([
+            _obs("a", 1, 0.1, (0.0, 0.0), (0.0, 0.0), appearance=red)
+        ])
+        original_gid = manager.affinity[("a", 1)]
+        manager.step([], timestamp_s=0.4, arrival_timestamp_s=0.4)
+        self.assertTrue(manager.tracks[original_gid].dormant)
+
+        manager.step([
+            _obs("a", 2, 0.5, (0.0, 0.0), (0.0, 0.0), appearance=red)
+        ])
+        self.assertNotEqual(
+            manager.resolve_gid(manager.affinity[("a", 2)]), original_gid
+        )
+        manager.step([
+            _obs("a", 2, 0.6, (0.0, 0.0), (0.0, 0.0), appearance=red)
+        ])
+
+        self.assertEqual(
+            manager.resolve_gid(manager.affinity[("a", 2)]), original_gid
+        )
+        self.assertEqual(manager.metrics["local_fragments_reconnected"], 1)
+
+    def test_global_identity_retention_is_separate_from_render_window(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_max_age_s=0.2,
+            fusion_identity_retention_s=0.2,
+            fusion_dormant_retention_s=3.0,
+            fusion_retire_requires_exit_boundary=True,
+            fusion_output_grace_s=0.1,
+            render_occluded_tracks_enabled=True,
+            render_occluded_max_age_s=0.6,
+        ))
+        manager.step([_obs("a", 1, 0.0, (0.0, 0.0))])
+        gid = manager.affinity[("a", 1)]
+
+        visible = manager.step([], timestamp_s=0.4, arrival_timestamp_s=0.4)
+
+        self.assertEqual(visible, [])
+        self.assertEqual(
+            [track.gid for track in manager.public_identity_tracks_snapshot()],
+            [gid],
+        )
+        self.assertEqual(
+            [track.gid for track in manager.render_tracks_snapshot()], [gid]
+        )
+        self.assertFalse(manager.render_tracks_snapshot()[0].cameras)
+
+        manager.step([], timestamp_s=0.8, arrival_timestamp_s=0.8)
+
+        self.assertEqual(manager.render_tracks_snapshot(), [])
+        self.assertEqual(
+            [track.gid for track in manager.public_identity_tracks_snapshot()],
+            [gid],
+        )
+
     def test_fragments_reconnect_inside_buffer_before_one_public_gid_is_allocated(self) -> None:
         manager = GlobalTrackManager(self._config(
             cameras=["a"],
@@ -739,6 +936,33 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertNotIn(exiting_gid, exiting.tracks)
         self.assertEqual(exiting.metrics["confirmed_identity_exits"], 1)
 
+    def test_camera_boundary_handoff_is_not_a_world_exit(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a", "b"],
+            tracklet_history_s=0.1,
+            tracklet_late_drop_s=0.1,
+            fusion_max_age_s=0.2,
+            fusion_identity_retention_s=0.2,
+            fusion_min_hits=1,
+            fusion_retire_requires_exit_boundary=True,
+            fusion_forced_retire_s=0.0,
+            fusion_instant_confirmations=1,
+            fusion_published_merge_confirmations=1,
+        ))
+        for timestamp in (0.0, 0.1):
+            manager.step([
+                _obs("a", 1, timestamp, (timestamp, 0.0), near_boundary=True),
+                _obs("b", 7, timestamp, (timestamp, 0.0), near_boundary=False),
+            ])
+
+        gid = manager.resolve_gid(manager.affinity[("a", 1)])
+        self.assertEqual(gid, manager.resolve_gid(manager.affinity[("b", 7)]))
+        manager.step([], timestamp_s=0.5, arrival_timestamp_s=0.5)
+
+        self.assertIn(gid, manager.tracks)
+        self.assertEqual(manager.metrics["confirmed_identity_exits"], 0)
+        self.assertEqual(manager.metrics["retirement_deferred_no_exit"], 1)
+
     def test_clear_published_pair_uses_confirmation_when_motion_is_noisy(self) -> None:
         manager = GlobalTrackManager(self._config(
             cameras=["a", "b"],
@@ -844,6 +1068,24 @@ class EventTimeFusionTests(unittest.TestCase):
 
         self.assertEqual(manager.tracks[gid].state_timestamp_s, 0.0)
         self.assertEqual(manager.metrics["fusion_motion_jump_rejected"], 1)
+
+    def test_rolling_jump_cap_rejects_many_small_steps_over_one_window(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_instant_merge_enabled=False,
+            fusion_max_speed_mps=100.0,
+            fusion_max_acceleration_mps2=100.0,
+            fusion_motion_uncertainty_sigma=100.0,
+            fusion_motion_measurement_tolerance_m=100.0,
+            fusion_jump_window_s=1.0,
+            fusion_max_jump_m=2.0,
+        ))
+        for index, x in enumerate((0.0, 0.4, 0.8, 1.2, 1.6, 2.01)):
+            manager.step([_obs("a", 1, index * 0.1, (x, 0.0))])
+
+        gid = manager.affinity[("a", 1)]
+        self.assertAlmostEqual(manager.tracks[gid].last_seen_ts_s, 0.4)
+        self.assertEqual(manager.metrics["fusion_rolling_jump_rejected"], 1)
 
     def test_physical_gate_uses_irregular_capture_time_delta(self) -> None:
         def build() -> GlobalTrackManager:
@@ -959,6 +1201,40 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertEqual(len(visible), 1)
         self.assertEqual(manager.metrics["interior_birth_fallbacks"], 1)
 
+    def test_reachable_dormant_cannot_block_interior_birth_forever(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_provisional_buffer_enabled=True,
+            fusion_provisional_min_age_s=0.10,
+            fusion_deferred_gid_allocation_enabled=True,
+            fusion_new_gid_entry_required=True,
+            fusion_new_gid_bootstrap_s=0.0,
+            fusion_interior_birth_fallback_s=0.20,
+            fusion_reachable_dormant_max_defer_s=0.30,
+            fusion_trajectory_min_points=2,
+            fusion_trajectory_min_duration_s=0.10,
+            fusion_instant_merge_enabled=False,
+        ))
+        manager.step([], timestamp_s=0.0, arrival_timestamp_s=0.0)
+
+        with patch.object(
+            manager, "_has_reachable_dormant_candidate", return_value=True
+        ):
+            manager.step([_obs("a", 1, 0.2, (0.0, 0.0))])
+            manager.step([_obs("a", 1, 0.4, (0.1, 0.0))])
+            self.assertLess(manager.affinity[("a", 1)], 0)
+            visible = manager.step([_obs("a", 1, 0.8, (0.3, 0.0))])
+
+        self.assertGreater(manager.affinity[("a", 1)], 0)
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(
+            manager.metrics[
+                "interior_birth_reachable_dormant_timeout_releases"
+            ],
+            1,
+        )
+
     def test_dormant_identity_reconnected_via_kinematic_matching(self) -> None:
         manager = GlobalTrackManager(self._config(
             cameras=["a"],
@@ -994,6 +1270,10 @@ class EventTimeFusionTests(unittest.TestCase):
         # Kinematic matching should awaken and reconnect to original_gid
         self.assertEqual(manager.resolve_gid(manager.affinity[("a", 2)]), original_gid)
         self.assertEqual(manager.metrics["dormant_reconnects_accepted"], 1)
+        self.assertGreater(manager.metrics["dormant_match_cycles_attempted"], 0)
+        self.assertEqual(
+            manager.metrics["dormant_match_cycles_without_acceptance"], 0
+        )
         self.assertNotIn(original_gid, manager.dormant_tracks)
         self.assertEqual(
             manager.metrics["public_gid_allocations"],
@@ -1033,6 +1313,10 @@ class EventTimeFusionTests(unittest.TestCase):
         self.assertLess(manager.affinity[("a", 2)], 0)
         self.assertGreater(manager.metrics["trajectory_direction_rejected"], 0)
         self.assertEqual(manager.metrics["dormant_reconnects_accepted"], 0)
+        self.assertGreater(manager.metrics["dormant_match_cycles_attempted"], 0)
+        self.assertGreater(
+            manager.metrics["dormant_match_cycles_without_acceptance"], 0
+        )
 
     def test_entry_gate_uses_birth_point_not_later_position(self) -> None:
         manager = GlobalTrackManager(self._config(

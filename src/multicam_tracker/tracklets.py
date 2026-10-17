@@ -194,6 +194,16 @@ class TrackletStore:
     def get(self, key: TrackletKey) -> TrackletHistory | None:
         return self.histories.get(key)
 
+    def reset(self, key: TrackletKey) -> None:
+        """Start a new trajectory segment for a reused local tracker ID."""
+        history = self.histories.pop(key, None)
+        if history is None:
+            return
+        removed = len(history.points)
+        self.metrics["points_stored"] -= removed
+        self.metrics["segments_reset"] += 1
+        self.metrics["points_reset"] += removed
+
     def eligible(self) -> list[TrackletHistory]:
         return [
             history
@@ -436,6 +446,8 @@ class CameraClockOffsetEstimator:
     ) -> ClockEstimate:
         if camera == self.reference_camera:
             return self._estimates[camera]
+        if not self.cfg.clock_learning_enabled:
+            return self.estimate(camera)
         if match_confidence < self.cfg.offset_min_confidence:
             return self.estimate(camera)
         if abs(correction_s) > self.cfg.max_camera_offset_s:

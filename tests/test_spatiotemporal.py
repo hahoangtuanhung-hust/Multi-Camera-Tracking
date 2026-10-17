@@ -13,6 +13,7 @@ from multicam_tracker.spatiotemporal import (
     estimate_ground_plane_location,
     get_ground_plane_location,
     reassignment_confidence,
+    fit_weighted_trajectory,
     spatial_consistency_distance,
 )
 
@@ -83,6 +84,32 @@ class TopDownProjectionTests(unittest.TestCase):
 
 
 class SlidingWindowSmoothingTests(unittest.TestCase):
+    def test_robust_fit_downweights_an_accepted_history_outlier(self) -> None:
+        fit = fit_weighted_trajectory(
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [8.0, 0.0], [4.0, 0.0], [5.0, 0.0]],
+            [1.0] * 6,
+            reference_ts_s=5.0,
+            recency_half_life_s=10.0,
+            min_acceleration_duration_s=10.0,
+        )
+
+        self.assertAlmostEqual(fit.velocity_xy[0], 1.0, delta=0.20)
+        self.assertFalse(fit.acceleration_reliable)
+
+    def test_acceleration_requires_temporal_support(self) -> None:
+        fit = fit_weighted_trajectory(
+            [0.0, 0.1, 0.2, 0.3],
+            [[0.0, 0.0], [0.01, 0.0], [0.04, 0.0], [0.09, 0.0]],
+            [1.0] * 4,
+            reference_ts_s=0.3,
+            recency_half_life_s=0.75,
+            min_acceleration_duration_s=1.0,
+        )
+
+        self.assertFalse(fit.acceleration_reliable)
+        np.testing.assert_array_equal(fit.acceleration_xy, np.zeros(2))
+
     def test_weighted_window_rejects_sudden_outlier(self) -> None:
         smoother = SlidingWindowTrajectorySmoother(
             window_s=1.0,
@@ -103,6 +130,23 @@ class SlidingWindowSmoothingTests(unittest.TestCase):
         recovered = smoother.update(("a", 1), 0.3, [0.3, 0.0])
         self.assertTrue(recovered.accepted)
         self.assertEqual(recovered.sample_count, 3)
+
+    def test_clipped_motion_cannot_make_an_impossible_segment_valid(self) -> None:
+        smoother = SlidingWindowTrajectorySmoother(
+            window_s=3.0,
+            recency_half_life_s=1.0,
+            outlier_gate_m=100.0,
+            max_speed_mps=1.0,
+            max_acceleration_mps2=4.0,
+            max_jump_m=100.0,
+        )
+        smoother.update(("a", 1), 0.0, [0.0, 0.0])
+        impossible = smoother.update(("a", 1), 1.0, [10.0, 0.0])
+
+        self.assertFalse(impossible.accepted)
+        self.assertEqual(impossible.sample_count, 1)
+        self.assertEqual(smoother.metrics["speed_limit_rejected"], 1)
+        np.testing.assert_allclose(impossible.smoothed_xy, [0.0, 0.0])
 
     def test_weighted_regression_estimates_velocity_and_acceleration(self) -> None:
         linear = SlidingWindowTrajectorySmoother(
