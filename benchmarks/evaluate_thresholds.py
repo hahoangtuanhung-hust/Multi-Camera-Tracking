@@ -6,9 +6,6 @@ import argparse
 from dataclasses import replace
 from pathlib import Path
 
-import numpy as np
-from scipy.optimize import linear_sum_assignment
-
 from multicam_tracker.config import PipelineConfig
 from multicam_tracker.demo import run_pipeline
 from multicam_tracker.evaluate import MATCH_GATE_M, ground_truth_by_frame
@@ -16,28 +13,11 @@ from multicam_tracker.fusion import GlobalTrackManager
 from multicam_tracker.mot_metrics import evaluate_mot
 
 
-def _score(predictions, gt_frames):
-    best_offset, best_rmse = 0, float("inf")
-    for offset in (0, 1, 2):
-        errors = []
-        for frame_index, predictions_at_frame in predictions[:100]:
-            gt = gt_frames.get(frame_index + offset, {})
-            if not gt or not predictions_at_frame:
-                continue
-            gt_xy = np.array(list(gt.values()))
-            pred_xy = np.array(list(predictions_at_frame.values()))
-            distance = np.linalg.norm(gt_xy[:, None] - pred_xy[None, :], axis=2)
-            for row, column in zip(*linear_sum_assignment(distance)):
-                if distance[row, column] < MATCH_GATE_M:
-                    errors.append(float(distance[row, column]))
-        if errors and np.sqrt(np.mean(np.square(errors))) < best_rmse:
-            best_offset = offset
-            best_rmse = float(np.sqrt(np.mean(np.square(errors))))
-
+def _score(predictions, gt_frames, frame_offset: int = 0):
     metrics = evaluate_mot(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=MATCH_GATE_M,
     )
     return {
@@ -71,6 +51,7 @@ def main() -> None:
         device=args.device,
         timestamp_fusion_enabled=False,
         async_ingest=False,
+        fusion_output_time_policy="event",
         # Keep local detections/track IDs identical while replaying only the
         # global-fusion feature flags below.
         track_motion_association_enabled=False,

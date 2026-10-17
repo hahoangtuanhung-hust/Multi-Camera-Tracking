@@ -19,16 +19,17 @@ import psutil
 import torch
 
 from multicam_tracker.config import (
-    PipelineConfig,
     TRACKING_PROFILE_OVERRIDES,
     DEFAULT_TRACKING_PROFILE,
-    apply_tracking_profile,
+    build_effective_config,
 )
 from multicam_tracker.demo import run_pipeline
 from multicam_tracker.detection_cache import build_detection_cache_metadata
 from multicam_tracker.detector import PersonDetector
 from multicam_tracker.evaluate import ground_truth_by_frame
+from multicam_tracker.identity_commit import IdentityCommitBuffer, append_committed_frames
 from multicam_tracker.local_tracker import LOCAL_TRACKERS
+from multicam_tracker.reporting import build_run_metadata
 from evaluate_thresholds import _score
 
 def main() -> None:
@@ -47,15 +48,20 @@ def main() -> None:
     parser.add_argument(
         "--local-tracker",
         choices=LOCAL_TRACKERS,
-        default="ocsort",
-        help="Per-camera tracker (default: ocsort)",
+        default=None,
+        help="Explicit per-camera tracker override (default: selected profile)",
     )
     parser.add_argument("--capture-detections", type=Path,
                         help="Save compact detection/packet metadata for offline regression replay")
     args = parser.parse_args()
-    cfg = PipelineConfig(device="cpu", stride=1, async_ingest=False)
-    apply_tracking_profile(cfg, args.tracking_profile)
-    cfg.local_tracker = args.local_tracker
+    cfg = build_effective_config(
+        device="cpu",
+        stride=1,
+        async_ingest=False,
+        fusion_output_time_policy="event",
+        profile=args.tracking_profile,
+        local_tracker=args.local_tracker,
+    )
     if args.cameras:
         cfg.cameras = args.cameras
     if args.threads is not None and hasattr(cfg, "cpu_threads"):
@@ -88,6 +94,8 @@ def main() -> None:
     warm_started = None
     warm_ticks = 0
     last_metrics = {}
+    committed_sources = {}
+    identity_committer = IdentityCommitBuffer(cfg.fusion_identity_commit_delay_s)
     for tick in run_pipeline(cfg, max_frames=args.frames, detector=detector):
         if args.capture_detections:
             replay.append({
@@ -96,9 +104,9 @@ def main() -> None:
                             for camera, packet in tick["packets"].items()},
                 "detections": last_detections,
             })
-        predictions.append((tick["frame_index"], {
-            track.gid: track.world_xy.copy() for track in tick["global_tracks"]
-        }))
+        append_committed_frames(
+            identity_committer.push_tick(tick), predictions, committed_sources
+        )
         last_metrics = tick["metrics"]
         if tick["tick_index"] == 10:
             warm_started = perf_counter()
@@ -111,6 +119,8 @@ def main() -> None:
                   f"elapsed={perf_counter()-started:.1f}s RSS={rss:.1f}MiB "
                   f"merges={last_metrics.get('global_id_merges', 0)} "
                   f"late_drop={last_metrics.get('tracklet_late_dropped', 0)}", flush=True)
+    append_committed_frames(identity_committer.flush(), predictions, committed_sources)
+    last_metrics.update(identity_committer.metrics)
     elapsed = perf_counter() - started
     if args.capture_detections:
         args.capture_detections.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +153,7 @@ def main() -> None:
         "people_last": len(predictions[-1][1]) if predictions else 0,
         "score": _score(predictions, gt), "metrics": last_metrics,
         "threads": {"torch": torch.get_num_threads(), "opencv": cv2.getNumThreads()},
+        "run_metadata": build_run_metadata(cfg),
         "errors": [],
     }
     args.out.write_text(json.dumps(summary, indent=2), encoding="utf-8")

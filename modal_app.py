@@ -10,8 +10,8 @@ Later runs reuse the persistent Volume:
 
 Evaluate a longer sequence and save the returned metrics locally:
 
-    modal run modal_app.py --evaluate --max-frames 1800 \
-        --tracking-profile identity-v1-drift-guard \
+    modal run modal_app.py --evaluate --max-frames 4000 \
+        --tracking-profile hybridsort-crowd-recovery \
         --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
         --metrics-out mot-metrics.json
 
@@ -22,6 +22,7 @@ on the T4 container's CPU.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import subprocess
 import uuid
@@ -56,9 +57,26 @@ def _local_git_value(*args: str) -> str:
     return result.stdout.strip()
 
 
+def _local_source_fingerprint() -> str:
+    """Hash the exact Python/config source mounted into the Modal worker."""
+    root = Path(__file__).resolve().parent
+    paths = [root / "modal_app.py", root / "pyproject.toml", root / "uv.lock"]
+    paths.extend(sorted((root / "src" / "multicam_tracker").glob("*.py")))
+    digest = hashlib.sha256()
+    for path in paths:
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 _SOURCE_GIT_SHA = _local_git_value("rev-parse", "HEAD")
 _SOURCE_GIT_BRANCH = _local_git_value("branch", "--show-current")
 _SOURCE_GIT_DIRTY = "1" if _local_git_value("status", "--porcelain") else "0"
+_SOURCE_TREE_SHA256 = _local_source_fingerprint()
 
 # uv_sync installs the exact project lockfile. Source is mounted separately so
 # code-only changes do not rebuild the large PyTorch/Ultralytics image layer.
@@ -70,6 +88,7 @@ gpu_image = (
         "SOURCE_GIT_SHA": _SOURCE_GIT_SHA,
         "SOURCE_GIT_BRANCH": _SOURCE_GIT_BRANCH,
         "SOURCE_GIT_DIRTY": _SOURCE_GIT_DIRTY,
+        "SOURCE_TREE_SHA256": _SOURCE_TREE_SHA256,
     })
     # Modal local mounts must be the final image operation. Keeping this last
     # also avoids rebuilding dependency layers for source-only changes.
@@ -182,6 +201,7 @@ def evaluate_on_t4(
     output_name: str,
     max_frames: int = 1200,
     match_gate_m: float = 1.0,
+    frame_offset: int = 0,
     metric_window_frames: int = 500,
     cumulative_frames: list[int] | None = None,
     cameras: list[str] | None = None,
@@ -190,18 +210,20 @@ def evaluate_on_t4(
     seed: int = 0,
 ) -> dict[str, object]:
     """Run the full tracker on CUDA and return world-plane MOT metrics."""
-    from collections import defaultdict
     import json
     import time
 
     import numpy as np
     import torch
 
-    from multicam_tracker.config import PipelineConfig, apply_tracking_profile
+    from multicam_tracker.config import build_effective_config
     from multicam_tracker.demo import run_pipeline
+    from multicam_tracker.identity_commit import (
+        IdentityCommitBuffer,
+        append_committed_frames,
+    )
     from multicam_tracker.evaluate import (
         _classify_switch_events,
-        _match_errors,
         ground_truth_by_frame,
     )
     from multicam_tracker.mot_metrics import (
@@ -211,6 +233,10 @@ def evaluate_on_t4(
         identity_trajectory_diagnostics,
     )
     from multicam_tracker.reporting import build_run_metadata, configure_determinism
+    from multicam_tracker.stage_diagnostics import (
+        PipelineStageDiagnostics,
+        load_bbox_ground_truth,
+    )
 
     if not torch.cuda.is_available():
         raise RuntimeError("Modal assigned a GPU, but PyTorch CUDA is unavailable")
@@ -218,6 +244,8 @@ def evaluate_on_t4(
         raise ValueError("max_frames must be > 0")
     if not np.isfinite(match_gate_m) or match_gate_m <= 0:
         raise ValueError("match_gate_m must be a finite positive number")
+    if frame_offset not in (0, 1, 2):
+        raise ValueError("frame_offset must be 0, 1, or 2")
     if metric_window_frames <= 0:
         raise ValueError("metric_window_frames must be > 0")
     if expected_people is not None and expected_people < 0:
@@ -246,12 +274,13 @@ def evaluate_on_t4(
             f"Missing {model_path}. Run once with `modal run modal_app.py --upload`."
         )
 
-    cfg = PipelineConfig(
+    cfg = build_effective_config(
         data_root=data_root,
         device="cuda",
         async_ingest=False,
+        fusion_output_time_policy="event",
+        profile=tracking_profile,
     )
-    apply_tracking_profile(cfg, tracking_profile)
     if expected_people is not None:
         cfg.fusion_fixed_population_size = expected_people
     cfg.model_name = str(model_path)
@@ -271,61 +300,67 @@ def evaluate_on_t4(
         cfg.camera_start_frame_offsets,
         max_frame=max_frames + 3,
     )
+    bbox_gt_frames = load_bbox_ground_truth(
+        cfg.scene_dir,
+        cfg.cameras,
+        cfg.camera_start_frame_offsets,
+        max_frame=max_frames + 3,
+    )
+    stage_diagnostics = PipelineStageDiagnostics(
+        bbox_gt_frames,
+        stride=cfg.stride,
+        segment_frames=metric_window_frames,
+        pipeline_detection_threshold=cfg.conf_threshold,
+        confidence_source_floor=cfg.conf_threshold,
+    )
     predictions: list[tuple[int, dict[int, np.ndarray]]] = []
     source_maps: dict[int, dict[int, list[tuple[str, int]]]] = {}
-    track_exists_not_output = 0
+    no_public_affinity = 0
+    provisional_affinity = 0
+    public_affinity_not_output = 0
     last_pipeline_metrics: dict[str, object] = {}
+    identity_committer = IdentityCommitBuffer(cfg.fusion_identity_commit_delay_s)
     started = time.perf_counter()
     for tick in run_pipeline(cfg, max_frames=max_frames):
-        predictions.append((
-            tick["frame_index"],
-            {
-                track.gid: track.world_xy.copy()
-                for track in tick["global_tracks"]
-            },
-        ))
-        sources: defaultdict[int, list[tuple[str, int]]] = defaultdict(list)
+        stage_diagnostics.update(tick)
+        append_committed_frames(
+            identity_committer.push_tick(tick), predictions, source_maps
+        )
+        emitted_gids = {int(track.gid) for track in tick["global_tracks"]}
         for observation in tick["observations"]:
             key = observation.camera, int(observation.local_id)
             gid = tick["local_to_gid"].get(key)
             if gid is None:
-                track_exists_not_output += 1
+                no_public_affinity += 1
+                internal_gid = tick["local_to_internal_gid"].get(key)
+                if internal_gid is not None and int(internal_gid) < 0:
+                    provisional_affinity += 1
             else:
-                sources[int(gid)].append(key)
-        source_maps[tick["frame_index"]] = dict(sources)
+                if int(gid) not in emitted_gids:
+                    public_affinity_not_output += 1
         last_pipeline_metrics = tick["metrics"]
-        if len(predictions) % 250 == 0:
+        if int(tick["tick_index"]) % 250 == 0:
             print(
                 f"Evaluated {len(predictions)} ticks in "
                 f"{time.perf_counter() - started:.1f}s",
                 flush=True,
             )
+    append_committed_frames(identity_committer.flush(), predictions, source_maps)
+    last_pipeline_metrics.update(identity_committer.metrics)
     elapsed_s = time.perf_counter() - started
     if not predictions:
         raise RuntimeError("The tracking pipeline produced no evaluation ticks")
 
-    best_offset = 0
-    best_rmse = float("inf")
-    for offset in (0, 1, 2):
-        errors = _match_errors(
-            predictions[:100], gt_frames, offset, match_gate_m
-        )
-        if errors:
-            rmse = float(np.sqrt(np.mean(np.square(errors))))
-            if rmse < best_rmse:
-                best_offset = offset
-                best_rmse = rmse
-
     metrics = evaluate_mot(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=match_gate_m,
     )
     metric_slices = evaluate_mot_slices(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=match_gate_m,
         cumulative_frames=cumulative_frames,
         window_frames=metric_window_frames,
@@ -333,7 +368,7 @@ def evaluate_on_t4(
     identity_diagnostics = identity_trajectory_diagnostics(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=match_gate_m,
     )
     switch_diagnostics = _classify_switch_events(
@@ -341,14 +376,18 @@ def evaluate_on_t4(
         source_maps,
         predictions,
         gt_frames,
-        best_offset,
+        frame_offset,
     )
+    stage_report = stage_diagnostics.finalize()
     error_taxonomy = build_identity_error_taxonomy(
         metrics,
         identity_diagnostics,
         last_pipeline_metrics,
         switch_diagnostics=switch_diagnostics,
-        track_exists_not_output=track_exists_not_output,
+        no_public_affinity=no_public_affinity,
+        provisional_affinity=provisional_affinity,
+        public_affinity_not_output=public_affinity_not_output,
+        stage_diagnostics=stage_report,
     )
     fusion_counter_names = (
         "global_id_merges",
@@ -369,6 +408,7 @@ def evaluate_on_t4(
         "local_reconnect_covariance_gate_failed",
         "local_reconnect_ambiguous",
         "local_reconnect_motion_gate_failed",
+        "local_reconnect_appearance_rejected",
         "batch_reconnect_assignments",
         "long_reconnect_boundary_rejected",
         "long_reconnect_motion_rejected",
@@ -386,6 +426,8 @@ def evaluate_on_t4(
         "new_gid_entry_deferred",
         "interior_birth_fallbacks",
         "interior_birth_reachable_dormant_deferred",
+        "late_identity_binding_deferred",
+        "late_identity_binding_timeout_releases",
         "new_gid_capacity_deferred",
         "new_gid_trajectory_rejected",
         "retirement_deferred_no_exit",
@@ -394,6 +436,14 @@ def evaluate_on_t4(
         "confirmed_identity_exits",
         "forced_identity_retirements",
         "anti_pingpong_switches_blocked",
+        "global_appearance_conflicts",
+        "global_appearance_conflicts_deferred",
+        "global_ids_protected_from_local_takeover",
+        "retained_occluded_global_tracks",
+        "retained_appearance_prototypes",
+        "appearance_prototype_bytes",
+        "tracklet_segments_reset",
+        "tracklet_points_reset",
         "fusion_motion_gate_accepted",
         "fusion_motion_jump_rejected",
         "trajectory_matches_accepted",
@@ -402,14 +452,22 @@ def evaluate_on_t4(
         "trajectory_speed_rejected",
         "local_tracks_created",
         "local_track_reactivations",
+        "local_appearance_reappearance_matches",
+        "local_appearance_reappearance_deferred",
+        "local_appearance_reappearance_ambiguous",
+        "retained_occluded_local_tracks",
         "peak_retained_local_tracks",
         "trajectory_smoothing_accepted",
         "trajectory_smoothing_rejected",
         "trajectory_smoothing_out_of_order_rejected",
+        "identity_commit_frames_buffered",
+        "identity_commit_frames_committed",
+        "identity_commit_unresolved_hypotheses_dropped",
+        "identity_commit_duplicate_hypotheses_collapsed",
     )
     switch_gaps = [event[2] - event[1] for event in metrics["switch_events"]]
     metrics.update({
-        "frame_offset": best_offset,
+        "frame_offset": frame_offset,
         "match_gate_m": match_gate_m,
         "max_frames": max_frames,
         "evaluated_ticks": len(predictions),
@@ -429,6 +487,7 @@ def evaluate_on_t4(
         "identity_diagnostics": identity_diagnostics,
         "switch_diagnostics": switch_diagnostics,
         "identity_error_taxonomy": error_taxonomy,
+        "stage_diagnostics": stage_report,
         "fusion_counters": {
             name: last_pipeline_metrics.get(name, 0)
             for name in fusion_counter_names
@@ -491,6 +550,7 @@ def main(
     evaluate: bool = False,
     max_frames: int = 1200,
     match_gate_m: float = 1.0,
+    frame_offset: int = 0,
     metrics_out: str = "modal-mot-metrics.json",
     metric_window_frames: int = 500,
     cumulative_frames: str = "500,1000,1500,2000,4000",
@@ -526,6 +586,7 @@ def main(
             output_name=remote_name,
             max_frames=max_frames,
             match_gate_m=match_gate_m,
+            frame_offset=frame_offset,
             metric_window_frames=metric_window_frames,
             cumulative_frames=selected_cumulative_frames,
             cameras=selected_cameras or None,
