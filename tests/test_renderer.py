@@ -1,5 +1,6 @@
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +20,26 @@ class FakeBev:
 
 
 class RendererTests(unittest.TestCase):
+    def test_occluded_prediction_uses_render_stream_not_observed_stream(self):
+        track = SimpleNamespace(
+            track_id=3,
+            misses=2,
+            xyxy=np.array([8.0, 8.0, 24.0, 32.0]),
+        )
+        tick = {
+            "frames": {"a": np.zeros((48, 64, 3), np.uint8)},
+            "camera_tracks": {"a": []},
+            "camera_render_tracks": {"a": [track]},
+            "global_tracks": [],
+            "global_render_tracks": [],
+            "local_to_gid": {("a", 3): 7},
+        }
+
+        frame = composite(tick, FakeBev(), ["a"])
+
+        # The predicted box top edge is around y=45 after 480x270 resize.
+        self.assertGreater(np.count_nonzero(frame[40:51, 55:186]), 0)
+
     def test_missing_camera_renders_blank_cell(self):
         tick = {"frames": {"a": np.zeros((48, 64, 3), np.uint8)},
                 "camera_tracks": {}, "global_tracks": [], "local_to_gid": {}}

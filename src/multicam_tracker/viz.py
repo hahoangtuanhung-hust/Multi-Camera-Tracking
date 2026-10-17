@@ -21,8 +21,12 @@ import colorsys
 
 import cv2
 import numpy as np
-import rerun as rr
-import rerun.blueprint as rrb
+try:
+    import rerun as rr
+    import rerun.blueprint as rrb
+except ImportError:
+    rr = None
+    rrb = None
 
 from .calibration import CameraCalibration
 from .config import PipelineConfig
@@ -129,7 +133,10 @@ class RerunLogger:
                 x1, y1, x2, y2 = track.xyxy
                 boxes.append([x1, y1, x2 - x1, y2 - y1])
                 colors.append(color_for_id(gid))
-                labels.append(f"#{gid}")
+                labels.append(
+                    f"#{gid} OCC" if getattr(track, "misses", 0) > 0
+                    else f"#{gid}"
+                )
             rr.log(
                 f"/{cam}/boxes",
                 rr.Boxes2D(array=np.array(boxes).reshape(-1, 4), array_format=rr.Box2DFormat.XYWH,
@@ -142,10 +149,14 @@ class RerunLogger:
             seen_gids.add(track.gid)
             color = color_for_id(track.gid)
             x, y = track.world_xy
+            observed = bool(getattr(track, "cameras", set()))
             rr.log(
                 f"/world/tracks/{track.gid}/dot",
                 rr.Points3D([[x, y, 0.05]], colors=[color], radii=0.18,
-                            labels=[f"#{track.gid} ({len(track.cameras)} cams)"]),
+                            labels=[
+                                f"#{track.gid} ({len(track.cameras)} cams)"
+                                if observed else f"#{track.gid} OCC"
+                            ]),
             )
             if len(track.trail) >= 2:
                 trail = [[px, py, 0.05] for px, py in track.trail]

@@ -23,7 +23,7 @@ from .config import (
     DEFAULT_TRACKING_PROFILE,
     PipelineConfig,
     TRACKING_PROFILE_OVERRIDES,
-    apply_tracking_profile,
+    build_effective_config,
 )
 from .detector import PersonDetector
 from .fusion import CameraObservation, GlobalTrackManager, foot_point_xyxy
@@ -111,6 +111,9 @@ def run_pipeline(
             outlier_gate_m=cfg.fusion_trajectory_outlier_gate_m,
             max_speed_mps=cfg.fusion_max_speed_mps,
             max_acceleration_mps2=cfg.fusion_max_acceleration_mps2,
+            min_acceleration_duration_s=(
+                cfg.fusion_trajectory_min_acceleration_duration_s
+            ),
             jump_window_s=cfg.fusion_jump_window_s,
             max_jump_m=cfg.fusion_max_jump_m,
         )
@@ -175,11 +178,33 @@ def run_pipeline(
                     detector_high_confidence_detections += high_count
                     detector_low_confidence_candidates += count - high_count
             processed_ticks += 1
-            camera_tracks = {
-                camera: trackers[camera].update(
-                    dets, timestamp_s=batch.packets[camera].capture_ts_s
+            camera_tracks = {}
+            for camera, dets in zip(cameras, detections):
+                tracker = trackers[camera]
+                update_kwargs = {
+                    "timestamp_s": batch.packets[camera].capture_ts_s
+                }
+                if getattr(tracker, "accepts_frame", False):
+                    update_kwargs["frame"] = frames[camera]
+                camera_tracks[camera] = tracker.update(dets, **update_kwargs)
+            camera_identity_tracks = {
+                camera: (
+                    tracker.identity_tracks()
+                    if hasattr(tracker, "identity_tracks")
+                    else [
+                        track for track in tracker.tracks
+                        if getattr(track, "confirmed", False)
+                    ]
                 )
-                for camera, dets in zip(cameras, detections)
+                for camera, tracker in trackers.items()
+            }
+            camera_render_tracks = {
+                camera: (
+                    tracker.render_tracks()
+                    if hasattr(tracker, "render_tracks")
+                    else camera_tracks.get(camera, [])
+                )
+                for camera, tracker in trackers.items()
             }
             processing_ts_s = monotonic()
             for camera in cameras:
@@ -273,6 +298,7 @@ def run_pipeline(
                             calibrations[camera].height,
                             cfg.fusion_boundary_margin_ratio,
                         ),
+                        appearance=getattr(track, "current_appearance", None),
                     ))
             event_watermark = max(event_watermark, *(batch.packets[camera].capture_ts_s for camera in cameras))
             if trajectory_smoother is not None:
@@ -287,6 +313,8 @@ def run_pipeline(
                 timestamp_s=event_watermark,
                 arrival_timestamp_s=arrival_watermark,
             )
+            global_identity_tracks = fusion.public_identity_tracks_snapshot()
+            global_render_tracks = fusion.render_tracks_snapshot()
 
             yield {
                 "tick_index": processed_ticks,
@@ -294,12 +322,36 @@ def run_pipeline(
                 "capture_ts_s": event_watermark,
                 "packets": {camera: batch.packets[camera] for camera in cameras},
                 "frames": frames,
+                "detections": {
+                    camera: np.asarray(camera_detections, dtype=float).copy()
+                    for camera, camera_detections in zip(cameras, detections)
+                },
                 "camera_tracks": camera_tracks,
+                # Identity state is broader than observed output. Consumers
+                # that compute MOT metrics must continue using camera_tracks;
+                # renderers may opt into short dashed occlusion predictions.
+                "camera_identity_tracks": camera_identity_tracks,
+                "camera_render_tracks": camera_render_tracks,
                 "observations": observations,
+                "accepted_fusion_keys": set(fusion.last_accepted_observation_keys),
                 "global_tracks": global_tracks,
+                "global_identity_tracks": global_identity_tracks,
+                "global_render_tracks": global_render_tracks,
+                # Lightweight snapshots for bounded offline identity commit.
+                # Unlike ``global_tracks``, this includes fresh confirmed
+                # negative/provisional hypotheses but never image data.
+                "identity_hypotheses": fusion.identity_hypotheses_snapshot(),
+                "identity_aliases": dict(fusion.aliases),
                 # Pending negative IDs are internal decision-buffer state and
                 # must never leak into Rerun, MP4 labels, or API consumers.
                 "local_to_gid": fusion.public_affinity_snapshot(),
+                # Evaluators use this diagnostic-only mapping to distinguish a
+                # provisional/internal owner from a missing public affinity.
+                "local_to_internal_gid": {
+                    key: fusion.resolve_gid(gid)
+                    for key, gid in fusion.affinity.items()
+                    if fusion.resolve_gid(gid) in fusion.tracks
+                },
                 "gid_aliases": dict(fusion.aliases),
                 "calibrations": calibrations,
                 "metrics": {
@@ -346,6 +398,38 @@ def run_pipeline(
                     ),
                     "local_ambiguous_detections_suppressed": sum(
                         tracker.metrics.get("ambiguous_detections_suppressed", 0)
+                        for tracker in trackers.values()
+                    ),
+                    "local_observation_outliers_suppressed": sum(
+                        tracker.metrics.get("observation_outliers_suppressed", 0)
+                        for tracker in trackers.values()
+                    ),
+                    "local_appearance_reappearance_matches": sum(
+                        tracker.metrics.get(
+                            "appearance_reappearance_matches", 0
+                        )
+                        for tracker in trackers.values()
+                    ),
+                    "local_appearance_reappearance_deferred": sum(
+                        tracker.metrics.get(
+                            "appearance_reappearance_deferred", 0
+                        )
+                        for tracker in trackers.values()
+                    ),
+                    "local_appearance_reappearance_ambiguous": sum(
+                        tracker.metrics.get(
+                            "appearance_reappearance_ambiguous", 0
+                        )
+                        for tracker in trackers.values()
+                    ),
+                    "retained_occluded_local_tracks": sum(
+                        sum(
+                            int(
+                                getattr(track, "confirmed", False)
+                                and getattr(track, "misses", 0) > 0
+                            )
+                            for track in tracker.tracks
+                        )
                         for tracker in trackers.values()
                     ),
                     "retained_local_tracks": sum(
@@ -444,8 +528,12 @@ def main() -> None:
     if args.expected_people is not None and args.expected_people < 0:
         parser.error("--expected-people must be >= 0")
 
-    cfg = PipelineConfig(data_root=args.data_root)
-    apply_tracking_profile(cfg, args.profile)
+    cfg = build_effective_config(
+        data_root=args.data_root,
+        profile=args.profile,
+        local_tracker=args.local_tracker,
+        fusion_output_time_policy="arrival" if args.async_ingest else "event",
+    )
     if args.cameras:
         cfg.cameras = args.cameras
     else:
@@ -457,8 +545,6 @@ def main() -> None:
         cfg.stride = args.stride
     if args.device:
         cfg.device = args.device
-    if args.local_tracker:
-        cfg.local_tracker = args.local_tracker
     cfg.async_ingest = args.async_ingest
     if args.cpu_threads is not None:
         cfg.cpu_threads = args.cpu_threads
@@ -496,8 +582,8 @@ def main() -> None:
         t_prev = now
 
         logger.log_tick(
-            tick["frame_index"], tick["frames"], tick["camera_tracks"],
-            tick["local_to_gid"], tick["global_tracks"], fps=fps_smoothed,
+            tick["frame_index"], tick["frames"], tick["camera_render_tracks"],
+            tick["local_to_gid"], tick["global_render_tracks"], fps=fps_smoothed,
         )
         if tick["tick_index"] == 1 or (
             args.log_every > 0 and tick["tick_index"] % args.log_every == 0

@@ -18,9 +18,8 @@ import numpy as np
 
 from .config import (
     DEFAULT_TRACKING_PROFILE,
-    PipelineConfig,
     TRACKING_PROFILE_OVERRIDES,
-    apply_tracking_profile,
+    build_effective_config,
 )
 from .demo import run_pipeline
 from .local_tracker import LOCAL_TRACKERS
@@ -28,6 +27,43 @@ from .viz import color_for_id
 
 CELL_W, CELL_H = 480, 270          # camera cell in the grid
 MAP_W = 540                        # bird's-eye panel width
+
+
+def _draw_dashed_rectangle(
+    image: np.ndarray,
+    first: tuple[int, int],
+    second: tuple[int, int],
+    color: tuple[int, int, int],
+    *,
+    thickness: int = 1,
+    dash: int = 8,
+) -> None:
+    """Draw a predicted/occluded box without implying an observation."""
+    x1, y1 = first
+    x2, y2 = second
+    segments = (
+        ((x1, y1), (x2, y1)),
+        ((x2, y1), (x2, y2)),
+        ((x2, y2), (x1, y2)),
+        ((x1, y2), (x1, y1)),
+    )
+    for start, end in segments:
+        length = int(round(np.hypot(end[0] - start[0], end[1] - start[1])))
+        if length <= 0:
+            continue
+        for offset in range(0, length, 2 * dash):
+            stop = min(length, offset + dash)
+            alpha0 = offset / length
+            alpha1 = stop / length
+            p0 = (
+                int(round(start[0] + alpha0 * (end[0] - start[0]))),
+                int(round(start[1] + alpha0 * (end[1] - start[1]))),
+            )
+            p1 = (
+                int(round(start[0] + alpha1 * (end[0] - start[0]))),
+                int(round(start[1] + alpha1 * (end[1] - start[1]))),
+            )
+            cv2.line(image, p0, p1, color, thickness, cv2.LINE_AA)
 
 
 class BevRenderer:
@@ -75,8 +111,12 @@ class BevRenderer:
             for p, q in zip(trail, trail[1:]):
                 cv2.line(img, p, q, bgr, 2, cv2.LINE_AA)
             u, v = self.to_px(track.world_xy)
-            cv2.circle(img, (u, v), 7, bgr, -1, cv2.LINE_AA)
-            cv2.putText(img, str(track.gid), (u + 9, v + 4),
+            observed = bool(getattr(track, "cameras", set()))
+            cv2.circle(
+                img, (u, v), 7, bgr, -1 if observed else 2, cv2.LINE_AA
+            )
+            label = str(track.gid) if observed else f"{track.gid} OCC"
+            cv2.putText(img, label, (u + 9, v + 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, bgr, 1, cv2.LINE_AA)
         cv2.putText(img, "world ground plane (1 m grid)", (12, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1, cv2.LINE_AA)
@@ -96,7 +136,10 @@ def composite(tick: dict, bev: BevRenderer, cameras: list[str]) -> np.ndarray:
         src_h, src_w = source.shape[:2]
         frame = cv2.resize(source, (CELL_W, CELL_H))
         sx, sy = CELL_W / src_w, CELL_H / src_h
-        for track in tick["camera_tracks"].get(cam, []):
+        camera_render_tracks = tick.get(
+            "camera_render_tracks", tick["camera_tracks"]
+        )
+        for track in camera_render_tracks.get(cam, []):
             gid = tick["local_to_gid"].get((cam, track.track_id))
             if gid is None:
                 continue
@@ -104,9 +147,15 @@ def composite(tick: dict, bev: BevRenderer, cameras: list[str]) -> np.ndarray:
             x1, y1, x2, y2 = track.xyxy
             p1 = (int(x1 * sx), int(y1 * sy))
             p2 = (int(x2 * sx), int(y2 * sy))
-            cv2.rectangle(frame, p1, p2, (b, g, r), 2)
-            cv2.putText(frame, str(gid), (p1[0], p1[1] - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (b, g, r), 2, cv2.LINE_AA)
+            occluded = getattr(track, "misses", 0) > 0
+            if occluded:
+                _draw_dashed_rectangle(frame, p1, p2, (b, g, r))
+            else:
+                cv2.rectangle(frame, p1, p2, (b, g, r), 2)
+            label = str(gid) if not occluded else f"{gid} OCC"
+            cv2.putText(frame, label, (p1[0], p1[1] - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (b, g, r),
+                        1 if occluded else 2, cv2.LINE_AA)
         cv2.putText(frame, cam, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (230, 230, 230), 1, cv2.LINE_AA)
         cells.append(frame)
@@ -115,7 +164,7 @@ def composite(tick: dict, bev: BevRenderer, cameras: list[str]) -> np.ndarray:
     if len(cells) % 2:  # pad an odd camera count with a black cell
         rows[-1] = np.hstack([cells[-1], np.zeros_like(cells[-1])])
     grid = np.vstack(rows)
-    map_img = bev.render(tick["global_tracks"])
+    map_img = bev.render(tick.get("global_render_tracks", tick["global_tracks"]))
     if map_img.shape[:2] != (grid.shape[0], MAP_W):
         map_img = cv2.resize(map_img, (MAP_W, grid.shape[0]))
     return np.hstack([grid, map_img])
@@ -132,7 +181,7 @@ def render_video(
     model_name: str | None = None,
     cameras: list[str] | None = None,
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
-    local_tracker: str = "ocsort",
+    local_tracker: str | None = None,
     expected_people: int | None = None,
     gif: Path | None = None,
     gif_fps: int = 10,
@@ -156,9 +205,15 @@ def render_video(
     if expected_people is not None and expected_people < 0:
         raise ValueError("expected_people must be >= 0")
 
-    cfg = PipelineConfig(data_root=data_root, stride=stride, device=device, async_ingest=False)
-    apply_tracking_profile(cfg, tracking_profile)
-    cfg.local_tracker = local_tracker
+    cfg = build_effective_config(
+        data_root=data_root,
+        stride=stride,
+        device=device,
+        async_ingest=False,
+        fusion_output_time_policy="event",
+        profile=tracking_profile,
+        local_tracker=local_tracker,
+    )
     if expected_people is not None:
         cfg.fusion_fixed_population_size = expected_people
     if model_name is not None:
@@ -255,8 +310,8 @@ def main() -> None:
     parser.add_argument(
         "--local-tracker",
         choices=LOCAL_TRACKERS,
-        default="ocsort",
-        help="Per-camera tracker (default: ocsort)",
+        default=None,
+        help="Explicit per-camera tracker override (default: selected profile)",
     )
     parser.add_argument("--model", default=None,
                         help="YOLO weights path/name (default from PipelineConfig)")

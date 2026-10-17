@@ -24,11 +24,11 @@ from scipy.optimize import linear_sum_assignment
 
 from .config import (
     DEFAULT_TRACKING_PROFILE,
-    PipelineConfig,
     TRACKING_PROFILE_OVERRIDES,
-    apply_tracking_profile,
+    build_effective_config,
 )
 from .demo import run_pipeline
+from .identity_commit import IdentityCommitBuffer, append_committed_frames
 from .local_tracker import LOCAL_TRACKERS
 from .mot_metrics import (
     build_identity_error_taxonomy,
@@ -37,6 +37,7 @@ from .mot_metrics import (
     identity_trajectory_diagnostics,
 )
 from .reporting import build_run_metadata, configure_determinism
+from .stage_diagnostics import PipelineStageDiagnostics, load_bbox_ground_truth
 
 MATCH_GATE_M = 1.0
 
@@ -113,6 +114,13 @@ def main() -> None:
         help="Maximum world-plane match distance in meters (default: 1.0)",
     )
     parser.add_argument(
+        "--frame-offset",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="Fixed logical GT frame offset shared by every candidate (default: 0)",
+    )
+    parser.add_argument(
         "--expected-people",
         type=int,
         default=None,
@@ -186,8 +194,13 @@ def main() -> None:
 
     configure_determinism(args.seed)
 
-    cfg = PipelineConfig(data_root=args.data_root, async_ingest=False)
-    apply_tracking_profile(cfg, args.profile)
+    cfg = build_effective_config(
+        data_root=args.data_root,
+        async_ingest=False,
+        fusion_output_time_policy="event",
+        profile=args.profile,
+        local_tracker=args.local_tracker,
+    )
     cfg.identity_diagnostics_path = args.identity_events
     cfg.identity_diagnostics_max_events = args.identity_events_max
     if args.expected_people is not None:
@@ -198,8 +211,6 @@ def main() -> None:
     cfg.cameras = args.cameras or available
     if args.device:
         cfg.device = args.device
-    if args.local_tracker:
-        cfg.local_tracker = args.local_tracker
     if args.track_kf_time_process_noise is not None:
         cfg.track_kf_time_process_noise = args.track_kf_time_process_noise
     if args.track_kf_robust_nis_threshold is not None:
@@ -211,6 +222,19 @@ def main() -> None:
         cfg.camera_start_frame_offsets,
         max_frame=args.max_frames + 3,
     )
+    bbox_gt_frames = load_bbox_ground_truth(
+        cfg.scene_dir,
+        cfg.cameras,
+        cfg.camera_start_frame_offsets,
+        max_frame=args.max_frames + 3,
+    )
+    stage_diagnostics = PipelineStageDiagnostics(
+        bbox_gt_frames,
+        stride=cfg.stride,
+        segment_frames=max(1, args.metric_window_frames or 500),
+        pipeline_detection_threshold=cfg.conf_threshold,
+        confidence_source_floor=cfg.conf_threshold,
+    )
     print(
         f"Evaluating {len(cfg.cameras)} cameras over {args.max_frames} frames "
         f"(stride={cfg.stride}, tracker={cfg.local_tracker})...",
@@ -219,52 +243,49 @@ def main() -> None:
 
     predictions: list[tuple[int, dict[int, np.ndarray]]] = []
     source_maps: dict[int, dict[int, list[tuple[str, int]]]] = {}
-    track_exists_not_output = 0
+    no_public_affinity = 0
+    provisional_affinity = 0
+    public_affinity_not_output = 0
     last_metrics: dict = {}
+    identity_committer = IdentityCommitBuffer(cfg.fusion_identity_commit_delay_s)
     started = time.perf_counter()
     for tick in run_pipeline(cfg, max_frames=args.max_frames):
-        predictions.append((
-            tick["frame_index"],
-            {t.gid: t.world_xy.copy() for t in tick["global_tracks"]},
-        ))
-        sources: defaultdict[int, list[tuple[str, int]]] = defaultdict(list)
+        stage_diagnostics.update(tick)
+        append_committed_frames(
+            identity_committer.push_tick(tick), predictions, source_maps
+        )
+        emitted_gids = {int(track.gid) for track in tick["global_tracks"]}
         for observation in tick["observations"]:
             key = observation.camera, int(observation.local_id)
-            gid = tick["local_to_gid"].get(key)
-            if gid is not None:
-                sources[int(gid)].append(key)
-        source_maps[tick["frame_index"]] = dict(sources)
-        track_exists_not_output += sum(
-            (observation.camera, int(observation.local_id))
-            not in tick["local_to_gid"]
-            for observation in tick["observations"]
-        )
+            public_gid = tick["local_to_gid"].get(key)
+            internal_gid = tick["local_to_internal_gid"].get(key)
+            if public_gid is None:
+                no_public_affinity += 1
+                if internal_gid is not None and int(internal_gid) < 0:
+                    provisional_affinity += 1
+            elif int(public_gid) not in emitted_gids:
+                public_affinity_not_output += 1
         last_metrics = tick["metrics"]
-        if len(predictions) % 50 == 0:
+        if int(tick["tick_index"]) % 50 == 0:
             print(f"Evaluated {len(predictions)} ticks in {time.perf_counter() - started:.1f}s", flush=True)
+    append_committed_frames(identity_committer.flush(), predictions, source_maps)
+    last_metrics.update(identity_committer.metrics)
     elapsed = time.perf_counter() - started
 
-    # The GT frame column is 1-based-ish; find the constant offset to our
-    # 0-based video frame index that minimizes error (0, 1, or 2).
-    best_offset, best_rmse = 0, np.inf
-    for offset in (0, 1, 2):
-        errors = _match_errors(
-            predictions[:100], gt_frames, offset, args.match_gate_m
-        )
-        if errors and np.sqrt(np.mean(np.square(errors))) < best_rmse:
-            best_rmse = np.sqrt(np.mean(np.square(errors)))
-            best_offset = offset
+    # Alignment is dataset configuration, not a candidate hyperparameter.
+    # Never select it from tracker predictions independently for each A/B run.
+    frame_offset = args.frame_offset
 
     metrics = evaluate_mot(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=args.match_gate_m,
     )
     metric_slices = evaluate_mot_slices(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=args.match_gate_m,
         cumulative_frames=args.cumulative_frames,
         window_frames=args.metric_window_frames,
@@ -272,7 +293,7 @@ def main() -> None:
     identity_diagnostics = identity_trajectory_diagnostics(
         predictions,
         gt_frames,
-        frame_offset=best_offset,
+        frame_offset=frame_offset,
         match_gate_m=args.match_gate_m,
     )
     switch_events = metrics["switch_events"]
@@ -281,23 +302,27 @@ def main() -> None:
         source_maps,
         predictions,
         gt_frames,
-        best_offset,
+        frame_offset,
     )
     if args.identity_events is not None:
         with args.identity_events.open("a", encoding="utf-8") as destination:
             for record in switch_diagnostics:
                 destination.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    stage_report = stage_diagnostics.finalize()
     error_taxonomy = build_identity_error_taxonomy(
         metrics,
         identity_diagnostics,
         last_metrics,
         switch_diagnostics=switch_diagnostics,
-        track_exists_not_output=track_exists_not_output,
+        no_public_affinity=no_public_affinity,
+        provisional_affinity=provisional_affinity,
+        public_affinity_not_output=public_affinity_not_output,
+        stage_diagnostics=stage_report,
     )
 
     metrics.update({
-        "frame_offset": best_offset,
+        "frame_offset": frame_offset,
         "match_gate_m": args.match_gate_m,
         "max_frames": args.max_frames,
         "evaluated_ticks": len(predictions),
@@ -310,11 +335,12 @@ def main() -> None:
         "identity_diagnostics": identity_diagnostics,
         "switch_diagnostics": switch_diagnostics,
         "identity_error_taxonomy": error_taxonomy,
+        "stage_diagnostics": stage_report,
         "pipeline_metrics": last_metrics,
         "run_metadata": build_run_metadata(cfg, seed=args.seed),
     })
 
-    print(f"\nFrame offset used     : {best_offset}")
+    print(f"\nFrame offset used     : {frame_offset} (fixed)")
     print(f"World match gate      : {args.match_gate_m:.2f} m")
     print(f"TP / FP / FN          : {metrics['TP']} / {metrics['FP']} / {metrics['FN']}")
     print(f"Precision / Recall    : {metrics['precision']:.3f} / {metrics['recall']:.3f}")
