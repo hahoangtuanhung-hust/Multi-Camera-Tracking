@@ -137,6 +137,31 @@ class PipelineConfig:
     hybridsort_ambiguity_min_iou: float = 0.25
     hybridsort_ambiguity_margin: float = 0.08
     hybridsort_ambiguity_min_area_ratio: float = 1.10
+    hybridsort_ambiguity_owner_grace_s: float = 0.0
+    hybridsort_lost_observation_prediction_enabled: bool = False
+    # Experimental A1: keep a matched raw bbox for diagnostics, but do not
+    # let a high-NIS merged/outlier box replace trusted direction/history.
+    hybridsort_trusted_observation_enabled: bool = False
+    hybridsort_trusted_observation_nis_multiplier: float = 1.0
+    # Event-triggered appearance association for a confirmed local track that
+    # reappears after an observation gap. The descriptor is a compact HSV
+    # histogram; no image crops or face features are retained.
+    hybridsort_reappearance_enabled: bool = False
+    hybridsort_reappearance_max_gap_s: float = 6.0
+    hybridsort_reappearance_min_similarity: float = 0.78
+    hybridsort_reappearance_min_margin: float = 0.08
+    hybridsort_reappearance_appearance_weight: float = 0.70
+    hybridsort_reappearance_confirmations: int = 3
+    hybridsort_reappearance_confirmation_window_s: float = 0.35
+    hybridsort_appearance_update_alpha: float = 0.15
+    hybridsort_appearance_update_min_similarity: float = 0.55
+
+    # Identity retention and drawing are separate contracts. Confirmed lost
+    # tracks may remain available for reassociation without being emitted as
+    # observed detections. Renderers may optionally show a short dashed
+    # prediction while evaluators continue to consume observed tracks only.
+    render_occluded_tracks_enabled: bool = False
+    render_occluded_max_age_s: float = 2.0
 
     # --- cross-camera fusion (fusion.py) ---
     fusion_gate_m: float = 2.0      # max world-plane distance (meters) to match
@@ -147,6 +172,10 @@ class PipelineConfig:
     # after the short horizon by strict motion + image-boundary evidence.
     fusion_identity_retention_s: float = 5.0
     fusion_output_grace_s: float = 0.25  # retain IDs longer than we publish stale positions
+    # Live serving uses arrival time for freshness/latency. Deterministic
+    # offline evaluation and replay explicitly use event time instead so CPU
+    # and GPU processing speed cannot change which identities are emitted.
+    fusion_output_time_policy: str = "arrival"  # "arrival" (live) or "event" (offline)
     # A new global identity is already hidden until ``fusion_min_hits``.  This
     # optional additional event-time hold is useful for ablation without
     # forcing latency/recall loss in the default real-time profile.
@@ -160,6 +189,13 @@ class PipelineConfig:
     # entry/capacity checks pass.  This prevents short false fragments from
     # consuming externally visible identities.
     fusion_deferred_gid_allocation_enabled: bool = False
+    # Late identity binding keeps a fresh fragment private while an existing
+    # public owner remains kinematically reachable. Offline consumers may also
+    # delay committing lightweight identity snapshots so a later alias can be
+    # applied retroactively without buffering image frames.
+    fusion_late_identity_binding_enabled: bool = False
+    fusion_identity_commit_delay_s: float = 0.0
+    fusion_late_identity_max_defer_s: float = 0.0
     # 0 keeps the population unconstrained. A positive value caps concurrently
     # retained public identities; pending fragments remain hidden until a slot
     # is released by a confirmed exit.
@@ -172,6 +208,10 @@ class PipelineConfig:
     # scene (for example after a long detector miss). Entry evidence remains
     # preferred; zero keeps the strict closed-world policy.
     fusion_interior_birth_fallback_s: float = 0.0
+    # After the interior fallback is ready, a merely reachable dormant GID may
+    # defer publication only this much longer. Zero preserves strict/unbounded
+    # waiting for baseline profiles.
+    fusion_reachable_dormant_max_defer_s: float = 0.0
     # Public identities that disappear inside the scene stay dormant for
     # reconnect. Boundary evidence releases them normally; the forced timeout
     # is a bounded-memory safety valve for imperfect boundary calibration.
@@ -194,8 +234,10 @@ class PipelineConfig:
     # Multi-point trajectory cost used for dormant/interior reassociation.
     fusion_trajectory_window_s: float = 2.0
     fusion_trajectory_smoothing_enabled: bool = False
+    fusion_robust_trajectory_motion_enabled: bool = False
     fusion_trajectory_recency_half_life_s: float = 0.75
     fusion_trajectory_outlier_gate_m: float = 0.75
+    fusion_trajectory_min_acceleration_duration_s: float = 1.0
     fusion_trajectory_position_weight: float = 1.0
     fusion_trajectory_velocity_weight: float = 0.5
     fusion_trajectory_direction_weight: float = 1.0
@@ -226,6 +268,9 @@ class PipelineConfig:
     fusion_published_motion_gate_enabled: bool = False
     fusion_duplicate_suppression_enabled: bool = False
     fusion_instant_merge_enabled: bool = True
+    # Experimental A3: predict both observations to one clock-normalized
+    # timestamp before the instant geometry distance is evaluated.
+    fusion_common_timestamp_instant_merge_enabled: bool = False
     fusion_event_time_gate_s: float = 0.15
     fusion_instant_margin_m: float = 0.20
     # Optional crossing controls. The bundled scene evaluates best with
@@ -266,6 +311,18 @@ class PipelineConfig:
     fusion_local_reconnect_velocity_weight_s: float = 0.0
     fusion_local_reconnect_velocity_gate_mps: float = 1.25
     fusion_local_reconnect_direction_cosine: float = 0.0
+    # Same-camera appearance is used only as a reconnect veto/tie-breaker and
+    # to protect a public GID from a local-ID takeover. Cross-camera colour
+    # descriptors are intentionally never compared.
+    fusion_reconnect_appearance_enabled: bool = False
+    fusion_reconnect_appearance_min_similarity: float = 0.72
+    fusion_reconnect_appearance_weight_m: float = 0.50
+    fusion_appearance_update_alpha: float = 0.15
+    fusion_appearance_conflict_confirmations: int = 2
+    fusion_appearance_conflict_window_s: float = 0.35
+    fusion_stationary_reconnect_enabled: bool = False
+    fusion_stationary_speed_mps: float = 0.20
+    fusion_stationary_reconnect_max_gap_s: float = 6.0
     # When enabled, a new local fragment cannot take ownership of an already
     # published GID from a single plausible observation. It must keep selecting
     # the same canonical candidate for ``fusion_local_reconnect_confirmations``
@@ -291,6 +348,7 @@ class PipelineConfig:
     offset_refine_window_s: float = 0.2
     offset_ewma_alpha: float = 0.15
     offset_min_confidence: float = 0.55
+    clock_learning_enabled: bool = True
     # Maximum spread between independently matched trajectory shifts in one
     # camera-pair cycle. The selected default prevents spatial calibration
     # bias from masquerading as a clock offset; the baseline profile restores
@@ -641,9 +699,109 @@ TRACKING_PROFILE_OVERRIDES["hybridsort-continuity"] = {
 TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort-tentative"],
 }
+TRACKING_PROFILE_OVERRIDES["hybridsort-balanced-low-floor"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "conf_threshold": 0.15,
+    "imgsz": 640,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-balanced-mid-floor"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "conf_threshold": 0.20,
+    "imgsz": 640,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a1-robust-local"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "hybridsort_trusted_observation_enabled": True,
+    "hybridsort_trusted_observation_nis_multiplier": 4.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a2-trajectory"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "fusion_trajectory_smoothing_enabled": True,
+    "fusion_robust_trajectory_motion_enabled": True,
+    "fusion_trajectory_window_s": 3.5,
+    "fusion_trajectory_recency_half_life_s": 0.75,
+    "tracklet_history_s": 7.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a2-motion-only"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    # Isolate the association-side benefit from changing emitted positions.
+    "fusion_robust_trajectory_motion_enabled": True,
+    "fusion_trajectory_window_s": 3.5,
+    "fusion_trajectory_recency_half_life_s": 0.75,
+    "tracklet_history_s": 7.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a2-smoothing-only"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    # Control arm: smooth emitted positions without using robust motion for
+    # association.  This distinguishes localization/fragmentation effects.
+    "fusion_trajectory_smoothing_enabled": True,
+    "fusion_trajectory_window_s": 3.5,
+    "fusion_trajectory_recency_half_life_s": 0.75,
+    "tracklet_history_s": 7.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a3-common-time"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "fusion_common_timestamp_instant_merge_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a3-clock-fixed"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "clock_learning_enabled": False,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a3-clock-offset-only"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "offset_max_drift_ppm": 0.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a4-crossing"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "hybridsort_ambiguity_suppression_enabled": True,
+    "hybridsort_ambiguity_min_iou": 0.25,
+    "hybridsort_ambiguity_margin": 0.04,
+    "hybridsort_ambiguity_min_area_ratio": 1.10,
+    # Six frames at the dataset's nominal 30 FPS.
+    "hybridsort_ambiguity_owner_grace_s": 0.20,
+    "hybridsort_lost_observation_prediction_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-a5-lifecycle"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    "fusion_interior_birth_fallback_s": 1.5,
+    "fusion_reachable_dormant_max_defer_s": 1.5,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-balanced"],
+    # Give active/dormant ownership resolution time to converge before a
+    # fragment receives an externally visible ID. The commit delay matches
+    # the bounded maximum defer so offline output can be canonicalized without
+    # losing the provisional portion of a valid trajectory.
+    "fusion_identity_retention_s": 5.0,
+    "fusion_provisional_min_age_s": 1.0,
+    "fusion_late_identity_binding_enabled": True,
+    "fusion_identity_commit_delay_s": 2.0,
+    "fusion_late_identity_max_defer_s": 2.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding"],
+    # Preserve recall for valid interior births. A fragment that remains
+    # reachable from an existing public owner is still held privately for the
+    # bounded late-binding horizon before it can receive a new public ID.
+    "fusion_new_gid_entry_required": False,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"],
+    "hybridsort_reappearance_enabled": True,
+    "hybridsort_reappearance_max_gap_s": 6.0,
+    "hybridsort_reappearance_confirmations": 3,
+    "fusion_reconnect_appearance_enabled": True,
+    "fusion_stationary_reconnect_enabled": True,
+    "fusion_local_reconnect_long_window_s": 6.0,
+    "fusion_local_reconnect_confirmations": 3,
+    "fusion_dormant_retention_s": 10.0,
+    "render_occluded_tracks_enabled": True,
+    "render_occluded_max_age_s": 2.0,
+}
 TRACKING_PROFILE_OVERRIDES["hybridsort-trajectory"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort"],
     "fusion_trajectory_smoothing_enabled": True,
+    "fusion_robust_trajectory_motion_enabled": True,
     "fusion_trajectory_window_s": 3.5,
     "fusion_trajectory_recency_half_life_s": 0.75,
     "tracklet_history_s": 7.0,
@@ -651,6 +809,7 @@ TRACKING_PROFILE_OVERRIDES["hybridsort-trajectory"] = {
 TRACKING_PROFILE_OVERRIDES["hybridsort-stable"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort-local-v2"],
     "fusion_trajectory_smoothing_enabled": True,
+    "fusion_robust_trajectory_motion_enabled": True,
     "fusion_trajectory_window_s": 3.5,
     "fusion_trajectory_recency_half_life_s": 0.75,
     "tracklet_history_s": 7.0,
@@ -677,4 +836,23 @@ def apply_tracking_profile(cfg: PipelineConfig, profile: str) -> PipelineConfig:
         raise ValueError(f"Unknown tracking profile {profile!r}; choose one of: {choices}")
     for name, value in TRACKING_PROFILE_OVERRIDES[profile].items():
         setattr(cfg, name, value)
+    return cfg
+
+
+def build_effective_config(
+    *,
+    profile: str = DEFAULT_TRACKING_PROFILE,
+    local_tracker: str | None = None,
+    **pipeline_kwargs: object,
+) -> PipelineConfig:
+    """Build one effective config with explicit overrides applied last.
+
+    ``None`` means that the named profile owns the local-tracker choice. This
+    distinction prevents CLI defaults from silently replacing Hybrid-SORT with
+    OC-SORT after a profile has already been applied.
+    """
+    cfg = PipelineConfig(**pipeline_kwargs)
+    apply_tracking_profile(cfg, profile)
+    if local_tracker is not None:
+        cfg.local_tracker = local_tracker
     return cfg
