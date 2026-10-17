@@ -31,9 +31,33 @@ def evaluate_mot(
         predictions, ground_truth, frame_offset, match_gate_m
     )
     identity = _identity_metrics(sequence)
-    clear = _clear_metrics(sequence)
+    clear = _clear_metrics(sequence, _clear_frame_events(sequence))
     hota = _hota_metrics(sequence)
     return {**identity, **clear, **hota}
+
+
+def evaluate_bbox_mot(
+    predictions: list[tuple[int, dict[int, np.ndarray]]],
+    ground_truth: dict[int, dict[int, np.ndarray]],
+    *,
+    iou_threshold: float = 0.5,
+) -> dict[str, object]:
+    """Evaluate local bbox identities with Identity and CLEAR MOT metrics."""
+    if not 0.0 < iou_threshold <= 1.0:
+        raise ValueError("iou_threshold must be in (0, 1]")
+    sequence = _prepare_bbox_sequence(predictions, ground_truth, iou_threshold)
+    identity = _identity_metrics(sequence)
+    clear = _clear_metrics(sequence, _clear_frame_events(sequence))
+    return {
+        **identity,
+        **{
+            name: clear[name]
+            for name in (
+                "TP", "FP", "FN", "precision", "recall", "IDSW", "Frag",
+                "MOTA", "MOTP", "switch_events",
+            )
+        },
+    }
 
 
 def evaluate_mot_slices(
@@ -107,6 +131,7 @@ def identity_trajectory_diagnostics(
     sequence = _prepare_sequence(
         predictions, ground_truth, frame_offset, match_gate_m
     )
+    clear_frames = _clear_frame_events(sequence)
     people: defaultdict[int, dict[str, object]] = defaultdict(lambda: {
         "visible_frames": 0,
         "matched_frames": 0,
@@ -120,25 +145,19 @@ def identity_trajectory_diagnostics(
     })
     previous_gid: dict[int, int] = {}
     previous_frame: dict[int, int] = {}
-    long_gap_attempts = long_gap_successes = crossing_switches = switches = 0
+    long_gap_reappearances = long_gap_same_gid = crossing_switches = switches = 0
 
-    for frame in sequence["frames"]:
+    for frame, clear_frame in zip(sequence["frames"], clear_frames):
         frame_index = int(frame["frame_index"])
         gt_original = frame["gt_original"]
         tracker_original = frame["tracker_original"]
         for gt_id in gt_original:
             people[int(gt_id)]["visible_frames"] += 1
-        if not len(gt_original) or not len(tracker_original):
-            continue
-
-        continuation = np.asarray([
-            previous_gid.get(int(gt_id), -1) for gt_id in gt_original
-        ], dtype=int)[:, None] == tracker_original[None, :]
-        score = 1000.0 * continuation + frame["similarity"]
-        score[frame["similarity"] <= 0.0] = 0.0
-        rows, columns = linear_sum_assignment(-score)
-        accepted = score[rows, columns] > 0.0
-        rows, columns = rows[accepted], columns[accepted]
+        rows = clear_frame["rows"]
+        columns = clear_frame["columns"]
+        switched_gt_ids = {
+            int(event[0]) for event in clear_frame["switch_events"]
+        }
 
         frame_gt = ground_truth.get(frame_index + frame_offset, {})
         for row, column in zip(rows, columns):
@@ -160,10 +179,10 @@ def identity_trajectory_diagnostics(
                     int(record["longest_missing_gap"]), missing_gap
                 )
                 if frame_index - old_frame > long_gap_frames:
-                    long_gap_attempts += 1
+                    long_gap_reappearances += 1
                     if old_gid == gid:
-                        long_gap_successes += 1
-            if old_gid is not None and old_gid != gid:
+                        long_gap_same_gid += 1
+            if gt_id in switched_gt_ids:
                 switches += 1
                 record["switch_count"] += 1
                 point = frame_gt.get(gt_id)
@@ -239,10 +258,10 @@ def identity_trajectory_diagnostics(
             / max(len(predictions), 1)
         ),
         "wrong_id_duration_frames": int(wrong_id_duration),
-        "long_gap_reconnect_attempts": int(long_gap_attempts),
-        "long_gap_reconnect_successes": int(long_gap_successes),
-        "long_gap_reconnect_success_rate": float(
-            long_gap_successes / max(long_gap_attempts, 1)
+        "long_gap_reappearances": int(long_gap_reappearances),
+        "long_gap_same_gid": int(long_gap_same_gid),
+        "long_gap_same_gid_rate": float(
+            long_gap_same_gid / max(long_gap_reappearances, 1)
         ),
         "crossing_switches": int(crossing_switches),
         "crossing_switch_rate": float(crossing_switches / max(switches, 1)),
@@ -256,7 +275,10 @@ def build_identity_error_taxonomy(
     pipeline_metrics: dict[str, object],
     *,
     switch_diagnostics: list[dict[str, object]] | None = None,
-    track_exists_not_output: int = 0,
+    no_public_affinity: int = 0,
+    provisional_affinity: int = 0,
+    public_affinity_not_output: int = 0,
+    stage_diagnostics: dict[str, object] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Map available evaluator/runtime evidence to the ten failure classes.
 
@@ -265,19 +287,48 @@ def build_identity_error_taxonomy(
     every false negative originated in the detector.
     """
     switches = switch_diagnostics or []
-    long_attempts = int(identity_diagnostics.get("long_gap_reconnect_attempts", 0))
-    long_successes = int(identity_diagnostics.get("long_gap_reconnect_successes", 0))
+    long_reappearances = int(identity_diagnostics.get("long_gap_reappearances", 0))
+    long_same_gid = int(identity_diagnostics.get("long_gap_same_gid", 0))
     trajectory_rejections = int(
         pipeline_metrics.get("trajectory_matches_rejected", 0)
     )
     publication_rejections = int(
         pipeline_metrics.get("new_gid_trajectory_rejected", 0)
     )
+    stage_overall = (
+        stage_diagnostics.get("overall", {})
+        if isinstance(stage_diagnostics, dict)
+        else {}
+    )
+    stage_losses = (
+        stage_overall.get("stage_loss_gt_instances", {})
+        if isinstance(stage_overall, dict)
+        else {}
+    )
+    detector_misses = (
+        int(stage_losses.get("detector", 0))
+        if isinstance(stage_losses, dict) and "detector" in stage_losses
+        else None
+    )
     return {
-        "detector_miss": {
+        "fused_false_negative": {
             "count": int(metrics.get("FN", 0)),
-            "evidence": "upper_bound_proxy",
-            "note": "Fused FN also includes local/fusion/output misses.",
+            "evidence": "evaluator",
+            "note": "GT was visible but no fused output matched inside the gate.",
+        },
+        "detector_miss": {
+            "count": detector_misses,
+            "evidence": (
+                "bbox_iou_stage_diagnostics"
+                if detector_misses is not None
+                else "unavailable_without_bbox_stage_diagnostics"
+            ),
+            "note": (
+                "Count is unmatched GT instances at the effective pipeline "
+                "detection threshold; it is not inferred from fused FN."
+                if detector_misses is not None
+                else "A fused FN is not assumed to be a detector miss."
+            ),
         },
         "tentative_local_track_deleted": {
             "count": int(pipeline_metrics.get("local_tracks_removed_tentative", 0)),
@@ -290,6 +341,11 @@ def build_identity_error_taxonomy(
                 for record in switches
             ),
             "evidence": "evaluator_switch_context" if switches else "unavailable",
+        },
+        "crossing_proximity_on_switch": {
+            "count": sum(bool(record.get("near_crossing")) for record in switches),
+            "evidence": "evaluator_proximity_context" if switches else "unavailable",
+            "note": "Proximity is context, not proof that the crossing caused the switch.",
         },
         "local_fragmentation_after_occlusion": {
             "count": sum(
@@ -306,9 +362,17 @@ def build_identity_error_taxonomy(
             ),
             "evidence": "evaluator_switch_context" if switches else "unavailable",
         },
-        "dormant_reconnect_failed": {
-            "count": max(0, long_attempts - long_successes),
-            "evidence": "trajectory_matching",
+        "long_gap_reappearance_changed_gid": {
+            "count": max(0, long_reappearances - long_same_gid),
+            "evidence": "evaluator_reappearance",
+            "note": "This does not imply that the dormant matcher was invoked.",
+        },
+        "dormant_match_cycle_without_acceptance": {
+            "count": int(
+                pipeline_metrics.get("dormant_match_cycles_without_acceptance", 0)
+            ),
+            "evidence": "runtime_match_cycle_counter",
+            "note": "Counts matcher cycles, not unique people or independent errors.",
         },
         "motion_gate_rejection": {
             "count": int(pipeline_metrics.get("fusion_motion_jump_rejected", 0)),
@@ -326,9 +390,17 @@ def build_identity_error_taxonomy(
             "count": int(pipeline_metrics.get("new_gid_entry_deferred", 0)),
             "evidence": "runtime_counter",
         },
-        "track_exists_not_output": {
-            "count": int(track_exists_not_output),
+        "no_public_affinity": {
+            "count": int(no_public_affinity),
             "evidence": "per_tick_observation_vs_public_affinity",
+        },
+        "provisional_affinity": {
+            "count": int(provisional_affinity),
+            "evidence": "per_tick_internal_affinity",
+        },
+        "public_affinity_not_output": {
+            "count": int(public_affinity_not_output),
+            "evidence": "per_tick_public_affinity_vs_emitted_gid",
         },
     }
 
@@ -419,6 +491,79 @@ def _prepare_sequence(predictions, ground_truth, frame_offset, match_gate_m):
     }
 
 
+def _prepare_bbox_sequence(predictions, ground_truth, iou_threshold):
+    gt_values = {
+        int(gt_id)
+        for frame_index, _ in predictions
+        for gt_id in ground_truth.get(frame_index, {})
+    }
+    tracker_values = {
+        int(tracker_id)
+        for _, frame_predictions in predictions
+        for tracker_id in frame_predictions
+    }
+    gt_lookup = {value: index for index, value in enumerate(sorted(gt_values))}
+    tracker_lookup = {
+        value: index for index, value in enumerate(sorted(tracker_values))
+    }
+    frames = []
+    for frame_index, frame_predictions in predictions:
+        frame_gt = ground_truth.get(frame_index, {})
+        gt_original = np.asarray(list(frame_gt), dtype=int)
+        tracker_original = np.asarray(list(frame_predictions), dtype=int)
+        gt_ids = np.asarray([gt_lookup[value] for value in gt_original], dtype=int)
+        tracker_ids = np.asarray(
+            [tracker_lookup[value] for value in tracker_original], dtype=int
+        )
+        gt_boxes = np.asarray(
+            [frame_gt[value] for value in gt_original], dtype=float
+        ).reshape((-1, 4))
+        tracker_boxes = np.asarray(
+            [frame_predictions[value] for value in tracker_original], dtype=float
+        ).reshape((-1, 4))
+        similarity = _bbox_iou_matrix(gt_boxes, tracker_boxes)
+        similarity[similarity < iou_threshold] = 0.0
+        frames.append({
+            "frame_index": int(frame_index),
+            "gt_ids": gt_ids,
+            "tracker_ids": tracker_ids,
+            "gt_original": gt_original,
+            "tracker_original": tracker_original,
+            "distance": 1.0 - similarity,
+            "similarity": similarity,
+        })
+    return {
+        "frames": frames,
+        "num_gt_ids": len(gt_lookup),
+        "num_tracker_ids": len(tracker_lookup),
+        "num_gt_dets": sum(len(frame["gt_ids"]) for frame in frames),
+        "num_tracker_dets": sum(len(frame["tracker_ids"]) for frame in frames),
+        "tracker_original_ids": np.asarray(sorted(tracker_values), dtype=int),
+    }
+
+
+def _bbox_iou_matrix(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    if not len(left) or not len(right):
+        return np.empty((len(left), len(right)), dtype=float)
+    top_left = np.maximum(left[:, None, :2], right[None, :, :2])
+    bottom_right = np.minimum(left[:, None, 2:], right[None, :, 2:])
+    intersection_wh = np.maximum(0.0, bottom_right - top_left)
+    intersection = intersection_wh[..., 0] * intersection_wh[..., 1]
+    left_area = np.maximum(0.0, left[:, 2] - left[:, 0]) * np.maximum(
+        0.0, left[:, 3] - left[:, 1]
+    )
+    right_area = np.maximum(0.0, right[:, 2] - right[:, 0]) * np.maximum(
+        0.0, right[:, 3] - right[:, 1]
+    )
+    union = left_area[:, None] + right_area[None, :] - intersection
+    return np.divide(
+        intersection,
+        union,
+        out=np.zeros_like(intersection),
+        where=union > np.finfo(float).eps,
+    )
+
+
 def _identity_metrics(sequence):
     num_gt_ids = sequence["num_gt_ids"]
     num_tracker_ids = sequence["num_tracker_ids"]
@@ -472,31 +617,42 @@ def _identity_metrics(sequence):
     }
 
 
-def _clear_metrics(sequence):
+def _clear_frame_events(sequence) -> list[dict[str, object]]:
+    """Return the single continuity-aware assignment stream used by CLEAR.
+
+    Keeping this event source separate from metric aggregation lets diagnostic
+    reports describe exactly the same GT/GID matches and switches as IDSW.
+    """
     previous_match = np.full(sequence["num_gt_ids"], -1, dtype=int)
     previous_frame_match = np.full(sequence["num_gt_ids"], -1, dtype=int)
     previous_frame_index: dict[int, int] = {}
-    tp = fp = fn = id_switches = fragmentations = 0
     tracked_before = np.zeros(sequence["num_gt_ids"], dtype=bool)
     tracked_previous_frame = np.zeros(sequence["num_gt_ids"], dtype=bool)
-    similarity_sum = 0.0
-    distance_sum = 0.0
-    squared_distance_sum = 0.0
-    switch_events: list[tuple[int, int, int, int, int]] = []
+    results: list[dict[str, object]] = []
 
     for frame in sequence["frames"]:
         gt_ids = frame["gt_ids"]
         tracker_ids = frame["tracker_ids"]
         similarity = frame["similarity"]
         if not len(gt_ids):
-            fp += len(tracker_ids)
             previous_frame_match[:] = -1
             tracked_previous_frame[:] = False
+            results.append({
+                "rows": np.empty(0, dtype=int),
+                "columns": np.empty(0, dtype=int),
+                "fragmented_gt": np.empty(0, dtype=int),
+                "switch_events": [],
+            })
             continue
         if not len(tracker_ids):
-            fn += len(gt_ids)
             previous_frame_match[:] = -1
             tracked_previous_frame[:] = False
+            results.append({
+                "rows": np.empty(0, dtype=int),
+                "columns": np.empty(0, dtype=int),
+                "fragmented_gt": np.empty(0, dtype=int),
+                "switch_events": [],
+            })
             continue
 
         continuation = (
@@ -510,20 +666,20 @@ def _clear_metrics(sequence):
         columns = columns[matched]
         matched_gt = gt_ids[rows]
         matched_tracker = tracker_ids[columns]
-        fragmentations += int(np.sum(
+        fragmented_gt = matched_gt[
             tracked_before[matched_gt] & ~tracked_previous_frame[matched_gt]
-        ))
+        ]
         tracked_before[matched_gt] = True
         tracked_previous_frame[:] = False
         tracked_previous_frame[matched_gt] = True
 
+        frame_switches: list[tuple[int, int, int, int, int]] = []
         for row, column, gt_id, tracker_id in zip(
             rows, columns, matched_gt, matched_tracker
         ):
             old_tracker = previous_match[gt_id]
             if old_tracker >= 0 and old_tracker != tracker_id:
-                id_switches += 1
-                switch_events.append((
+                frame_switches.append((
                     int(frame["gt_original"][row]),
                     previous_frame_index.get(int(gt_id), frame["frame_index"]),
                     int(frame["frame_index"]),
@@ -535,6 +691,31 @@ def _clear_metrics(sequence):
 
         previous_frame_match[:] = -1
         previous_frame_match[matched_gt] = matched_tracker
+        results.append({
+            "rows": rows,
+            "columns": columns,
+            "fragmented_gt": fragmented_gt,
+            "switch_events": frame_switches,
+        })
+    return results
+
+
+def _clear_metrics(sequence, clear_frames=None):
+    clear_frames = clear_frames or _clear_frame_events(sequence)
+    tp = fp = fn = fragmentations = 0
+    similarity_sum = 0.0
+    distance_sum = 0.0
+    squared_distance_sum = 0.0
+    switch_events: list[tuple[int, int, int, int, int]] = []
+
+    for frame, clear_frame in zip(sequence["frames"], clear_frames):
+        gt_ids = frame["gt_ids"]
+        tracker_ids = frame["tracker_ids"]
+        similarity = frame["similarity"]
+        rows = clear_frame["rows"]
+        columns = clear_frame["columns"]
+        fragmentations += len(clear_frame["fragmented_gt"])
+        switch_events.extend(clear_frame["switch_events"])
         match_distance = frame["distance"][rows, columns]
         tp += len(rows)
         fn += len(gt_ids) - len(rows)
@@ -546,7 +727,7 @@ def _clear_metrics(sequence):
     gt_detections = tp + fn
     precision = tp / max(tp + fp, 1)
     recall = tp / max(gt_detections, 1)
-    mota = 1.0 - (fn + fp + id_switches) / max(gt_detections, 1)
+    mota = 1.0 - (fn + fp + len(switch_events)) / max(gt_detections, 1)
     motp = similarity_sum / max(tp, 1)
     motp_distance = distance_sum / max(tp, 1)
     position_rmse = float(np.sqrt(squared_distance_sum / max(tp, 1)))
@@ -556,7 +737,7 @@ def _clear_metrics(sequence):
         "FN": fn,
         "precision": precision,
         "recall": recall,
-        "IDSW": id_switches,
+        "IDSW": len(switch_events),
         "Frag": fragmentations,
         "MOTA": mota,
         "MOTP": motp,

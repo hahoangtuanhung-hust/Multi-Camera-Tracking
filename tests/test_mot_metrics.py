@@ -146,16 +146,37 @@ class MotMetricTests(unittest.TestCase):
         self.assertEqual(person["switch_count"], 2)
         self.assertEqual(person["longest_missing_gap"], 2)
         self.assertEqual(report["predicted_gids_per_gt"]["max"], 3.0)
-        self.assertEqual(report["long_gap_reconnect_attempts"], 2)
-        self.assertEqual(report["long_gap_reconnect_successes"], 1)
+        self.assertEqual(report["long_gap_reappearances"], 2)
+        self.assertEqual(report["long_gap_same_gid"], 1)
         self.assertGreater(report["crossing_switch_rate"], 0.0)
+
+    def test_identity_diagnostics_reuses_clear_assignment_after_gap(self) -> None:
+        predictions = [
+            (0, {10: self._point(0.0), 20: self._point(10.0)}),
+            (1, {}),
+            (2, {10: self._point(0.4), 30: self._point(0.0)}),
+        ]
+        ground_truth = {
+            0: {1: self._point(0.0), 2: self._point(10.0)},
+            1: {1: self._point(0.0), 2: self._point(10.0)},
+            2: {1: self._point(0.0), 2: self._point(0.4)},
+        }
+
+        metrics = evaluate_mot(predictions, ground_truth)
+        diagnostics = identity_trajectory_diagnostics(predictions, ground_truth)
+
+        self.assertEqual(metrics["IDSW"], 2)
+        self.assertEqual(
+            sum(person["switch_count"] for person in diagnostics["per_gt"]),
+            metrics["IDSW"],
+        )
 
     def test_identity_error_taxonomy_preserves_evidence_quality(self) -> None:
         taxonomy = build_identity_error_taxonomy(
             {"FN": 12},
             {
-                "long_gap_reconnect_attempts": 4,
-                "long_gap_reconnect_successes": 1,
+                "long_gap_reappearances": 4,
+                "long_gap_same_gid": 1,
             },
             {
                 "local_tracks_removed_tentative": 5,
@@ -163,6 +184,7 @@ class MotMetricTests(unittest.TestCase):
                 "trajectory_matches_rejected": 8,
                 "new_gid_trajectory_rejected": 2,
                 "new_gid_entry_deferred": 9,
+                "dormant_match_cycles_without_acceptance": 2,
             },
             switch_diagnostics=[{
                 "near_crossing": True,
@@ -173,19 +195,42 @@ class MotMetricTests(unittest.TestCase):
                 "classification": "global_changed_local_stable",
                 "gap_frames": 1,
             }],
-            track_exists_not_output=11,
+            no_public_affinity=11,
+            provisional_affinity=7,
+            public_affinity_not_output=3,
         )
 
-        self.assertEqual(taxonomy["detector_miss"]["count"], 12)
+        self.assertEqual(taxonomy["fused_false_negative"]["count"], 12)
+        self.assertIsNone(taxonomy["detector_miss"]["count"])
         self.assertEqual(
-            taxonomy["detector_miss"]["evidence"], "upper_bound_proxy"
+            taxonomy["detector_miss"]["evidence"],
+            "unavailable_without_bbox_stage_diagnostics",
         )
         self.assertEqual(taxonomy["local_switch_at_crossing"]["count"], 1)
-        self.assertEqual(taxonomy["dormant_reconnect_failed"]["count"], 3)
+        self.assertEqual(taxonomy["long_gap_reappearance_changed_gid"]["count"], 3)
+        self.assertEqual(
+            taxonomy["dormant_match_cycle_without_acceptance"]["count"], 2
+        )
         self.assertEqual(
             taxonomy["trajectory_verification_rejection"]["count"], 10
         )
-        self.assertEqual(taxonomy["track_exists_not_output"]["count"], 11)
+        self.assertEqual(taxonomy["no_public_affinity"]["count"], 11)
+        self.assertEqual(taxonomy["provisional_affinity"]["count"], 7)
+        self.assertEqual(taxonomy["public_affinity_not_output"]["count"], 3)
+
+        with_stage = build_identity_error_taxonomy(
+            {"FN": 12},
+            {},
+            {},
+            stage_diagnostics={
+                "overall": {"stage_loss_gt_instances": {"detector": 4}}
+            },
+        )
+        self.assertEqual(with_stage["detector_miss"]["count"], 4)
+        self.assertEqual(
+            with_stage["detector_miss"]["evidence"],
+            "bbox_iou_stage_diagnostics",
+        )
 
 
 if __name__ == "__main__":
