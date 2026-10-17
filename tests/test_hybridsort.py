@@ -34,6 +34,10 @@ def _det(x: float, confidence: float = 0.95) -> np.ndarray:
     return np.array([[x, 0.0, x + 20.0, 40.0, confidence]], dtype=float)
 
 
+def _det_xy(x: float, y: float, confidence: float = 0.95) -> np.ndarray:
+    return np.array([[x, y, x + 20.0, y + 40.0, confidence]], dtype=float)
+
+
 class HybridSortDefaultProfileTests(unittest.TestCase):
     def test_hybridsort_is_branch_default_profile(self):
         self.assertEqual(DEFAULT_TRACKING_PROFILE, "hybridsort")
@@ -62,6 +66,67 @@ class HybridSortDefaultProfileTests(unittest.TestCase):
 
 
 class HybridSortTrackerTests(unittest.TestCase):
+    @staticmethod
+    def _appearance_frame(colour: tuple[int, int, int]) -> np.ndarray:
+        frame = np.zeros((80, 80, 3), dtype=np.uint8)
+        frame[0:40, 0:20] = colour
+        return frame
+
+    def test_reappearance_is_held_until_consecutive_appearance_confirmation(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            track_max_age_s=0.2,
+            ocsort_use_byte=False,
+            ocsort_observation_recovery_enabled=False,
+            hybridsort_reappearance_enabled=True,
+            hybridsort_reappearance_max_gap_s=2.0,
+            hybridsort_reappearance_confirmations=3,
+            hybridsort_reappearance_min_similarity=0.75,
+        )
+        tracker = HybridSortTracker(cfg)
+        frame = self._appearance_frame((0, 0, 255))
+        original_id = tracker.update(
+            _det(0.0), timestamp_s=0.0, frame=frame
+        )[0].track_id
+        tracker.update(np.empty((0, 5)), timestamp_s=0.1, frame=frame)
+
+        self.assertEqual(
+            tracker.update(_det(0.0), timestamp_s=0.2, frame=frame), []
+        )
+        self.assertEqual(
+            tracker.update(_det(0.0), timestamp_s=0.3, frame=frame), []
+        )
+        visible = tracker.update(_det(0.0), timestamp_s=0.4, frame=frame)
+
+        self.assertEqual([track.track_id for track in visible], [original_id])
+        self.assertEqual(tracker._next_id, 2)
+        self.assertEqual(tracker.metrics["appearance_reappearance_matches"], 1)
+        self.assertEqual(tracker.metrics["appearance_reappearance_deferred"], 2)
+
+    def test_occluded_identity_retention_is_separate_from_render_window(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_max_age_s=0.2,
+            hybridsort_reappearance_enabled=True,
+            hybridsort_reappearance_max_gap_s=2.0,
+            render_occluded_tracks_enabled=True,
+            render_occluded_max_age_s=0.3,
+        )
+        tracker = HybridSortTracker(cfg)
+        frame = self._appearance_frame((0, 255, 0))
+        tracker.update(_det(0.0), timestamp_s=0.0, frame=frame)
+        tracker.update(np.empty((0, 5)), timestamp_s=0.2, frame=frame)
+        self.assertEqual(len(tracker.identity_tracks()), 1)
+        self.assertEqual(len(tracker.render_tracks()), 1)
+
+        tracker.update(np.empty((0, 5)), timestamp_s=0.5, frame=frame)
+
+        self.assertEqual(len(tracker.identity_tracks()), 1)
+        self.assertEqual(tracker.render_tracks(), [])
+        self.assertEqual(tracker.update(np.empty((0, 5)), timestamp_s=1.5), [])
+        self.assertEqual(len(tracker.identity_tracks()), 1)
+
     def test_normal_track_and_confirm(self):
         cfg = PipelineConfig(track_min_hits=3, track_min_iou=0.25)
         tracker = HybridSortTracker(cfg)
@@ -186,6 +251,34 @@ class HybridSortTrackerTests(unittest.TestCase):
         self.assertEqual(tracker._next_id, 3)
         self.assertEqual(tracker.metrics["ambiguous_detections_suppressed"], 1)
 
+    def test_robust_bbox_outlier_does_not_contaminate_trusted_observation(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            track_kf_robust_nis_threshold=13.28,
+            hybridsort_trusted_observation_enabled=True,
+            hybridsort_ambiguity_suppression_enabled=False,
+        )
+        tracker = HybridSortTracker(cfg)
+        tracker.update(_det(0.0), timestamp_s=0.0)
+        tracker.update(_det(2.0), timestamp_s=0.1)
+        track = tracker.tracks[0]
+        trusted_bbox = track.last_observation.copy()
+        trusted_direction = track.velocity.copy()
+        trusted_history_size = len(track.observations)
+
+        merged = np.array([[0.0, 0.0, 40.0, 80.0, 0.95]], dtype=float)
+        visible = tracker.update(merged, timestamp_s=0.2)
+
+        self.assertEqual([item.track_id for item in visible], [track.track_id])
+        np.testing.assert_array_equal(track.last_raw_observation, merged[0])
+        np.testing.assert_array_equal(track.last_observation, trusted_bbox)
+        np.testing.assert_array_equal(track.velocity, trusted_direction)
+        self.assertEqual(len(track.observations), trusted_history_size)
+        self.assertFalse(track.last_update_trusted)
+        self.assertFalse(np.array_equal(track.xyxy, merged[0, :4]))
+        self.assertEqual(tracker.metrics["observation_outliers_suppressed"], 1)
+
     def test_clear_detection_is_not_marked_ambiguous(self):
         cfg = PipelineConfig(track_min_hits=1)
         tracker = HybridSortTracker(cfg)
@@ -200,6 +293,36 @@ class HybridSortTrackerTests(unittest.TestCase):
         )
 
         self.assertEqual(ambiguous, {})
+
+    def test_multi_frame_merged_bbox_does_not_capture_one_owner(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            ocsort_use_byte=False,
+            ocsort_observation_recovery_enabled=False,
+            hybridsort_ambiguity_suppression_enabled=True,
+            hybridsort_ambiguity_min_iou=0.20,
+            hybridsort_ambiguity_margin=0.10,
+            hybridsort_ambiguity_owner_grace_s=0.20,
+            hybridsort_lost_observation_prediction_enabled=True,
+        )
+        tracker = HybridSortTracker(cfg)
+        tracker.update(np.vstack((_det(0.0), _det(20.0))), timestamp_s=0.0)
+        tracker.update(np.vstack((_det(4.0), _det(16.0))), timestamp_s=0.1)
+        ids = [track.track_id for track in tracker.tracks]
+
+        merged = np.array([[8.0, 0.0, 32.0, 40.0, 0.95]], dtype=float)
+        for timestamp in (0.2, 0.3, 0.4):
+            self.assertEqual(tracker.update(merged, timestamp_s=timestamp), [])
+        separated = tracker.update(
+            np.vstack((_det(24.0), _det(-4.0))), timestamp_s=0.5
+        )
+
+        self.assertEqual(sorted(track.track_id for track in separated), ids)
+        by_id = {track.track_id: track for track in tracker.tracks}
+        self.assertGreater(by_id[ids[0]].velocity[0], 0.0)
+        self.assertLess(by_id[ids[1]].velocity[0], 0.0)
+        self.assertEqual(tracker.metrics["ambiguous_detections_suppressed"], 3)
 
     def test_same_size_overlap_is_not_treated_as_merged_box(self):
         cfg = PipelineConfig(track_min_hits=1)
@@ -287,6 +410,62 @@ class HybridSortTrackerTests(unittest.TestCase):
         tracker.update(_det(0.0), timestamp_s=0.0)
         tracker.update(np.empty((0, 5)), timestamp_s=0.35)
         self.assertEqual(tracker.tracks, [])
+
+    def test_occlusion_durations_respect_second_based_retention(self):
+        for gap_s in (0.3, 0.5, 1.0, 2.0, 3.0):
+            with self.subTest(gap_s=gap_s):
+                tracker = HybridSortTracker(PipelineConfig(
+                    track_min_hits=1,
+                    track_max_age_s=2.0,
+                    ocsort_use_byte=False,
+                ))
+                original_id = tracker.update(
+                    _det(0.0), timestamp_s=0.0
+                )[0].track_id
+                reappeared = tracker.update(_det(0.0), timestamp_s=gap_s)
+                ids = [track.track_id for track in reappeared]
+                if gap_s <= 2.0:
+                    self.assertEqual(ids, [original_id])
+                    self.assertEqual(tracker._next_id, 2)
+                else:
+                    self.assertNotIn(original_id, ids)
+                    self.assertEqual(tracker.metrics["tracks_removed_timeout"], 1)
+
+    def test_same_direction_overtaking_preserves_track_ownership(self):
+        tracker = HybridSortTracker(PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.15,
+            hybridsort_alpha=0.60,
+            ocsort_use_byte=False,
+        ))
+        tracker.update(
+            np.vstack((_det_xy(0.0, 0.0), _det_xy(30.0, 8.0))),
+            timestamp_s=0.0,
+        )
+        rear_id, front_id = [track.track_id for track in tracker.tracks]
+        paths = (
+            ((10.0, 0.0), (35.0, 8.0)),
+            ((20.0, 0.0), (40.0, 8.0)),
+            ((30.0, 0.0), (45.0, 8.0)),
+            ((42.0, 0.0), (50.0, 8.0)),
+            ((55.0, 0.0), (55.0, 8.0)),
+            ((68.0, 0.0), (60.0, 8.0)),
+        )
+        for index, (rear, front) in enumerate(paths, start=1):
+            detections = np.vstack((
+                _det_xy(front[0], front[1]),
+                _det_xy(rear[0], rear[1]),
+            ))
+            tracker.update(detections, timestamp_s=index * 0.1)
+
+        by_id = {track.track_id: track for track in tracker.tracks}
+        rear_center = (by_id[rear_id].xyxy[:2] + by_id[rear_id].xyxy[2:]) * 0.5
+        front_center = (
+            by_id[front_id].xyxy[:2] + by_id[front_id].xyxy[2:]
+        ) * 0.5
+        self.assertGreater(rear_center[0], front_center[0])
+        self.assertLess(rear_center[1], front_center[1])
+        self.assertEqual(tracker._next_id, 3)
 
     def test_invalid_alpha_raises(self):
         with self.assertRaises(ValueError):
