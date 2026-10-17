@@ -95,8 +95,10 @@ uv run render-preview --device cpu --stride 1 --seconds 60 \
   --out fixed-population.mp4
 ```
 
-The runtime default is `identity-v1-drift-guard`; the fixed-population policy
-remains experimental until it passes a long-sequence IDF1/HOTA comparison.
+The effective runtime default is the No-ReID `hybridsort` profile. The
+`fixed-population-buffered` and older `identity-v1-*` policies remain explicit
+experiments/rollback profiles; none passed the current 4,000-tick release
+gates. See [the tracking stability audit](docs/tracking-stability-audit.md).
 Without ReID/FaceID, a person who
 leaves and later enters at an unrelated boundary remains fundamentally
 ambiguous; the fixed capacity prevents ID proliferation but cannot prove that
@@ -120,6 +122,14 @@ uv run --extra modal modal run modal_app.py \
 # Reuse the uploaded data/model on later jobs:
 uv run --extra modal modal run modal_app.py \
   --seconds 60 --stride 1 --out modal-result.mp4
+
+# Render the crowd/occlusion recovery candidate. Every run packages the latest
+# local source; --upload is only needed when the data or model changes:
+uv run --extra modal modal run modal_app.py \
+  --seconds 60 --stride 1 \
+  --tracking-profile hybridsort-crowd-recovery \
+  --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
+  --out crowd-recovery-t4.mp4
 
 # Render with buffered fixed-population identity allocation:
 uv run --extra modal modal run modal_app.py \
@@ -206,14 +216,14 @@ flowchart LR
 sequenceDiagram
     participant R as SyncedVideoReader
     participant Y as PersonDetector
-    participant B as OC-SORT per camera
+    participant B as Hybrid-SORT per camera
     participant C as CameraCalibration
     participant G as GlobalTrackManager
     participant Z as RerunLogger
 
     R->>Y: dynamic {cam: FramePacket}
     Y->>B: per-cam detections (M, 5) [x1 y1 x2 y2 conf]
-    Note over B: KF predict → OCM Hungarian →<br/>OCR/ORU recovery → lifecycle
+    Note over B: KF predict → blended predicted/observed IoU →<br/>BYTE recovery → lifecycle
     B->>C: confirmed Tracks (local_id, bbox)
     C->>G: CameraObservation(cam, local_id, capture_ts, world_xy, velocity)
     Note over G: 5 s metadata history → offset scan →<br/>trajectory gates + Hungarian → canonical gid
@@ -227,8 +237,8 @@ sequenceDiagram
 |---|---|---|---|
 | `FramePacket` | `video.py` | `camera`, image, `capture_ts_s`, `arrival_ts_s`, sequence, source index, quality | separates event time from transport/processing time |
 | detections | `PersonDetector` | `(M, 5)` float32 `[x1, y1, x2, y2, conf]` | people found in one frame |
-| `OCTrack` | `OCSortTracker` | `track_id`, Kalman box, observed direction, `hits`, `misses`, `confirmed` | one person, one camera, stable local ID |
-| `CameraObservation` | `demo.run_pipeline` | `camera`, `local_id`, capture time, `world_xy`, world velocity, bbox, confidence | a confirmed track projected to the floor |
+| local `Track` | `HybridSortTracker` | `track_id`, Kalman box, raw/trusted observations, `hits`, `misses`, `confirmed`, optional appearance prototype | one person and retained identity within one camera |
+| `CameraObservation` | `demo.run_pipeline` | `camera`, `local_id`, capture time, `world_xy`, world velocity, bbox, confidence, optional current appearance | an observed confirmed track projected to the floor |
 | `TimedWorldPoint` | `TrackletStore` | timestamp, 2D position/velocity, confidence | metadata-only history; no image or appearance embedding |
 | `GlobalTrack` | `GlobalTrackManager` | `gid`, fused Kalman `world_xy`, `trail`, supporting `cameras` | one *physical person* across all cameras |
 | `affinity` | `GlobalTrackManager` | `(camera, local_id) → gid` | fusion output that lets the viewer color per-camera boxes globally |
@@ -239,8 +249,8 @@ sequenceDiagram
 |---|---|---|
 | Fusion strategy | **Late fusion** (fuse tracks, not pixels) | Matches DeepStream MV3DT; modular, camera dropout degrades gracefully. Early fusion (BEV feature projection) is more accurate on dense scenes but monolithic. |
 | Fusion topology | **Centralized** manager | One readable class. MV3DT distributes this over MQTT peers — great production property, unnecessary complexity for learning. |
-| Association cost | **Trajectory only** | Position RMSE, velocity RMSE, direction, overlap and confidence. No ReID/FaceID. |
-| Per-camera tracker | **Vendored OC-SORT, motion-only** | Observation momentum, last-observation recovery and Kalman re-update improve crossings/occlusion without ReID. The former ByteTrack backend remains available for A/B. |
+| Association cost | **Trajectory-first; optional same-camera appearance** | Position RMSE, velocity RMSE, direction, overlap and confidence remain authoritative. The crowd-recovery profile uses a compact colour descriptor only to veto/tie-break ambiguous same-camera recovery; no FaceID or cross-camera ReID. |
+| Per-camera tracker | **Hybrid-SORT with opt-in reappearance recovery** | Blends predicted-box IoU with last-trusted-observation IoU and uses low-confidence detections only to recover existing tracks. The crowd profile holds an ambiguous reappearance for consecutive evidence instead of immediately creating another ID. OC-SORT and ByteTrack remain explicit A/B backends. |
 | Detection | **One batched YOLO26n call** for all cameras | Amortizes per-call overhead exactly like DeepStream's `nvinfer` stream batching; NMS-free architecture removes a postprocessing stage. |
 | Time base | **Capture event time in seconds** | Handles 1–3 s camera skew, irregular FPS, delayed arrival and clock drift; ticks remain a legacy fallback. |
 | Visualization | **Rerun** | Camera grid + 3D world + timeline scrubbing in one dependency; a custom web UI would cost hundreds of lines and lose replay. |
@@ -287,23 +297,23 @@ in **all cameras with one batched inference call** per tick. YOLO26 is
 end-to-end (no NMS postprocessing) and runs on Apple's GPU via PyTorch
 MPS, or on CPU with `--device cpu`.
 
-### 3. Single-camera tracking (`ocsort.py`)
+### 3. Single-camera tracking (`hybridsort.py`)
 
 Detection says *where people are*; tracking says *who is who over time*.
-Each camera runs a motion-only [OC-SORT](https://arxiv.org/abs/2203.14360) tracker:
+Each camera runs a Hybrid-SORT tracker. Primary Hungarian
+association blends IoU against the Kalman prediction with IoU against the last
+trusted observation, so one statistically extreme bbox cannot silently become
+the recovery anchor. A second BYTE-style round lets low-confidence detections
+update existing tracks but never create new IDs. Raw/trusted observation state,
+NIS outlier protection, merged-box suppression, and lost-observation prediction
+are available as controlled profile switches; the latter policies remain off
+in the effective default because their A/B results did not clear release gates.
 
-- **Observation-centric momentum (OCM)** adds observed movement direction to
-  IoU Hungarian matching, helping identities keep ownership while crossing.
-- **Observation-centric recovery (OCR)** retries unmatched tracks against the
-  last real detection instead of trusting a drifting Kalman prediction alone.
-- **Observation-centric re-update (ORU)** is available to rebuild the Kalman
-  trajectory with virtual observations after an occlusion. It is release-gated
-  off by default because the current scene's A/B reduced IDF1 when it was on.
-- The optional **BYTE low-confidence extension** is enabled by default to keep
-  partially occluded tracks alive; low-confidence boxes never create IDs.
-
-No appearance embedding, ReID model, or FaceID is used. Select the legacy
-backend for a direct A/B with `--local-tracker bytetrack`.
+The default profiles remain appearance-free. `hybridsort-crowd-recovery` adds
+a small three-stripe HSV descriptor, stored as metadata rather than an image,
+for same-camera reappearance and local-ID ownership checks. It is deliberately
+not used as cross-camera ReID or FaceID. Select OC-SORT or the legacy ByteTrack
+backend explicitly with `--local-tracker ocsort|bytetrack`.
 
 Per-camera IDs still fragment under long occlusions (watch the racks in
 camera_0001). That's expected — and it's exactly what the next stage fixes.
@@ -404,9 +414,18 @@ evaluated ticks. Change that interval with `--metric-window-frames`, or set it
 to zero to print only the full-sequence result. Modal evaluation stores the
 same window summaries in `metric_windows` in the output JSON.
 
-Latest CPU verification on the current custom 4-camera scene used 60 source
-frames (60 evaluated ticks), with ground truth aligned to each configured
-source-frame trim:
+The current release audit replays one continuous 4,000-tick cache for all four
+cameras at `stride=1`. No candidate was promoted: the corrected
+`hybridsort-balanced` reference reaches IDF1 0.2968, IDR 0.2718, HOTA 0.1948,
+AssA 0.1202, precision 0.7781, recall 0.6472, 258 ID switches, and 355
+fragmentations. Its cumulative IDF1 falls from 0.7017 at 500 ticks to 0.4175
+at 2,000 and 0.2968 at 4,000 because the median/p95 public GIDs per GT are
+9/12. Exact prediction and assignment hashes match across two independent
+4,000-tick runs. Full results, stage funnel, release gates, and reproducible
+commands are in [the tracking stability audit](docs/tracking-stability-audit.md).
+
+The older 60-tick CPU smoke result below is retained as historical context; it
+is not release evidence:
 
 | Metric | Value |
 |---|---|
@@ -420,15 +439,14 @@ source-frame trim:
 | Global ID switches | 5 over 60 ticks |
 | CPU throughput | 2.11 tick/s |
 
-The fusion ablation replays identical local observations through multiple
-global-association configurations. On 300 source frames, batch reconnect was
-neutral, early duplicate suppression was neutral/slightly positive, and
-adaptive published-pair softening was harmful:
+The following earlier fusion ablation is also historical. It replayed identical
+local observations through multiple global-association configurations on 300
+source frames:
 
 | Fusion profile | IDF1 | HOTA | MOTA | IDSW |
 |---|---:|---:|---:|---:|
 | `identity-v1-baseline` (rollback) | 0.705 | 0.480 | 0.594 | 39 |
-| `identity-v1-drift-guard` (default) | 0.709 | 0.483 | 0.595 | 33 |
+| `identity-v1-drift-guard` (historical candidate) | 0.709 | 0.483 | 0.595 | 33 |
 | Pre-identity-v2 | 0.703 | 0.469 | 0.542 | 42 |
 | Batch reconnect only | 0.703 | 0.469 | 0.542 | 42 |
 | Duplicate suppression only | 0.704 | 0.469 | 0.542 | 42 |
@@ -450,10 +468,10 @@ entry/capacity checks lower short-sequence recall. Use it when preventing GID
 proliferation is the priority, and validate it on the full sequence before
 considering it as the default profile.
 
-The older identity-v2 candidates below were compared on the full 9,000-frame
-Modal T4 evaluation. They missed the strict release gate and remain explicit
-experiments. The newer drift guard is deliberately smaller in scope and was
-accepted from a same-input CPU A/B capped at 1,000 frames:
+The older identity-v2 candidates below were compared on a separate historical
+9,000-frame Modal T4 evaluation. They missed their release gate and remain
+explicit experiments. The drift-guard table is a historical 1,000-frame A/B,
+not the current runtime-default decision:
 
 | 1,000-frame profile | IDF1 | IDP | IDR | HOTA | AssA | MOTA | IDSW |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -517,11 +535,11 @@ To benchmark inference, tracking and fusion separately from visualization:
 ```bash
 uv run python benchmarks/cpu_pipeline.py --frames 300 --out data/cpu-audit/run.json
 uv run python benchmarks/cpu_pipeline.py --frames 300 \
-  --tracking-profile identity-v1-drift-guard \
-  --out data/cpu-audit/drift-guard.json
+  --tracking-profile hybridsort-balanced \
+  --out data/cpu-audit/hybridsort-balanced.json
 uv run python benchmarks/cpu_pipeline.py --frames 100 --profile --out data/cpu-audit/profile.json
 uv run python benchmarks/state_retention.py \
-  --tracking-profile identity-v1-drift-guard
+  --tracking-profile hybridsort-balanced
 ```
 
 For a bounded decision audit, stream fusion events and evaluator-attributed
@@ -529,7 +547,7 @@ ID switches directly to JSONL:
 
 ```bash
 uv run evaluate --device cpu --max-frames 300 \
-  --profile identity-v1-drift-guard \
+  --profile hybridsort-balanced \
   --identity-events data/cpu-audit/identity-events.jsonl \
   --cameras camera_0001 camera_0007 camera_0008 camera_0010
 ```
@@ -559,7 +577,8 @@ src/multicam_tracker/
 ├── timebase.py           # FramePacket and affine camera clock contract
 ├── video.py              # lockstep dataset + bounded async readers
 ├── detector.py           # batched YOLO26 wrapper
-├── local_tracker.py      # local tracker factory (OC-SORT default)
+├── local_tracker.py      # local tracker factory (Hybrid-SORT effective default)
+├── hybridsort.py         # predicted/observed-IoU Hybrid-SORT tracker
 ├── ocsort.py             # OCM + OCR + ORU local tracker
 ├── bytetrack.py          # shared Kalman + legacy ByteTrack A/B backend
 ├── fusion.py             # cross-camera association — the core idea
@@ -569,6 +588,7 @@ src/multicam_tracker/
 ├── demo.py               # the pipeline as one readable loop + CLI
 ├── evaluate.py           # metrics vs ground truth
 ├── mot_metrics.py        # Identity, CLEAR MOT and HOTA for world points
+├── stage_diagnostics.py  # detector→local→fusion→public coverage funnel
 ├── check_calibration.py  # dataset geometry sanity checks
 └── render_preview.py     # composite MP4/GIF clips
 ```
@@ -580,7 +600,7 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | Knob | Default | Effect |
 |---|---|---|
 | `stride` | 1 | detect/track every decoded frame; values >1 explicitly skip frames |
-| `local_tracker` | `ocsort` | per-camera backend; set `bytetrack` only for rollback/A/B |
+| `local_tracker` | `hybridsort` (effective profile) | per-camera backend; set `ocsort` or `bytetrack` only for rollback/A/B |
 | `conf_threshold` | 0.25 | detection floor; low values feed OC-SORT's optional BYTE extension |
 | `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
 | `track_tentative_max_misses` | 0 | misses tolerated before an unconfirmed local track is deleted; candidate profiles use 1 |
@@ -593,7 +613,7 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `ocsort_delta_t` | 3 ticks | observation look-back used to estimate motion direction |
 | `ocsort_inertia` | 0.10 | weight of observation-direction consistency in primary matching |
 | `ocsort_use_byte` | true | allow low-confidence boxes to update an existing track, never to create one |
-| `ocsort_observation_recovery_enabled` | true | enable last-observation recovery (OCR) after prediction mismatch |
+| `ocsort_observation_recovery_enabled` | false in `hybridsort` | OC-SORT-only last-observation recovery switch |
 | `ocsort_oru_enabled` | false | optional virtual Kalman re-update; release A/B keeps it off because it reduced IDF1 |
 | `ocsort_oru_min_misses` | 2 ticks | avoid rebuilding motion from a one-frame merged detection at a crossing |
 | `hybridsort_ambiguity_suppression_enabled` | false | optional merged-box crossing guard; experimental because it trades recall for fewer switches |
@@ -605,21 +625,21 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `fusion_identity_retention_s` | 3.0 s | hidden identity retention; the experimental v2 profiles use 8 s |
 | `fusion_output_grace_s` | 0.25 s | publish freshness; retained IDs are not emitted as stale people |
 | `fusion_published_motion_gate_enabled` | false | experimental hard/soft motion policy for already-published GIDs |
-| `fusion_batch_reconnect_enabled` | false | experimental order-independent one-to-one fragment assignment |
-| `fusion_provisional_buffer_enabled` | false | optional extra age buffer; `fusion_min_hits` still hides unconfirmed births |
+| `fusion_batch_reconnect_enabled` | true in `hybridsort` | order-independent one-to-one fragment assignment |
+| `fusion_provisional_buffer_enabled` | true in `hybridsort` | buffer private provisional IDs before public allocation |
 | `fusion_event_time_gate_s` | 0.15 s | simultaneous-geometry gate after clock correction |
 | `fusion_local_reconnect_gate_m` | 1.0 m | reconnect a fragmented local ID to a retained same-camera global track |
 | `fusion_local_reconnect_window_s` | 3.0 s | default reconnect horizon; v2 uses a 1 s strict short window |
 | `fusion_local_reconnect_covariance_enabled` | false | experimental 2-D NIS gate (`fusion_local_reconnect_nis_gate=9.21`) |
-| `fusion_local_reconnect_confirmations` | 1 | v2 requires 2 observations for ambiguous/long-gap reconnects |
+| `fusion_local_reconnect_confirmations` | 2 in `hybridsort` | observations required for ambiguous/long-gap reconnects |
 | `fusion_local_reconnect_long_window_s` | 3.0 s | v2 can retain up to 8 s only with boundary and motion evidence |
 | `fusion_boundary_margin_ratio` | 0.06 | image-edge entry/exit band used by long reconnect |
-| `fusion_duplicate_merge_m` | 0 (off) | experimental profile uses a tight 0.30 m duplicate radius |
+| `fusion_duplicate_merge_m` | 0.30 m in `hybridsort` | tight duplicate radius, still protected by confirmation and motion checks |
 | `fusion_duplicate_confirmations` | 5 | consecutive duplicate evidence before irreversible merge |
 | `fusion_instant_velocity_weight_s` | 0 (off) | optional motion re-ranking at ambiguous cross-camera merges |
 | `fusion_instant_opposite_direction_cosine` | -1.1 (off) | optional opposite-direction veto; e.g. `-0.25` for a conservative crossing guard |
 | `fusion_min_hits` | 3 | ticks of support before a global track is shown |
-| `tracklet_history_s` | 5.0 s | bounded metadata history per local ID |
+| `tracklet_history_s` | 7.0 s in `hybridsort` | bounded metadata history per local ID |
 | `max_camera_offset_s` | 3.0 s | coarse residual clock-offset search radius |
 | `clock_max_pair_delta_spread_s` | 0.40 s | reject inconsistent multi-person clock evidence; `identity-v1-baseline` restores the legacy unlimited value |
 | `tracklet_min_duration_s` / `tracklet_min_overlap_s` | 1.0 / 0.8 s | evidence required before cross-camera merge |
@@ -633,11 +653,11 @@ counts. The older tick knobs are used only by callers that omit timestamps.
 
 ### Detector/tracker A/B profiles
 
-`hybridsort-balanced` is the current production candidate: it keeps the
-validated detector floor/resolution (`0.25`, `640`) and lets a tentative local
-track survive one missed frame. On the bundled 300-tick cache it improved IDF1,
-precision and recall, but it is not promoted to the default until a same-run
-2k/4k evaluation passes the long-sequence gates.
+`hybridsort-balanced` is the corrected audit reference: it keeps the detector
+floor/resolution (`0.25`, `640`) and lets a tentative local track survive one
+missed frame. It is **not** the production default and must not be promoted:
+the continuous 4,000-tick run failed the IDF1/IDR/recall, identity-churn, and
+long-sequence stability gates.
 
 `hybridsort-crossing-guard`, `hybridsort-mid-floor`,
 `hybridsort-low-floor`, and `hybridsort-detect-recall` remain explicit
@@ -645,9 +665,51 @@ experiments. The crossing guard reduced switches/fragmentation at the cost of
 ID recall; detector floors below `0.25` and `imgsz=768` did not beat the
 baseline on the current sequence.
 
+The `hybridsort-a1-*` through `hybridsort-a5-*` profiles, including trajectory
+smoothing and fixed/offset-only clock controls, are audit ablations. The A2
+trajectory profile improved aggregate IDF1/HOTA but increased 4,000-tick IDSW
+by 17.8% and fragmentation by 25.9%; keep it off.
+
+Late identity binding is available in two explicit candidates. Both keep a
+new fragment private for a bounded event-time window and let normal
+reconnect/trajectory matching resolve it before allocating a public GID. The
+offline evaluator and renderer delay only lightweight identity snapshots, so
+a later canonical alias is applied to earlier frames without buffering video
+images. `hybridsort-late-binding` is ID-first; the
+`hybridsort-late-binding-balanced` variant permits verified interior births to
+preserve recall. On the same 1,000-tick four-camera cache, the balanced variant
+changed IDF1 0.6097→0.6136, HOTA 0.3623→0.3717, IDSW 66→54, fragmentation
+99→82, and recall 0.7186→0.7118. It remains a candidate until a full 4,000-tick
+T4 evaluation passes.
+
+`hybridsort-crowd-recovery` extends the balanced candidate for stationary,
+dense groups. A lost confirmed local identity is retained for reappearance;
+appearance + geometry must win with a margin for three consecutive frames
+before the old local ID is restored. At fusion level, the same-camera
+appearance prototype protects an existing public GID from a recycled local ID,
+and permits an otherwise ambiguous stationary reconnect only when the evidence
+is strong. Descriptors are compact metadata; crops are not retained.
+
+Identity lifetime, observation lifetime, and drawing lifetime are separate:
+
+- `camera_tracks` / `global_tracks` contain only current observations and are
+  the sole inputs to MOT metrics.
+- `camera_identity_tracks` / `global_identity_tracks` also retain dormant
+  identities so a short occlusion does not force a new ID.
+- `camera_render_tracks` / `global_render_tracks` may draw a short predicted
+  state as a dashed `OCC` track. This visual continuity never creates a scored
+  detection.
+
 ```bash
 uv run evaluate --profile hybridsort-balanced --max-frames 2000 \
   --metric-window-frames 500 --metrics-out mot-balanced-2000.json
+
+uv run --extra modal modal run modal_app.py \
+  --evaluate --max-frames 4000 \
+  --tracking-profile hybridsort-crowd-recovery \
+  --cameras camera_0001,camera_0007,camera_0008,camera_0010 \
+  --metric-window-frames 500 \
+  --metrics-out mot-crowd-recovery-4000.json
 ```
 
 A detection cache recorded at a low confidence floor can be replayed at any
