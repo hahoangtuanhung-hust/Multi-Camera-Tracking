@@ -309,11 +309,13 @@ NIS outlier protection, merged-box suppression, and lost-observation prediction
 are available as controlled profile switches; the latter policies remain off
 in the effective default because their A/B results did not clear release gates.
 
-The default profiles remain appearance-free. `hybridsort-crowd-recovery` adds
-a small three-stripe HSV descriptor, stored as metadata rather than an image,
-for same-camera reappearance and local-ID ownership checks. It is deliberately
-not used as cross-camera ReID or FaceID. Select OC-SORT or the legacy ByteTrack
-backend explicitly with `--local-tracker ocsort|bytetrack`.
+The default profiles remain appearance-free. `hybridsort-crowd-recovery` is a
+feature-flagged T4 candidate that adds a small three-stripe HSV descriptor,
+stored as metadata rather than an image, for same-camera reappearance and
+local-ID ownership checks. It is deliberately not used as cross-camera ReID
+or FaceID. The stationary reconnect experiment remains separate because its
+real-frame screen regressed identity metrics. Select OC-SORT or the legacy
+ByteTrack backend explicitly with `--local-tracker ocsort|bytetrack`.
 
 Per-camera IDs still fragment under long occlusions (watch the racks in
 camera_0001). That's expected — and it's exactly what the next stage fixes.
@@ -529,6 +531,14 @@ CPU inference uses up to four PyTorch threads, one OpenCV operation thread,
 and one FFmpeg decoder thread per camera. `--cpu-threads` changes the PyTorch
 budget without changing frames or model accuracy. Ultralytics already uses
 inference mode; its device initialization callback reapplies this thread budget.
+The current four-camera Windows CPU audit selected four PyTorch threads:
+1/2/4/8-thread runs measured 1.89/1.43/2.04/1.45 tick/s on the same 60-tick
+workload with identical identity metrics. See
+[the 2026-10-19 optimization audit](docs/performance-identity-optimization-2026-10-19.md).
+
+CUDA FP16 and `torch.compile` are explicit A/B controls (`detector_fp16` and
+`detector_compile`). Both remain off by default until the target GPU clears
+throughput, IDF1/HOTA, IDSW, and determinism gates. CPU and MPS always use FP32.
 
 To benchmark inference, tracking and fusion separately from visualization:
 
@@ -538,6 +548,13 @@ uv run python benchmarks/cpu_pipeline.py --frames 300 \
   --tracking-profile hybridsort-balanced \
   --out data/cpu-audit/hybridsort-balanced.json
 uv run python benchmarks/cpu_pipeline.py --frames 100 --profile --out data/cpu-audit/profile.json
+uv run python benchmarks/cpu_pipeline.py --frames 300 --stride 2 \
+  --out data/cpu-audit/stride-2.json
+uv run python benchmarks/replay_cpu.py \
+  --detections data/cpu-audit/detections-low-floor-4000.pkl \
+  --out data/cpu-audit/fast-replay.json --only-current \
+  --profile hybridsort --fast-metrics \
+  --skip-stage-diagnostics --skip-memory-profile
 uv run python benchmarks/state_retention.py \
   --tracking-profile hybridsort-balanced
 ```
@@ -602,6 +619,8 @@ All knobs live in `config.py` (`PipelineConfig`); the important ones:
 | `stride` | 1 | detect/track every decoded frame; values >1 explicitly skip frames |
 | `local_tracker` | `hybridsort` (effective profile) | per-camera backend; set `ocsort` or `bytetrack` only for rollback/A/B |
 | `conf_threshold` | 0.25 | detection floor; low values feed OC-SORT's optional BYTE extension |
+| `detector_fp16` | false | CUDA-only FP16 inference A/B; CPU/MPS remain FP32 |
+| `detector_compile` | false | opt-in `torch.compile`; benchmark warm-up and steady state on the deployment GPU |
 | `track_high_conf` | 0.5 | stage-1 association + track birth threshold |
 | `track_tentative_max_misses` | 0 | misses tolerated before an unconfirmed local track is deleted; candidate profiles use 1 |
 | `track_max_age` | 60 ticks | legacy no-timestamp fallback (~2 s at 30 fps) |
@@ -665,6 +684,13 @@ experiments. The crossing guard reduced switches/fragmentation at the cost of
 ID recall; detector floors below `0.25` and `imgsz=768` did not beat the
 baseline on the current sequence.
 
+`hybridsort-realtime` (`imgsz=480`, confidence `0.20`) is also an explicit
+speed/quality ablation, not a recommended default. On the controlled 300-tick
+CPU run it improved end-to-end throughput by 26% but reduced IDF1 by 19.8%,
+increased IDSW by 56%, and increased fragmentation by 154%. `stride=2`
+increased source-time throughput by 52% with a 2.7% IDF1 loss. Keep the
+release default at `imgsz=640`, `stride=1` when identity quality is primary.
+
 The `hybridsort-a1-*` through `hybridsort-a5-*` profiles, including trajectory
 smoothing and fixed/offset-only clock controls, are audit ablations. The A2
 trajectory profile improved aggregate IDF1/HOTA but increased 4,000-tick IDSW
@@ -682,13 +708,15 @@ changed IDF1 0.6097→0.6136, HOTA 0.3623→0.3717, IDSW 66→54, fragmentation
 99→82, and recall 0.7186→0.7118. It remains a candidate until a full 4,000-tick
 T4 evaluation passes.
 
-`hybridsort-crowd-recovery` extends the balanced candidate for stationary,
-dense groups. A lost confirmed local identity is retained for reappearance;
-appearance + geometry must win with a margin for three consecutive frames
-before the old local ID is restored. At fusion level, the same-camera
-appearance prototype protects an existing public GID from a recycled local ID,
-and permits an otherwise ambiguous stationary reconnect only when the evidence
-is strong. Descriptors are compact metadata; crops are not retained.
+`hybridsort-crowd-recovery` extends the balanced candidate for dense groups. A
+lost confirmed local identity is retained for reappearance; appearance +
+geometry must win with a margin for three consecutive frames before the old
+local ID is restored. At fusion level, the same-camera appearance prototype
+protects an existing public GID from a recycled local ID. Stationary reconnect
+is isolated in `hybridsort-crowd-stationary-reconnect` and is not composed into
+the candidate after its 300-tick real-frame regression. Descriptors are compact
+metadata; crops are not retained. See the
+[real-frame crowd recovery audit](docs/crowd-recovery-audit-2026-10-18.md).
 
 Identity lifetime, observation lifetime, and drawing lifetime are separate:
 
@@ -715,6 +743,11 @@ uv run --extra modal modal run modal_app.py \
 A detection cache recorded at a low confidence floor can be replayed at any
 stricter floor; replay rejects attempts below the recorded floor because those
 boxes are absent.
+
+Appearance profiles must be replayed with `--video-frames`, which decodes the
+exact source frame recorded by the versioned cache. Placeholder 1x1 images are
+accepted only with the explicit `--allow-placeholder-frames` smoke-test flag
+and must not be used to claim appearance quality.
 
 ### Fault simulation and tests
 

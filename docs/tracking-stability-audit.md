@@ -5,6 +5,10 @@ Audit date: 2026-10-15. Dataset: `data/custom`; cameras `camera_0001`,
 time; fixed evaluator frame offset 0. The final runs replay one continuous
 4,000-tick detector cache (16,000 camera frames), not concatenated clips.
 
+Follow-up: the 2026-10-18 real-frame crowd recovery work, rejected ablations,
+and current T4 release commands are documented in
+[crowd-recovery-audit-2026-10-18.md](crowd-recovery-audit-2026-10-18.md).
+
 ## Outcome
 
 **Do not promote a new production profile.** The correctness, observability,
