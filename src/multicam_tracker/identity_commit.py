@@ -43,11 +43,20 @@ class IdentityCommitBuffer:
         self._pending: deque[_PendingIdentityFrame] = deque()
         self._aliases: dict[int, int] = {}
         self.metrics: defaultdict[str, int] = defaultdict(int)
+        self._decisions: dict[int, dict] = {}
+        self._terminal_contract = False
+        self._finalizer = None
+        self.lifecycle_report: dict = {}
+        self.final_pipeline_metrics: dict = {}
+        self._frame_outcomes: defaultdict[int, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     def push_tick(self, tick: Mapping[str, object]) -> list[CommittedIdentityFrame]:
         """Add one pipeline tick and return frames whose delay has elapsed."""
         frame_index = int(tick["frame_index"])
         capture_ts_s = float(tick["capture_ts_s"])
+        self._terminal_contract = bool(tick.get("identity_terminal_contract", False))
+        self._finalizer = tick.get("identity_finalizer")
+        self._consume_decisions(tick.get("identity_decisions", {}))
         aliases = tick.get("identity_aliases", {})
         if isinstance(aliases, Mapping):
             self._aliases.update({int(k): int(v) for k, v in aliases.items()})
@@ -89,7 +98,22 @@ class IdentityCommitBuffer:
 
     def flush(self) -> list[CommittedIdentityFrame]:
         """Commit every remaining frame using the final known alias graph."""
-        return self._drain(float("inf"), force=True)
+        if callable(self._finalizer):
+            final = self._finalizer()
+            self._aliases.update(final["identity_aliases"])
+            self._consume_decisions(final["identity_decisions"])
+            self.lifecycle_report = final["identity_lifecycle"]
+            self.final_pipeline_metrics = final["metrics"]
+        result = self._drain(float("inf"), force=True)
+        for record in self.lifecycle_report.get("records", []):
+            record["frame_outcomes"] = dict(self._frame_outcomes.get(record["provisional_gid"], {}))
+        return result
+
+    def _consume_decisions(self, decisions) -> None:
+        for gid, decision in decisions.items():
+            self._decisions[int(gid)] = dict(decision)
+            if decision.get("public_gid") is not None:
+                self._aliases[int(gid)] = int(decision["public_gid"])
 
     def _drain(
         self, watermark_s: float, *, force: bool
@@ -127,8 +151,21 @@ class IdentityCommitBuffer:
         for internal_gid, position in frame.hypotheses.items():
             canonical_gid = self._resolve_gid(internal_gid)
             if canonical_gid <= 0:
+                decision = self._decisions.get(internal_gid) or self._decisions.get(canonical_gid)
+                if decision and decision["outcome"] == "REJECTED_FALSE_TRACK":
+                    self.metrics["identity_commit_intentionally_rejected_hypotheses"] += 1
+                    self._frame_outcomes[internal_gid]["rejected"] += 1
+                    continue
+                if self._terminal_contract:
+                    # A missing decision is a contract violation, not a score
+                    # improvement obtained by renaming an unresolved counter.
+                    raise RuntimeError(f"No terminal decision for private GID {internal_gid} at frame {frame.frame_index}")
                 self.metrics["identity_commit_unresolved_hypotheses_dropped"] += 1
+                self._frame_outcomes[internal_gid]["unresolved"] += 1
                 continue
+            if internal_gid < 0:
+                self.metrics["identity_commit_backfilled_hypotheses"] += 1
+                self._frame_outcomes[internal_gid]["backfilled"] += 1
             grouped_positions[canonical_gid].append((internal_gid, position))
 
         predictions: dict[int, np.ndarray] = {}

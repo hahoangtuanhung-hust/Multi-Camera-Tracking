@@ -1,15 +1,16 @@
-"""Small, dependency-free person appearance descriptors for recovery events.
+"""Same-camera appearance: default HSV and opt-in trained TorchScript ReID.
 
-This is deliberately not a face identifier or a neural ReID system.  It keeps
-only a normalized, short-lived colour descriptor computed from the inner body
-crop.  The descriptor is useful as a veto/tie-breaker when geometry becomes
-degenerate in a stationary crowd, while the normal hot path remains unchanged.
+Descriptors are motion-gated veto/tie-breakers, not standalone identifiers.
+Neural weights must be provided explicitly; the default path stays HSV-only.
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
+from functools import lru_cache
+from pathlib import Path
+import hashlib
 
 
 def normalize_descriptor(descriptor: np.ndarray | None) -> np.ndarray | None:
@@ -120,3 +121,93 @@ def extract_person_descriptors(
     """Extract descriptors in exactly the same order as ``detections``."""
     values = np.asarray(detections, dtype=float).reshape((-1, 5))
     return [extract_person_descriptor(frame_bgr, item[:4]) for item in values]
+
+
+@lru_cache(maxsize=2)
+def _load_scripted_reid(path: str, sha256: str, device: str):
+    """Load a user-supplied, trained TorchScript ReID encoder; never download."""
+    import torch
+    checkpoint = Path(path)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    if digest != sha256:
+        raise ValueError("ReID checkpoint SHA-256 mismatch")
+    return torch.jit.load(str(checkpoint), map_location=device).eval()
+
+
+class PersonAppearanceBackend:
+    """Same-camera descriptor adapter with quality gating and batched inference.
+
+    TorchScript contract: ImageNet-normalized RGB float32 NCHW, 256x128 input,
+    finite NxD output trained for person ReID. A random/classification backbone
+    is not substituted for missing trained weights.
+    """
+    def __init__(self, cfg):
+        self.cfg = cfg
+        if cfg.appearance_backend not in {"hsv", "torchscript"}:
+            raise ValueError("appearance_backend must be hsv or torchscript")
+        if cfg.appearance_gallery_size < 1 or cfg.appearance_min_crop_height < 8:
+            raise ValueError("invalid appearance gallery/crop size")
+        if not 0 < cfg.appearance_max_crop_overlap <= 1:
+            raise ValueError("invalid appearance overlap gate")
+        self.model = None
+        self.inference_batches = self.inference_crops = self.quality_rejections = 0
+        if cfg.appearance_backend == "torchscript":
+            if not cfg.appearance_model_path or not cfg.appearance_model_sha256:
+                raise ValueError("trained ReID checkpoint path and SHA-256 are required")
+            self.model = _load_scripted_reid(str(Path(cfg.appearance_model_path).resolve()),
+                                             cfg.appearance_model_sha256, cfg.device)
+
+    def extract(self, frame, detections, *, event=True):
+        detections = np.asarray(detections, dtype=float).reshape((-1, 5))
+        if self.cfg.appearance_event_triggered and not event:
+            return [None] * len(detections)
+        if self.model is None and not self.cfg.appearance_quality_filter_enabled:
+            return extract_person_descriptors(frame, detections)
+        output = [None] * len(detections)
+        if frame is None or frame.ndim != 3:
+            return output
+        height, width = frame.shape[:2]
+        boxes = detections[:, :4]
+        crops, indices = [], []
+        for index, box in enumerate(boxes):
+            x1, y1, x2, y2 = box
+            area = max(0., x2-x1) * max(0., y2-y1)
+            overlap = 0.
+            for other_index, other in enumerate(boxes):
+                if other_index == index:
+                    continue
+                intersection = np.maximum(np.minimum(box[2:], other[2:]) - np.maximum(box[:2], other[:2]), 0.)
+                overlap = max(overlap, float(np.prod(intersection)) / max(area, 1.))
+            if (not np.all(np.isfinite(box)) or y2-y1 < self.cfg.appearance_min_crop_height
+                    or x2-x1 < 8 or min(x1, y1) < 0 or x2 > width or y2 > height
+                    or overlap > self.cfg.appearance_max_crop_overlap):
+                self.quality_rejections += 1
+                continue
+            if self.model is None:
+                output[index] = extract_person_descriptor(frame, box)
+            else:
+                crop = frame[int(y1):int(y2), int(x1):int(x2), :3]
+                crops.append(cv2.resize(crop, (128, 256))[:, :, ::-1].copy())
+                indices.append(index)
+        if crops:
+            import torch
+            values = np.stack(crops).astype(np.float32).transpose(0, 3, 1, 2) / 255.
+            values = (values - np.array([.485, .456, .406], dtype=np.float32)[None, :, None, None]) / np.array([.229, .224, .225], dtype=np.float32)[None, :, None, None]
+            with torch.inference_mode():
+                embeddings = self.model(torch.from_numpy(values).to(self.cfg.device))
+            if not isinstance(embeddings, torch.Tensor) or embeddings.ndim != 2 or embeddings.shape[0] != len(crops):
+                raise ValueError("ReID encoder must return a tensor shaped [N, D]")
+            if not bool(torch.isfinite(embeddings).all()):
+                raise ValueError("ReID encoder produced non-finite embeddings")
+            self.inference_batches += 1
+            self.inference_crops += len(crops)
+            for index, embedding in zip(indices, embeddings.float().cpu().numpy()):
+                output[index] = normalize_descriptor(embedding)
+        return output
+
+
+def gallery_similarity(gallery, descriptor):
+    """Best trusted prototype, never a cross-camera comparison."""
+    scores = [appearance_similarity(item, descriptor) for item in gallery]
+    scores = [score for score in scores if score is not None]
+    return max(scores) if scores else None

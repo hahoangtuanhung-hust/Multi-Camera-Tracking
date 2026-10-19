@@ -11,11 +11,21 @@ from multicam_tracker.config import PipelineConfig
 from multicam_tracker.reporting import (
     build_run_metadata,
     canonical_replay_tick_bytes,
+    committed_stream_hashes,
     validate_json_metadata,
 )
 
 
 class ReportingTests(unittest.TestCase):
+    def test_committed_hashes_include_backfill_and_are_order_independent(self):
+        predictions = [(0, {2: np.array([2., 3.]), 1: np.array([0., 1.])})]
+        sources = {0: {2: [("b", 2), ("a", 1)]}}
+        result = committed_stream_hashes(predictions, sources)
+        reordered = [(0, dict(reversed(list(predictions[0][1].items()))))]
+        self.assertEqual(result, committed_stream_hashes(reordered, {0: {2: [("a", 1), ("b", 2)]}}))
+        self.assertNotEqual(result, committed_stream_hashes([(0, {})], sources))
+        self.assertNotEqual(result, committed_stream_hashes(predictions, {}))
+
     def test_replay_tick_serialization_is_order_independent_and_exact(self) -> None:
         first = {
             "frame_index": 7,

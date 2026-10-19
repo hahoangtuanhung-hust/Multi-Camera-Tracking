@@ -154,9 +154,50 @@ class LifecycleRegressionTests(unittest.TestCase):
         crowd = PipelineConfig()
         apply_tracking_profile(crowd, "hybridsort-crowd-recovery")
         self.assertTrue(crowd.hybridsort_reappearance_enabled)
-        self.assertTrue(crowd.fusion_reconnect_appearance_enabled)
-        self.assertTrue(crowd.fusion_stationary_reconnect_enabled)
+        self.assertFalse(crowd.fusion_reconnect_appearance_enabled)
+        self.assertTrue(crowd.fusion_appearance_ownership_guard_enabled)
+        self.assertFalse(crowd.fusion_stationary_reconnect_enabled)
         self.assertTrue(crowd.render_occluded_tracks_enabled)
+
+        crowd_mid_floor = PipelineConfig()
+        apply_tracking_profile(
+            crowd_mid_floor, "hybridsort-crowd-recovery-mid-floor"
+        )
+        self.assertEqual(crowd_mid_floor.conf_threshold, 0.20)
+        self.assertEqual(
+            crowd_mid_floor.track_high_conf, crowd.track_high_conf
+        )
+
+        crowd_low_floor = PipelineConfig()
+        apply_tracking_profile(
+            crowd_low_floor, "hybridsort-crowd-recovery-low-floor"
+        )
+        self.assertEqual(crowd_low_floor.conf_threshold, 0.15)
+        self.assertEqual(
+            crowd_low_floor.track_high_conf, crowd.track_high_conf
+        )
+
+        local_only = PipelineConfig()
+        apply_tracking_profile(
+            local_only, "hybridsort-crowd-local-reappearance"
+        )
+        self.assertTrue(local_only.hybridsort_reappearance_enabled)
+        self.assertFalse(local_only.fusion_reconnect_appearance_enabled)
+
+        guard_only = PipelineConfig()
+        apply_tracking_profile(guard_only, "hybridsort-crowd-global-guard")
+        self.assertFalse(guard_only.hybridsort_reappearance_enabled)
+        self.assertFalse(guard_only.fusion_reconnect_appearance_enabled)
+        self.assertTrue(guard_only.fusion_appearance_ownership_guard_enabled)
+        self.assertFalse(guard_only.fusion_stationary_reconnect_enabled)
+
+        stationary = PipelineConfig()
+        apply_tracking_profile(
+            stationary, "hybridsort-crowd-stationary-reconnect"
+        )
+        self.assertFalse(stationary.hybridsort_reappearance_enabled)
+        self.assertTrue(stationary.fusion_reconnect_appearance_enabled)
+        self.assertTrue(stationary.fusion_stationary_reconnect_enabled)
 
         trajectory = PipelineConfig()
         apply_tracking_profile(trajectory, "hybridsort-trajectory")

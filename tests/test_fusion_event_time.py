@@ -685,7 +685,7 @@ class EventTimeFusionTests(unittest.TestCase):
         manager = GlobalTrackManager(self._config(
             cameras=["a"],
             fusion_min_hits=1,
-            fusion_reconnect_appearance_enabled=True,
+            fusion_appearance_ownership_guard_enabled=True,
             fusion_appearance_conflict_confirmations=2,
             fusion_appearance_conflict_window_s=0.35,
             fusion_batch_reconnect_enabled=False,
@@ -716,6 +716,37 @@ class EventTimeFusionTests(unittest.TestCase):
             manager.metrics["global_ids_protected_from_local_takeover"], 1
         )
         self.assertEqual(manager.tracklets.metrics["segments_reset"], 1)
+
+    def test_moderate_appearance_drift_keeps_public_gid_owner(self) -> None:
+        manager = GlobalTrackManager(self._config(
+            cameras=["a"],
+            fusion_min_hits=1,
+            fusion_appearance_ownership_guard_enabled=True,
+            fusion_appearance_conflict_min_similarity=0.5,
+            fusion_appearance_conflict_confirmations=2,
+            fusion_batch_reconnect_enabled=False,
+            fusion_instant_merge_enabled=False,
+            tracklet_match_interval_s=10.0,
+        ))
+        reference = np.array([1.0, 0.0, 0.0])
+        viewpoint_shift = np.array([0.6, 0.8, 0.0])
+        manager.step([
+            _obs("a", 1, 0.0, (0.0, 0.0), appearance=reference)
+        ])
+        original_gid = manager.affinity[("a", 1)]
+
+        manager.step([
+            _obs("a", 1, 0.1, (0.1, 0.0), appearance=viewpoint_shift)
+        ])
+        manager.step([
+            _obs("a", 1, 0.2, (0.2, 0.0), appearance=viewpoint_shift)
+        ])
+
+        self.assertEqual(manager.affinity[("a", 1)], original_gid)
+        self.assertEqual(manager.metrics["global_appearance_conflicts"], 0)
+        self.assertEqual(
+            manager.metrics["global_ids_protected_from_local_takeover"], 0
+        )
 
     def test_stationary_interior_fragment_reconnects_by_same_camera_appearance(self) -> None:
         manager = GlobalTrackManager(self._config(

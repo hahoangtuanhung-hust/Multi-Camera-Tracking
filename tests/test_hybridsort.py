@@ -68,8 +68,7 @@ class HybridSortDefaultProfileTests(unittest.TestCase):
 class HybridSortTrackerTests(unittest.TestCase):
     @staticmethod
     def _appearance_frame(colour: tuple[int, int, int]) -> np.ndarray:
-        frame = np.zeros((80, 80, 3), dtype=np.uint8)
-        frame[0:40, 0:20] = colour
+        frame = np.full((80, 120, 3), colour, dtype=np.uint8)
         return frame
 
     def test_reappearance_is_held_until_consecutive_appearance_confirmation(self):
@@ -92,17 +91,113 @@ class HybridSortTrackerTests(unittest.TestCase):
         tracker.update(np.empty((0, 5)), timestamp_s=0.1, frame=frame)
 
         self.assertEqual(
-            tracker.update(_det(0.0), timestamp_s=0.2, frame=frame), []
+            tracker.update(_det(15.0), timestamp_s=0.2, frame=frame), []
         )
         self.assertEqual(
-            tracker.update(_det(0.0), timestamp_s=0.3, frame=frame), []
+            tracker.update(_det(15.0), timestamp_s=0.3, frame=frame), []
         )
-        visible = tracker.update(_det(0.0), timestamp_s=0.4, frame=frame)
+        visible = tracker.update(_det(15.0), timestamp_s=0.4, frame=frame)
 
         self.assertEqual([track.track_id for track in visible], [original_id])
         self.assertEqual(tracker._next_id, 2)
         self.assertEqual(tracker.metrics["appearance_reappearance_matches"], 1)
         self.assertEqual(tracker.metrics["appearance_reappearance_deferred"], 2)
+
+    def test_reappearance_confirmation_resets_when_candidate_changes(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            track_max_age_s=0.1,
+            track_association_nis_gate=1e9,
+            ocsort_use_byte=False,
+            ocsort_observation_recovery_enabled=False,
+            hybridsort_reappearance_enabled=True,
+            hybridsort_reappearance_max_gap_s=2.0,
+            hybridsort_reappearance_confirmations=3,
+            hybridsort_reappearance_min_similarity=0.75,
+            hybridsort_reappearance_min_margin=0.0,
+        )
+        tracker = HybridSortTracker(cfg)
+        frame = self._appearance_frame((0, 0, 255))
+        original_id = tracker.update(
+            _det(0.0), timestamp_s=0.0, frame=frame
+        )[0].track_id
+        tracker.update(np.empty((0, 5)), timestamp_s=0.1, frame=frame)
+
+        self.assertEqual(
+            tracker.update(_det(15.0), timestamp_s=0.2, frame=frame), []
+        )
+        self.assertEqual(
+            tracker.update(_det(55.0), timestamp_s=0.3, frame=frame), []
+        )
+        self.assertEqual(
+            tracker.update(_det(55.0), timestamp_s=0.4, frame=frame), []
+        )
+        visible = tracker.update(_det(55.0), timestamp_s=0.5, frame=frame)
+
+        self.assertEqual([track.track_id for track in visible], [original_id])
+        self.assertEqual(
+            tracker.metrics["appearance_reappearance_candidate_resets"], 1
+        )
+
+    def test_reappearance_hold_expires_and_allows_new_birth(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.20,
+            track_max_age_s=0.1,
+            ocsort_use_byte=False,
+            ocsort_observation_recovery_enabled=False,
+            hybridsort_reappearance_enabled=True,
+            hybridsort_reappearance_max_gap_s=0.3,
+            hybridsort_reappearance_confirmations=10,
+            hybridsort_reappearance_min_similarity=0.75,
+        )
+        tracker = HybridSortTracker(cfg)
+        frame = self._appearance_frame((0, 255, 0))
+        original_id = tracker.update(
+            _det(0.0), timestamp_s=0.0, frame=frame
+        )[0].track_id
+        tracker.update(np.empty((0, 5)), timestamp_s=0.1, frame=frame)
+        self.assertEqual(
+            tracker.update(_det(15.0), timestamp_s=0.2, frame=frame), []
+        )
+
+        visible = tracker.update(_det(15.0), timestamp_s=0.4, frame=frame)
+
+        self.assertEqual(len(visible), 1)
+        self.assertNotEqual(visible[0].track_id, original_id)
+        self.assertEqual(tracker.metrics["tracks_removed_timeout"], 1)
+
+    def test_two_reappearances_are_assigned_one_to_one(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_min_iou=0.10,
+            track_max_age_s=0.1,
+            ocsort_use_byte=False,
+            ocsort_observation_recovery_enabled=False,
+            hybridsort_reappearance_enabled=True,
+            hybridsort_reappearance_max_gap_s=1.0,
+            hybridsort_reappearance_confirmations=1,
+            hybridsort_reappearance_min_similarity=0.75,
+        )
+        tracker = HybridSortTracker(cfg)
+        frame = self._appearance_frame((255, 0, 0))
+        original = tracker.update(
+            np.vstack((_det(0.0), _det(60.0))),
+            timestamp_s=0.0,
+            frame=frame,
+        )
+        original_ids = sorted(track.track_id for track in original)
+        tracker.update(np.empty((0, 5)), timestamp_s=0.1, frame=frame)
+
+        visible = tracker.update(
+            np.vstack((_det(75.0), _det(15.0))),
+            timestamp_s=0.2,
+            frame=frame,
+        )
+
+        self.assertEqual(sorted(track.track_id for track in visible), original_ids)
+        self.assertEqual(tracker._next_id, 3)
 
     def test_occluded_identity_retention_is_separate_from_render_window(self):
         cfg = PipelineConfig(
@@ -126,6 +221,24 @@ class HybridSortTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.render_tracks(), [])
         self.assertEqual(tracker.update(np.empty((0, 5)), timestamp_s=1.5), [])
         self.assertEqual(len(tracker.identity_tracks()), 1)
+
+    def test_global_guard_extracts_descriptor_without_local_reappearance(self):
+        cfg = PipelineConfig(
+            track_min_hits=1,
+            track_max_age_s=0.2,
+            hybridsort_reappearance_enabled=False,
+            fusion_appearance_ownership_guard_enabled=True,
+        )
+        tracker = HybridSortTracker(cfg)
+        frame = self._appearance_frame((255, 0, 0))
+
+        visible = tracker.update(_det(0.0), timestamp_s=0.0, frame=frame)
+
+        self.assertEqual(len(visible), 1)
+        self.assertIsNotNone(visible[0].current_appearance)
+        self.assertIsNotNone(visible[0].appearance)
+        tracker.update(np.empty((0, 5)), timestamp_s=0.3, frame=frame)
+        self.assertEqual(tracker.tracks, [])
 
     def test_normal_track_and_confirm(self):
         cfg = PipelineConfig(track_min_hits=3, track_min_iou=0.25)

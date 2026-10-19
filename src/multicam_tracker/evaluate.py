@@ -269,6 +269,7 @@ def main() -> None:
         if int(tick["tick_index"]) % 50 == 0:
             print(f"Evaluated {len(predictions)} ticks in {time.perf_counter() - started:.1f}s", flush=True)
     append_committed_frames(identity_committer.flush(), predictions, source_maps)
+    last_metrics.update(identity_committer.final_pipeline_metrics)
     last_metrics.update(identity_committer.metrics)
     elapsed = time.perf_counter() - started
 
@@ -333,6 +334,7 @@ def main() -> None:
         "expected_people": cfg.fusion_fixed_population_size,
         **metric_slices,
         "identity_diagnostics": identity_diagnostics,
+        "identity_lifecycle": identity_committer.lifecycle_report,
         "switch_diagnostics": switch_diagnostics,
         "identity_error_taxonomy": error_taxonomy,
         "stage_diagnostics": stage_report,

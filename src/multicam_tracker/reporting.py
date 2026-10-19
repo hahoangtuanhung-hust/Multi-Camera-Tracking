@@ -103,6 +103,25 @@ def canonical_replay_tick_bytes(
     return encoded(prediction_record), encoded(assignment_record)
 
 
+def committed_stream_hashes(predictions, source_maps) -> dict[str, str]:
+    """Hash the actual evaluator input, including end-of-stream backfill."""
+    prediction_hash, assignment_hash = hashlib.sha256(), hashlib.sha256()
+    for frame_index, tracks in predictions:
+        records = (
+            [int(frame_index), [[int(gid), np.asarray(xy, dtype=float).tolist()]
+                               for gid, xy in sorted(tracks.items())]],
+            [int(frame_index), [[int(gid), sorted([str(camera), int(local)]
+                                               for camera, local in keys)]
+                               for gid, keys in sorted(source_maps.get(frame_index, {}).items())]],
+        )
+        for digest, record in zip((prediction_hash, assignment_hash), records):
+            payload = json.dumps(record, separators=(",", ":"), allow_nan=False).encode()
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return {"committed_prediction_stream_sha256": prediction_hash.hexdigest(),
+            "committed_assignment_stream_sha256": assignment_hash.hexdigest()}
+
+
 def build_run_metadata(
     cfg: PipelineConfig,
     *,

@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 
@@ -12,6 +13,60 @@ from multicam_tracker.detection_cache import (
     filter_cached_detection_batch,
     validate_detection_cache,
 )
+from multicam_tracker.video import IndexedVideoFrameReader
+
+
+class _FakeCapture:
+    def __init__(self, frames: list[np.ndarray]) -> None:
+        self.frames = frames
+        self.index = 0
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return True
+
+    def grab(self) -> bool:
+        if self.index >= len(self.frames):
+            return False
+        self.index += 1
+        return True
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        if self.index >= len(self.frames):
+            return False, None
+        frame = self.frames[self.index].copy()
+        self.index += 1
+        return True, frame
+
+    def release(self) -> None:
+        self.released = True
+from multicam_tracker.video import IndexedVideoFrameReader
+
+
+class _FakeCapture:
+    def __init__(self, frames: list[np.ndarray]) -> None:
+        self.frames = frames
+        self.index = 0
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return True
+
+    def grab(self) -> bool:
+        if self.index >= len(self.frames):
+            return False
+        self.index += 1
+        return True
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        if self.index >= len(self.frames):
+            return False, None
+        frame = self.frames[self.index].copy()
+        self.index += 1
+        return True, frame
+
+    def release(self) -> None:
+        self.released = True
 
 
 class DetectionCacheTests(unittest.TestCase):
@@ -104,6 +159,35 @@ class DetectionCacheTests(unittest.TestCase):
         np.testing.assert_allclose(filtered[0][:, 4], [0.20, 0.80])
         self.assertFalse(np.shares_memory(filtered[0], batch[0]))
 
+    def test_indexed_video_reader_decodes_exact_cached_source_frame(self) -> None:
+        frames = [
+            np.full((2, 3, 3), value, dtype=np.uint8)
+            for value in range(5)
+        ]
+        capture = _FakeCapture(frames)
+        with patch("multicam_tracker.video.open_video", return_value=capture):
+            with IndexedVideoFrameReader(
+                Path("unused"), ["camera_0001"]
+            ) as reader:
+                np.testing.assert_array_equal(
+                    reader.read("camera_0001", 2), frames[2]
+                )
+                np.testing.assert_array_equal(
+                    reader.read("camera_0001", 4), frames[4]
+                )
+        self.assertTrue(capture.released)
+
+    def test_indexed_video_reader_rejects_frame_rewind(self) -> None:
+        capture = _FakeCapture([
+            np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(3)
+        ])
+        with patch("multicam_tracker.video.open_video", return_value=capture):
+            with IndexedVideoFrameReader(
+                Path("unused"), ["camera_0001"]
+            ) as reader:
+                reader.read("camera_0001", 1)
+                with self.assertRaisesRegex(ValueError, "Non-monotonic"):
+                    reader.read("camera_0001", 0)
 
 if __name__ == "__main__":
     unittest.main()

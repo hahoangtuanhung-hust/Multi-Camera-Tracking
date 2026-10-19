@@ -25,6 +25,7 @@ from .appearance import (
 from .bytetrack import ConstantVelocityKalman
 from .config import PipelineConfig
 from .diagnostics import IdentityEventWriter
+from .identity_lifecycle import IdentityLifecycle, TerminalBinding
 from .spatiotemporal import fit_weighted_trajectory, get_ground_plane_location
 from .tracklets import CameraClockOffsetEstimator, MatchResult, TrackletKey, TrackletMatcher, TrackletStore
 
@@ -131,6 +132,25 @@ class GlobalTrackManager:
     """Fuse observations and maintain canonical, alias-safe global IDs."""
 
     def __init__(self, cfg: PipelineConfig):
+        if cfg.fusion_terminal_binding_enabled:
+            if not (cfg.fusion_identity_lifecycle_enabled and cfg.fusion_deferred_gid_allocation_enabled):
+                raise ValueError("terminal binding requires lifecycle and deferred allocation")
+            horizon = cfg.fusion_late_identity_max_defer_s + cfg.fusion_terminal_grace_s
+            if (not np.isfinite(horizon) or horizon <= 0
+                    or not np.isfinite(cfg.fusion_identity_commit_delay_s)
+                    or cfg.fusion_identity_commit_delay_s < horizon):
+                raise ValueError("commit delay must cover the terminal decision horizon")
+            if cfg.fusion_provisional_min_age_s > horizon:
+                raise ValueError("minimum private age exceeds terminal horizon")
+        if cfg.fusion_terminal_batch_enabled and not cfg.fusion_terminal_binding_enabled:
+            raise ValueError("terminal batch requires terminal binding")
+        if cfg.fusion_lifecycle_report_limit < 1 or cfg.fusion_terminal_confirmations < 1:
+            raise ValueError("lifecycle limit and confirmations must be positive")
+        for name in ("fusion_terminal_grace_s", "fusion_terminal_confirmation_window_s",
+                     "fusion_terminal_max_cost", "fusion_terminal_margin", "fusion_terminal_nis_gate"):
+            value = getattr(cfg, name)
+            if not np.isfinite(value) or value < 0 or (name != "fusion_terminal_margin" and value == 0):
+                raise ValueError(f"invalid {name}")
         if cfg.fusion_provisional_min_age_s < 0:
             raise ValueError("fusion_provisional_min_age_s must be >= 0")
         if cfg.fusion_provisional_buffer_bootstrap_s < 0:
@@ -170,6 +190,10 @@ class GlobalTrackManager:
         if not -1.0 <= cfg.fusion_reconnect_appearance_min_similarity <= 1.0:
             raise ValueError(
                 "fusion_reconnect_appearance_min_similarity must be in [-1, 1]"
+            )
+        if not -1.0 <= cfg.fusion_appearance_conflict_min_similarity <= 1.0:
+            raise ValueError(
+                "fusion_appearance_conflict_min_similarity must be in [-1, 1]"
             )
         if cfg.fusion_reconnect_appearance_weight_m < 0:
             raise ValueError("fusion_reconnect_appearance_weight_m must be >= 0")
@@ -249,6 +273,9 @@ class GlobalTrackManager:
         self.clock_estimator = CameraClockOffsetEstimator(cfg, reference)
         self.matcher = TrackletMatcher(cfg)
         self.metrics: defaultdict[str, int | float] = defaultdict(int)
+        self.lifecycle = IdentityLifecycle(cfg.fusion_lifecycle_report_limit)
+        self.terminal_binding = TerminalBinding(self)
+        self._identity_finalized = False
         self.last_accepted_observation_keys: set[TrackletKey] = set()
         self._next_gid = 1
         self._next_provisional_gid = -1
@@ -302,7 +329,25 @@ class GlobalTrackManager:
         return float(arrival_ts_s)
 
     def close(self) -> None:
+        self.finalize_identities()
         self._diagnostics.close()
+
+    def finalize_identities(self) -> dict:
+        """End-of-stream decisions without inventing observations or votes."""
+        if self.cfg.fusion_identity_lifecycle_enabled and not self._identity_finalized:
+            if self.cfg.fusion_terminal_binding_enabled:
+                self.terminal_binding.step(final=True)
+            self.lifecycle.annotate(self)
+            for record in list(self.lifecycle.pending.values()):
+                self.lifecycle.finish(record["internal_gid"], "UNRESOLVED_ERROR",
+                                      self._max_event_ts_s, "end_of_stream_unresolved")
+            self._identity_finalized = True
+        return {
+            "identity_aliases": dict(self.aliases),
+            "identity_decisions": dict(self.lifecycle.decisions),
+            "identity_lifecycle": self.lifecycle.report(),
+            "metrics": dict(self.metrics),
+        }
 
     def record_diagnostic_event(self, event: str, **fields) -> None:
         """Append a non-fusion event to the shared bounded diagnostics log."""
@@ -481,7 +526,7 @@ class GlobalTrackManager:
         consecutive before the old public owner is detached; until then the
         observation is withheld rather than corrupting the canonical GID.
         """
-        if not self.cfg.fusion_reconnect_appearance_enabled:
+        if not self.cfg.fusion_appearance_ownership_guard_enabled:
             self._appearance_conflict_votes.pop(key, None)
             return "accept"
         prototype = track.appearance_by_camera.get(observation.camera)
@@ -491,7 +536,7 @@ class GlobalTrackManager:
             return "accept"
         if (
             similarity + 1e-9
-            >= self.cfg.fusion_reconnect_appearance_min_similarity
+            >= self.cfg.fusion_appearance_conflict_min_similarity
         ):
             self._appearance_conflict_votes.pop(key, None)
             return "accept"
@@ -590,6 +635,7 @@ class GlobalTrackManager:
         changed_keys: set[TrackletKey] = set()
         accepted: list[CameraObservation] = []
         records: list[tuple[CameraObservation, TrackletKey, int, bool]] = []
+        appearance_takeover_blocks: dict[TrackletKey, int] = {}
         for obs in ordered:
             event_ts = float(obs.capture_ts_s)
             arrival_ts = float(obs.arrival_ts_s) if obs.arrival_ts_s is not None else event_ts
@@ -612,6 +658,7 @@ class GlobalTrackManager:
                     # inconsistent crop contaminate its motion or appearance.
                     continue
                 if ownership == "takeover":
+                    appearance_takeover_blocks[key] = mapped_gid
                     self.affinity.pop(key, None)
                     self.members[mapped_gid].discard(key)
                     self.tracklets.reset(key)
@@ -665,6 +712,18 @@ class GlobalTrackManager:
             gid = self.resolve_gid(initial_gid)
             reconnect = reconnects.get(key)
             pingpong_blocked = False
+            if reconnect is not None:
+                candidate, requires_confirmation = reconnect
+                candidate = self.resolve_gid(candidate)
+                blocked_gid = appearance_takeover_blocks.get(key)
+                if (
+                    blocked_gid is not None
+                    and candidate == self.resolve_gid(blocked_gid)
+                ):
+                    self.metrics[
+                        "appearance_takeover_immediate_reconnects_blocked"
+                    ] += 1
+                    reconnect = None
             if reconnect is not None:
                 candidate, requires_confirmation = reconnect
                 candidate = self.resolve_gid(candidate)
@@ -751,9 +810,14 @@ class GlobalTrackManager:
 
         self._expire_event_tracks()
         self._canonicalize_affinity()
-        if self.cfg.fusion_dormant_retention_s > 0:
+        if self.cfg.fusion_dormant_retention_s > 0 and not self.cfg.fusion_terminal_batch_enabled:
             self._match_dormant_tracks(self._max_event_ts_s)
-        self._promote_ready_provisionals()
+        if self.cfg.fusion_terminal_binding_enabled:
+            self.terminal_binding.step()
+        else:
+            self._promote_ready_provisionals()
+        if self.cfg.fusion_identity_lifecycle_enabled:
+            self.lifecycle.annotate(self)
         self._prune_identity_metadata()
         self._update_population_metrics()
         visible: list[GlobalTrack] = []
@@ -862,6 +926,8 @@ class GlobalTrackManager:
         key = obs.camera, int(obs.local_id)
         self.affinity[key] = gid
         self.members[gid].add(key)
+        if self.cfg.fusion_identity_lifecycle_enabled and gid < 0:
+            self.lifecycle.birth(gid, event_ts, key)
         self._identity_event(
             "birth",
             event_ts_s=event_ts,
@@ -1648,6 +1714,10 @@ class GlobalTrackManager:
             return provisional_gid
         public_gid = self._next_gid
         self._next_gid += 1
+        if self.cfg.fusion_identity_lifecycle_enabled:
+            self.lifecycle.annotate(self)
+            self.lifecycle.finish(provisional_gid, "PROMOTED_NEW_GID",
+                                  self._max_event_ts_s, "verified_new_tracklet", public_gid)
         track = self.tracks.pop(provisional_gid)
         track.gid = public_gid
         self.tracks[public_gid] = track
@@ -3086,6 +3156,9 @@ class GlobalTrackManager:
         )
 
         self.aliases[retired] = canonical
+        if self.cfg.fusion_identity_lifecycle_enabled:
+            self.lifecycle.annotate(self)
+            self.lifecycle.merge(retired, canonical, self._max_event_ts_s, reason)
         self._alias_created_s[retired] = self._max_event_ts_s
         self.members[canonical].update(self.members.pop(retired, set()))
         del self.tracks[retired]
@@ -3190,6 +3263,10 @@ class GlobalTrackManager:
         )
         for gid in list(self.tracks):
             track = self.tracks[gid]
+            if gid < 0 and self.cfg.fusion_terminal_binding_enabled:
+                # TerminalBinding owns the bounded private lifetime, including
+                # disappeared tracklets which still need a final decision.
+                continue
             if track.last_seen_ts_s is None:
                 continue
             age_s = self._max_event_ts_s - track.last_seen_ts_s
@@ -3231,6 +3308,10 @@ class GlobalTrackManager:
                         continue
                     self.metrics["forced_identity_retirements"] += 1
 
+            if gid < 0 and self.cfg.fusion_identity_lifecycle_enabled:
+                self.lifecycle.annotate(self)
+                self.lifecycle.finish(gid, "UNRESOLVED_ERROR", self._max_event_ts_s,
+                                      "legacy_private_expiry")
             del self.tracks[gid]
             self.dormant_tracks.pop(gid, None)
             self.members.pop(gid, None)

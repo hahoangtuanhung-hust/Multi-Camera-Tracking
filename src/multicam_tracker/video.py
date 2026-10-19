@@ -27,6 +27,79 @@ def open_video(source: str, decoder_threads: int = 1, live: bool = False):
     return capture
 
 
+class IndexedVideoFrameReader:
+    """Decode the exact source-frame indices recorded in a detection cache.
+
+    Cached detections are only sufficient for motion-only replay. Appearance
+    recovery must see the original pixels that produced each detection. This
+    reader advances each camera independently and rejects non-monotonic frame
+    requests so a replay cannot silently pair a detection with the wrong crop.
+    """
+
+    def __init__(
+        self,
+        scene_dir: Path,
+        cameras: list[str],
+        decoder_threads: int = 1,
+    ) -> None:
+        if not cameras:
+            raise ValueError("At least one camera is required")
+        self.captures: dict[str, cv2.VideoCapture] = {}
+        self.next_indices: dict[str, int] = {}
+        try:
+            for camera in cameras:
+                path = scene_dir / camera / "video.mp4"
+                capture = open_video(str(path), decoder_threads)
+                if not capture.isOpened():
+                    capture.release()
+                    raise FileNotFoundError(f"Cannot open replay video: {path}")
+                self.captures[camera] = capture
+                self.next_indices[camera] = 0
+        except Exception:
+            self.close()
+            raise
+
+    def read(self, camera: str, source_frame_index: int) -> np.ndarray:
+        """Return one exact BGR frame and advance that camera's decoder."""
+        if camera not in self.captures:
+            raise KeyError(f"Unknown replay camera: {camera}")
+        target = int(source_frame_index)
+        if target < 0:
+            raise ValueError("source_frame_index must be >= 0")
+        current = self.next_indices[camera]
+        if target < current:
+            raise ValueError(
+                f"Non-monotonic replay frame for {camera}: "
+                f"requested {target} after {current - 1}"
+            )
+        capture = self.captures[camera]
+        while current < target:
+            if not capture.grab():
+                raise EOFError(
+                    f"Replay video {camera} ended before source frame {target}"
+                )
+            current += 1
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise EOFError(
+                f"Replay video {camera} cannot decode source frame {target}"
+            )
+        self.next_indices[camera] = target + 1
+        return frame
+
+    def close(self) -> None:
+        for capture in self.captures.values():
+            capture.release()
+        self.captures.clear()
+        self.next_indices.clear()
+
+    def __enter__(self) -> "IndexedVideoFrameReader":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 class SyncedVideoReader:
     """Iterate over synchronized frames from N camera videos.
 

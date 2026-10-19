@@ -342,6 +342,14 @@ def run_pipeline(
                 # negative/provisional hypotheses but never image data.
                 "identity_hypotheses": fusion.identity_hypotheses_snapshot(),
                 "identity_aliases": dict(fusion.aliases),
+                "identity_decisions": fusion.lifecycle.drain(),
+                "identity_terminal_contract": cfg.fusion_terminal_binding_enabled,
+                # Local callback, never serialized. It also finalizes a
+                # deliberately truncated evaluator stream before buffer flush.
+                "identity_finalizer": (
+                    fusion.finalize_identities
+                    if cfg.fusion_identity_lifecycle_enabled else None
+                ),
                 # Pending negative IDs are internal decision-buffer state and
                 # must never leak into Rerun, MP4 labels, or API consumers.
                 "local_to_gid": fusion.public_affinity_snapshot(),
@@ -410,6 +418,10 @@ def run_pipeline(
                         )
                         for tracker in trackers.values()
                     ),
+                    "causal_recovery_hold_expired": sum(tracker.metrics.get("appearance_recovery_hold_expired", 0) for tracker in trackers.values()),
+                    "causal_motion_rescues": sum(tracker.metrics.get("causal_motion_rescues", 0) for tracker in trackers.values()),
+                    "reid_inference_crops": sum(getattr(getattr(tracker, "appearance_backend", None), "inference_crops", 0) for tracker in trackers.values()),
+                    "reid_inference_batches": sum(getattr(getattr(tracker, "appearance_backend", None), "inference_batches", 0) for tracker in trackers.values()),
                     "local_appearance_reappearance_deferred": sum(
                         tracker.metrics.get(
                             "appearance_reappearance_deferred", 0
@@ -419,6 +431,12 @@ def run_pipeline(
                     "local_appearance_reappearance_ambiguous": sum(
                         tracker.metrics.get(
                             "appearance_reappearance_ambiguous", 0
+                        )
+                        for tracker in trackers.values()
+                    ),
+                    "local_appearance_reappearance_candidate_resets": sum(
+                        tracker.metrics.get(
+                            "appearance_reappearance_candidate_resets", 0
                         )
                         for tracker in trackers.values()
                     ),

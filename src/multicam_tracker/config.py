@@ -52,6 +52,12 @@ class PipelineConfig:
     imgsz: int = 640
     conf_threshold: float = 0.25    # low floor can feed OC-SORT's BYTE recovery stage
     person_class_id: int = 0        # COCO class 0 == person
+    # FP16 is CUDA-only and opt-in until a target-GPU A/B clears both the
+    # throughput and identity-quality gates. CPU/MPS always stay on FP32.
+    detector_fp16: bool = False
+    # torch.compile has a material warm-up cost and remains opt-in until a
+    # deployment-length benchmark amortizes it.
+    detector_compile: bool = False
     cpu_threads: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     opencv_threads: int = 1
 
@@ -147,6 +153,19 @@ class PipelineConfig:
     # reappears after an observation gap. The descriptor is a compact HSV
     # histogram; no image crops or face features are retained.
     hybridsort_reappearance_enabled: bool = False
+    hybridsort_cascade_enabled: bool = False
+    hybridsort_causal_association_enabled: bool = False
+    hybridsort_causal_motion_rescue_enabled: bool = False
+    hybridsort_recovery_max_candidates: int = 64
+    hybridsort_recovery_max_hold_s: float = 0.35
+    appearance_backend: str = "hsv"
+    appearance_model_path: str | None = None
+    appearance_model_sha256: str | None = None
+    appearance_event_triggered: bool = False
+    appearance_quality_filter_enabled: bool = False
+    appearance_gallery_size: int = 8
+    appearance_min_crop_height: int = 64
+    appearance_max_crop_overlap: float = 0.55
     hybridsort_reappearance_max_gap_s: float = 6.0
     hybridsort_reappearance_min_similarity: float = 0.78
     hybridsort_reappearance_min_margin: float = 0.08
@@ -195,6 +214,18 @@ class PipelineConfig:
     # applied retroactively without buffering image frames.
     fusion_late_identity_binding_enabled: bool = False
     fusion_identity_commit_delay_s: float = 0.0
+    # Opt-in lifecycle accounting and bounded terminal decisions. Legacy
+    # profiles keep their output contract for controlled comparisons.
+    fusion_identity_lifecycle_enabled: bool = False
+    fusion_terminal_binding_enabled: bool = False
+    fusion_terminal_batch_enabled: bool = False
+    fusion_terminal_grace_s: float = 1.0
+    fusion_terminal_confirmation_window_s: float = 0.35
+    fusion_terminal_confirmations: int = 3
+    fusion_terminal_max_cost: float = 1.0
+    fusion_terminal_margin: float = 0.20
+    fusion_terminal_nis_gate: float = 9.21
+    fusion_lifecycle_report_limit: int = 10000
     fusion_late_identity_max_defer_s: float = 0.0
     # 0 keeps the population unconstrained. A positive value caps concurrently
     # retained public identities; pending fragments remain hidden until a slot
@@ -318,6 +349,8 @@ class PipelineConfig:
     fusion_reconnect_appearance_min_similarity: float = 0.72
     fusion_reconnect_appearance_weight_m: float = 0.50
     fusion_appearance_update_alpha: float = 0.15
+    fusion_appearance_ownership_guard_enabled: bool = False
+    fusion_appearance_conflict_min_similarity: float = 0.50
     fusion_appearance_conflict_confirmations: int = 2
     fusion_appearance_conflict_window_s: float = 0.35
     fusion_stationary_reconnect_enabled: bool = False
@@ -785,18 +818,112 @@ TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"] = {
     # bounded late-binding horizon before it can receive a new public ID.
     "fusion_new_gid_entry_required": False,
 }
-TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"] = {
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-local-reappearance"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"],
     "hybridsort_reappearance_enabled": True,
     "hybridsort_reappearance_max_gap_s": 6.0,
     "hybridsort_reappearance_confirmations": 3,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-global-guard"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"],
+    "fusion_appearance_ownership_guard_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-stationary-reconnect"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-global-guard"],
     "fusion_reconnect_appearance_enabled": True,
     "fusion_stationary_reconnect_enabled": True,
     "fusion_local_reconnect_long_window_s": 6.0,
     "fusion_local_reconnect_confirmations": 3,
     "fusion_dormant_retention_s": 10.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"] = {
+    # Compose only the two crowd policies that are neutral on the real-frame
+    # screening replay. Stationary reconnect remains an explicit experimental
+    # profile because it regressed IDF1/IDSW/fragmentation on that replay.
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-global-guard"],
+    **{
+        key: value
+        for key, value in TRACKING_PROFILE_OVERRIDES[
+            "hybridsort-crowd-local-reappearance"
+        ].items()
+        if key.startswith("hybridsort_reappearance_")
+    },
     "render_occluded_tracks_enabled": True,
     "render_occluded_max_age_s": 2.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery-mid-floor"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"],
+    # Low-score boxes may recover an existing track but remain below the
+    # high-confidence threshold required to create a new local identity.
+    "conf_threshold": 0.20,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-lifecycle-audit"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"],
+    "fusion_identity_lifecycle_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-terminal"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-lifecycle-audit"],
+    "fusion_terminal_binding_enabled": True,
+    # >= decision horizon; ordinary reference remains at two seconds.
+    "fusion_identity_commit_delay_s": 3.0,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-terminal-batch-experimental"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-terminal"],
+    "fusion_terminal_batch_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery-v2"] = {
+    # Controlled 300-tick screening rejected terminal binding and local
+    # cascade. Roll back behavior; retain observability only, not a release.
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"],
+    "fusion_identity_lifecycle_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-local-cascade"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"],
+    "hybridsort_cascade_enabled": True,
+    "hybridsort_ambiguity_suppression_enabled": True,
+    "hybridsort_ambiguity_margin": 0.04,
+    "hybridsort_ambiguity_owner_grace_s": 0.20,
+    "hybridsort_trusted_observation_enabled": True,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery-low-floor"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"],
+    "conf_threshold": 0.15,
+}
+# Explicit speed/quality ablation. The 2026-10-19 four-camera CPU audit found
+# +26% throughput but -19.8% IDF1, +56% IDSW, and +154% fragmentation over
+# 300 ticks. Keep it opt-in; it is not a release-quality default.
+#   uv run demo --profile hybridsort-realtime --stride 2 --cpu-threads 4
+TRACKING_PROFILE_OVERRIDES["hybridsort-realtime"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort"],
+    "imgsz": 480,
+    "conf_threshold": 0.20,
+}
+# IDF1-boost profile: crowd-recovery base + crossing ambiguity suppression +
+# higher observation-IoU weight + extended identity/dormant retention windows.
+# Best for scenes with frequent occlusions and crossings. No neural ReID model
+# needed — uses HSV histogram gallery from appearance.py.
+#   uv run demo --profile hybridsort-idf1-boost --stride 3
+TRACKING_PROFILE_OVERRIDES["hybridsort-idf1-boost"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-crowd-recovery"],
+    # Tăng weight last-observation IoU để phục hồi tốt hơn sau occlusion ngắn
+    "hybridsort_alpha": 0.50,
+    # Crossing guard: không update Kalman từ merged box khi 2 người giao nhau
+    "hybridsort_ambiguity_suppression_enabled": True,
+    "hybridsort_ambiguity_min_iou": 0.25,
+    "hybridsort_ambiguity_margin": 0.04,
+    "hybridsort_ambiguity_min_area_ratio": 1.10,
+    "hybridsort_ambiguity_owner_grace_s": 0.20,
+    # Giữ GID lâu hơn trước khi expire, giảm ID switch sau occlusion
+    "fusion_identity_retention_s": 5.0,
+    # Dormant track giữ lâu hơn cho warehouse (người khuất sau kệ)
+    "fusion_dormant_retention_s": 10.0,
+    # Extend reconnect window để vớt lại fragment sau gap dài
+    "fusion_local_reconnect_long_window_s": 5.0,
+    "fusion_local_reconnect_confirmations": 3,
+    # Grace period: không retire ngay khi track mất signal
+    "fusion_output_grace_s": 0.5,
+    # Mid-floor: dùng low-conf detections để recover existing tracks
+    "conf_threshold": 0.20,
 }
 TRACKING_PROFILE_OVERRIDES["hybridsort-trajectory"] = {
     **TRACKING_PROFILE_OVERRIDES["hybridsort"],
@@ -827,6 +954,21 @@ TRACKING_PROFILE_OVERRIDES["hybridsort-stable"] = {
 # This branch uses Hybrid-SORT as the default local tracker.
 # Set to "identity-v1-drift-guard" or "identity-v1-baseline" for A/B.
 DEFAULT_TRACKING_PROFILE = "hybridsort"
+
+TRACKING_PROFILE_OVERRIDES["hybridsort-causal-association-v1"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-late-binding-balanced"],
+    "hybridsort_reappearance_enabled": False,
+    "hybridsort_causal_association_enabled": True,
+    "hybridsort_lost_observation_prediction_enabled": False,
+    "hybridsort_causal_motion_rescue_enabled": True,
+    "fusion_reconnect_appearance_enabled": False,
+    "fusion_appearance_ownership_guard_enabled": False,
+}
+TRACKING_PROFILE_OVERRIDES["hybridsort-causal-extrapolation-rejected"] = {
+    **TRACKING_PROFILE_OVERRIDES["hybridsort-causal-association-v1"],
+    "hybridsort_causal_motion_rescue_enabled": False,
+    "hybridsort_lost_observation_prediction_enabled": True,
+}
 
 
 def apply_tracking_profile(cfg: PipelineConfig, profile: str) -> PipelineConfig:

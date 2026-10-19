@@ -36,6 +36,8 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .appearance import (
+    PersonAppearanceBackend,
+    gallery_similarity,
     appearance_similarity,
     extract_person_descriptors,
     normalize_descriptor,
@@ -81,6 +83,7 @@ class HybridTrack:
     last_observed_covariance: np.ndarray | None = None
     appearance: np.ndarray | None = None
     current_appearance: np.ndarray | None = None
+    appearance_gallery: deque = field(default_factory=deque)
 
     @property
     def predicted_xyxy(self) -> np.ndarray:
@@ -381,7 +384,7 @@ def find_ambiguous_detections(
 # ---------------------------------------------------------------------------
 
 class HybridSortTracker:
-    """Timestamp-aware Hybrid-SORT (no ReID) backend compatible with run_pipeline."""
+    """Timestamp-aware Hybrid-SORT with optional same-camera appearance recovery."""
 
     def __init__(self, cfg: PipelineConfig) -> None:
         if cfg.ocsort_delta_t < 1:
@@ -443,6 +446,9 @@ class HybridSortTracker:
         if cfg.track_max_speed_mps <= 0:
             raise ValueError("track_max_speed_mps must be > 0")
         self.cfg = cfg
+        if cfg.hybridsort_recovery_max_candidates < 1 or cfg.hybridsort_recovery_max_hold_s <= 0:
+            raise ValueError("invalid causal recovery limits")
+        self.appearance_backend = PersonAppearanceBackend(cfg)
         self.tracks: list[HybridTrack] = []
         self._next_id = 1
         self._last_timestamp_s: float | None = None
@@ -451,8 +457,9 @@ class HybridSortTracker:
         self._diagnostics_enabled = cfg.identity_diagnostics_path is not None
         self.accepts_frame = True
         self._reappearance_votes: dict[
-            int, tuple[np.ndarray, int, float]
+            int, tuple[np.ndarray, int, float, np.ndarray]
         ] = {}
+        self._recovery_hold_started: dict[int, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -493,6 +500,8 @@ class HybridSortTracker:
         if timestamp_s is not None:
             self._last_timestamp_s = float(timestamp_s)
             self._expire_before_association(dt)
+            live_ids = {t.track_id for t in self.tracks}
+            self._recovery_hold_started = {k: v for k, v in self._recovery_hold_started.items() if k in live_ids}
 
         # Kalman predict all tracks
         for track in self.tracks:
@@ -509,8 +518,27 @@ class HybridSortTracker:
         high_mask = detections[:, 4] >= cfg.track_high_conf
         high = detections[high_mask]
         low = detections[~high_mask]
-        if cfg.hybridsort_reappearance_enabled:
-            descriptors = extract_person_descriptors(frame, detections)
+        # Fusion ownership protection also needs the current same-camera
+        # descriptor even when local reappearance itself is ablated off.
+        if (
+            cfg.hybridsort_reappearance_enabled
+            or cfg.fusion_reconnect_appearance_enabled
+            or cfg.fusion_appearance_ownership_guard_enabled
+        ):
+            # Initialize a new person's gallery, then encode on recovery or
+            # crowd events. Stable visible-only ticks need no neural forward.
+            crowd_event = False
+            if cfg.appearance_event_triggered and len(detections) > 1:
+                overlap = iou_matrix(detections[:, :4], detections[:, :4])
+                np.fill_diagonal(overlap, 0.)
+                crowd_event = bool(np.any(overlap > .20))
+            birth_event = not self.tracks
+            if cfg.appearance_event_triggered and self.tracks and len(high):
+                overlap = iou_matrix(np.stack([track.predicted_xyxy for track in self.tracks]), high[:, :4])
+                birth_event = bool(np.any(np.max(overlap, axis=0) < cfg.track_min_iou))
+            descriptors = self.appearance_backend.extract(frame, detections, event=(
+                birth_event or crowd_event or any(track.misses > 0 for track in self.tracks)
+            ))
             high_appearances = [
                 descriptors[index] for index in np.flatnonzero(high_mask)
             ]
@@ -565,14 +593,53 @@ class HybridSortTracker:
             )
         )
         reappearance_pairs: set[tuple[int, int]] = set()
-        if appearance_available:
-            active_indices = [
+        normal_track_index_set = set(range(len(self.tracks)))
+        if cfg.hybridsort_cascade_enabled:
+            normal_track_index_set = {
                 index for index, track in enumerate(self.tracks)
-                if track.misses == 0
+                if not track.confirmed or track.missed_seconds + dt <= cfg.track_max_age_s + 1e-9
+            }
+            pairs, unmatched_tracks, unmatched_high = self._cascade_associate(
+                primary_detection_indices.tolist(), high, normal_track_index_set, timestamp_s
+            )
+            if appearance_available:
+                recovered, held, unmatched_high = self._associate_reappearances(
+                    [index for index in unmatched_tracks if self.tracks[index].confirmed
+                     and self.tracks[index].misses > 0 and self.tracks[index].appearance is not None],
+                    unmatched_high, high, high_appearances, timestamp_s,
+                )
+                pairs.extend(recovered)
+                reappearance_pairs = set(recovered)
+                recovered_tracks = {index for index, _ in recovered}
+                unmatched_tracks = [index for index in unmatched_tracks if index not in recovered_tracks]
+                unmatched_high = [index for index in unmatched_high if index not in held]
+        elif appearance_available or cfg.hybridsort_causal_association_enabled:
+            # Preserve the normal Hybrid-SORT hot path. Appearance is a
+            # fallback only for lost identities that geometry did not already
+            # resolve; routing every one-frame miss through multi-frame
+            # confirmation causes avoidable fragmentation and duplicate births.
+            normal_track_indices = [
+                index
+                for index, track in enumerate(self.tracks)
+                if (
+                    not track.confirmed
+                    or track.missed_seconds + dt
+                    <= cfg.track_max_age_s + 1e-9
+                )
             ]
-            active_tracks = [self.tracks[index] for index in active_indices]
-            active_pairs, unmatched_active, unmatched_primary = associate_hybrid(
-                active_tracks,
+            normal_track_index_set = set(normal_track_indices)
+            recovery_only_indices = [
+                index
+                for index in range(len(self.tracks))
+                if index not in normal_track_index_set
+            ]
+            normal_tracks = [self.tracks[index] for index in normal_track_indices]
+            (
+                primary_pairs,
+                unmatched_normal_tracks,
+                unmatched_primary,
+            ) = associate_hybrid(
+                normal_tracks,
                 primary_high,
                 cfg.track_min_iou,
                 cfg.hybridsort_alpha,
@@ -581,25 +648,37 @@ class HybridSortTracker:
                 max_obs_gap_s=cfg.hybridsort_max_obs_gap_s,
                 min_blended_iou=cfg.hybridsort_min_blended_iou,
                 timestamp_s=timestamp_s,
-                use_lost_observation_prediction=False,
+                use_lost_observation_prediction=(
+                    cfg.hybridsort_lost_observation_prediction_enabled
+                ),
             )
             pairs = [
                 (
-                    active_indices[track_index],
+                    normal_track_indices[track_index],
                     int(primary_detection_indices[detection_index]),
                 )
-                for track_index, detection_index in active_pairs
+                for track_index, detection_index in primary_pairs
             ]
+            unmatched_tracks = [
+                normal_track_indices[index]
+                for index in unmatched_normal_tracks
+            ] + recovery_only_indices
             remaining_detection_indices = [
                 int(primary_detection_indices[index])
                 for index in unmatched_primary
+            ]
+            unmatched_lost_with_appearance = [
+                index
+                for index in unmatched_tracks
+                if self.tracks[index].misses > 0
+                and self.tracks[index].appearance is not None
             ]
             (
                 recovered,
                 held_detection_indices,
                 remaining_detection_indices,
             ) = self._associate_reappearances(
-                lost_with_appearance,
+                unmatched_lost_with_appearance,
                 remaining_detection_indices,
                 high,
                 high_appearances,
@@ -609,11 +688,9 @@ class HybridSortTracker:
             reappearance_pairs = set(recovered)
             recovered_tracks = {track_index for track_index, _ in recovered}
             unmatched_tracks = [
-                active_indices[index] for index in unmatched_active
-            ] + [
                 index
-                for index, track in enumerate(self.tracks)
-                if track.misses > 0 and index not in recovered_tracks
+                for index in unmatched_tracks
+                if index not in recovered_tracks
             ]
             unmatched_high = [
                 index
@@ -643,6 +720,14 @@ class HybridSortTracker:
                 int(primary_detection_indices[detection_index])
                 for detection_index in unmatched_primary
             ]
+        if cfg.hybridsort_causal_motion_rescue_enabled:
+            rescued = self._causal_motion_rescue(unmatched_tracks, unmatched_high, high, timestamp_s)
+            pairs.extend(rescued)
+            used_tracks = {i for i, _ in rescued}
+            used_detections = {j for _, j in rescued}
+            unmatched_tracks = [i for i in unmatched_tracks if i not in used_tracks]
+            unmatched_high = [j for j in unmatched_high if j not in used_detections]
+            self.metrics["causal_motion_rescues"] += len(rescued)
         for track_index, detection_index in pairs:
             self.metrics["high_confidence_matches"] += 1
             association = (
@@ -669,11 +754,7 @@ class HybridSortTracker:
             byte_track_indices = [
                 index
                 for index in unmatched_tracks
-                if not (
-                    appearance_available
-                    and self.tracks[index].misses > 0
-                    and self.tracks[index].appearance is not None
-                )
+                if index in normal_track_index_set
             ]
             leftover = [self.tracks[i] for i in byte_track_indices]
             pairs_low, still_unmatched, _ = match_low_confidence_motion(
@@ -706,12 +787,8 @@ class HybridSortTracker:
             recovery_tracks = [self.tracks[i] for i in unmatched_tracks]
             valid_local = [
                 li for li, t in enumerate(recovery_tracks)
-                if t.last_observation is not None
-                and not (
-                    appearance_available
-                    and t.misses > 0
-                    and t.appearance is not None
-                )
+                if unmatched_tracks[li] in normal_track_index_set
+                and t.last_observation is not None
                 and (
                     (timestamp_s - t.last_observation_ts <= cfg.hybridsort_max_obs_gap_s)
                     if timestamp_s is not None and t.last_observation_ts is not None
@@ -826,6 +903,119 @@ class HybridSortTracker:
             )
         return self.cfg.track_max_age_s
 
+    def _causal_motion_rescue(self, indices, detection_indices, detections, timestamp_s):
+        """Strong short-gap recovery after normal matches; never steals an owner.
+
+        Only actual past observations estimate displacement. The proposal is
+        motion/size gated and must be exclusive on both sides of assignment.
+        """
+        if timestamp_s is None or not indices or not detection_indices:
+            return []
+        cap = self.cfg.hybridsort_recovery_max_candidates
+        indices = [i for i in indices if self.tracks[i].confirmed
+                   and self.tracks[i].misses > 0 and self.tracks[i].last_update_trusted
+                   and len(self.tracks[i].observations) >= 3
+                   and self.tracks[i].last_observation_ts is not None
+                   and self.tracks[i].observation_velocity_px_s is not None
+                   and 0 < timestamp_s - self.tracks[i].last_observation_ts <= self.cfg.hybridsort_max_obs_gap_s][:cap]
+        dets = detection_indices[:cap]
+        if not indices or not dets:
+            return []
+        costs = np.full((len(indices), len(dets)), 1e6)
+        for row, index in enumerate(indices):
+            track = self.tracks[index]
+            box = track.last_observation[:4].copy()
+            shift = track.observation_velocity_px_s * (timestamp_s-track.last_observation_ts)
+            size = np.maximum(box[2:]-box[:2], 1.)
+            if not np.all(np.isfinite(shift)) or np.linalg.norm(shift / size) > 1.:
+                continue
+            box[[0, 2]] += shift[0]
+            box[[1, 3]] += shift[1]
+            overlap = iou_matrix(box[None, :], detections[dets, :4])[0]
+            mean, covariance = track.kf.projected_measurement(0.)
+            for col, det in enumerate(dets):
+                if overlap[col] < .5:
+                    continue
+                measured = _xyxy_to_box_state(detections[det])
+                if np.max(np.abs(np.log(np.maximum(measured[2:], 1.) / size))) > .35:
+                    continue
+                delta = measured - mean
+                try:
+                    nis = float(delta @ np.linalg.solve(covariance, delta))
+                except np.linalg.LinAlgError:
+                    continue
+                if not np.isfinite(nis) or nis > min(self.cfg.track_association_nis_gate, 9.21):
+                    continue
+                costs[row, col] = .75*(1.-overlap[col]) + .25*nis/9.21
+        rows, columns = linear_sum_assignment(costs)
+        result = []
+        for row, col in zip(rows, columns):
+            value = costs[row, col]
+            alternatives = [costs[row, j] for j in range(len(dets)) if j != col]
+            alternatives += [costs[i, col] for i in range(len(indices)) if i != row]
+            if value < .5 and min(alternatives, default=1e6)-value >= .15:
+                result.append((indices[row], dets[col]))
+        return result
+
+    def _cascade_associate(self, detection_indices, detections, normal_indices, timestamp_s):
+        """Visible owners first, lost motion next, trusted observation rescue.
+
+        Recovery-only retained tracks never enter the geometric or BYTE/OCR
+        stages, even if this tick contains no valid appearance descriptor.
+        """
+        cfg = self.cfg
+        remaining = list(detection_indices)
+        matched = []
+        visible = [i for i in sorted(normal_indices) if self.tracks[i].confirmed and self.tracks[i].misses == 0]
+        lost = [i for i in sorted(normal_indices) if self.tracks[i].confirmed and self.tracks[i].misses > 0]
+        tentative = [i for i in sorted(normal_indices) if not self.tracks[i].confirmed]
+
+        def apply_pairs(indices, pairs):
+            nonlocal remaining
+            matched.extend((indices[r], remaining[c]) for r, c in pairs)
+            used = {c for _, c in pairs}
+            remaining = [value for i, value in enumerate(remaining) if i not in used]
+
+        if visible and remaining:
+            pairs, _, _ = match_by_iou(np.stack([self.tracks[i].predicted_xyxy for i in visible]),
+                                       detections[remaining, :4], cfg.track_min_iou)
+            apply_pairs(visible, pairs)
+        if lost and remaining:
+            cost = np.full((len(lost), len(remaining)), 1e6)
+            for row, index in enumerate(lost):
+                track = self.tracks[index]
+                mean, covariance = track.kf.projected_measurement()
+                for col, detection in enumerate(detections[remaining]):
+                    measurement = _xyxy_to_box_state(detection)
+                    size = float(np.mean(np.abs(np.log(np.maximum(measurement[2:], 1.) / np.maximum(mean[2:], 1.)))))
+                    delta = measurement - mean
+                    try:
+                        nis = float(delta @ np.linalg.solve(covariance, delta))
+                    except np.linalg.LinAlgError:
+                        continue
+                    if not np.isfinite(nis) or nis > cfg.track_association_nis_gate or size > cfg.track_association_max_size_log_change:
+                        continue
+                    overlap = float(iou_matrix(track.predicted_xyxy[None, :], detection[None, :4])[0, 0])
+                    cost[row, col] = .6 * (1-overlap) + .4 * nis / cfg.track_association_nis_gate
+            rows, cols = linear_sum_assignment(cost)
+            pairs = [(int(r), int(c)) for r, c in zip(rows, cols) if cost[r, c] < 1e6]
+            apply_pairs(lost, pairs)
+        used_tracks = {i for i, _ in matched}
+        recovery = [i for i in visible + lost if i not in used_tracks
+                    and self.tracks[i].last_observation is not None
+                    and timestamp_s is not None and self.tracks[i].last_observation_ts is not None
+                    and timestamp_s - self.tracks[i].last_observation_ts <= cfg.hybridsort_max_obs_gap_s]
+        if recovery and remaining:
+            pairs, _, _ = match_by_iou(np.stack([self.tracks[i].last_observation[:4] for i in recovery]),
+                                       detections[remaining, :4], cfg.track_min_iou)
+            apply_pairs(recovery, pairs)
+        if tentative and remaining:
+            pairs, _, _ = match_by_iou(np.stack([self.tracks[i].predicted_xyxy for i in tentative]),
+                                       detections[remaining, :4], cfg.track_min_iou)
+            apply_pairs(tentative, pairs)
+        used_tracks = {i for i, _ in matched}
+        return matched, [i for i in range(len(self.tracks)) if i not in used_tracks], remaining
+
     def _associate_reappearances(
         self,
         track_indices: list[int],
@@ -842,6 +1032,13 @@ class HybridSortTracker:
         """
         if not track_indices or not detection_indices:
             return [], set(), list(detection_indices)
+        skipped_detections = []
+        if self.cfg.hybridsort_causal_association_enabled:
+            track_indices = sorted(track_indices, key=lambda i: (
+                self.tracks[i].missed_seconds, self.tracks[i].track_id
+            ))[:self.cfg.hybridsort_recovery_max_candidates]
+            skipped_detections = list(detection_indices[self.cfg.hybridsort_recovery_max_candidates:])
+            detection_indices = detection_indices[:self.cfg.hybridsort_recovery_max_candidates]
         sentinel = 1e6
         cost = np.full(
             (len(track_indices), len(detection_indices)), sentinel, dtype=float
@@ -868,13 +1065,6 @@ class HybridSortTracker:
             predicted_size = np.maximum(predicted[2:], 1.0)
             for column, detection_index in enumerate(detection_indices):
                 descriptor = appearances[detection_index]
-                score = appearance_similarity(track.appearance, descriptor)
-                if (
-                    score is None
-                    or score + 1e-9
-                    < self.cfg.hybridsort_reappearance_min_similarity
-                ):
-                    continue
                 measurement = _xyxy_to_box_state(detections[detection_index])
                 measured_size = np.maximum(measurement[2:], 1.0)
                 size_change = float(
@@ -890,6 +1080,11 @@ class HybridSortTracker:
                 except np.linalg.LinAlgError:
                     continue
                 if not np.isfinite(nis) or nis > nis_gate:
+                    continue
+                score = (gallery_similarity(track.appearance_gallery, descriptor)
+                         if self.cfg.appearance_backend == "torchscript" and track.appearance_gallery
+                         else appearance_similarity(track.appearance, descriptor))
+                if score is None or score + 1e-9 < self.cfg.hybridsort_reappearance_min_similarity:
                     continue
                 overlap = float(iou_matrix(
                     track.predicted_xyxy[None, :],
@@ -910,7 +1105,7 @@ class HybridSortTracker:
                 self._reappearance_votes.pop(
                     self.tracks[track_index].track_id, None
                 )
-            return [], set(), list(detection_indices)
+            return [], set(), list(detection_indices) + skipped_detections
 
         rows, columns = linear_sum_assignment(cost)
         matched: list[tuple[int, int]] = []
@@ -923,6 +1118,12 @@ class HybridSortTracker:
             track_index = track_indices[int(row)]
             detection_index = detection_indices[int(column)]
             track = self.tracks[track_index]
+            if self.cfg.hybridsort_causal_association_enabled and timestamp_s is not None:
+                started = self._recovery_hold_started.setdefault(track.track_id, float(timestamp_s))
+                if timestamp_s - started >= self.cfg.hybridsort_recovery_max_hold_s:
+                    self.metrics["appearance_recovery_hold_expired"] += 1
+                    self._reappearance_votes.pop(track.track_id, None)
+                    continue
             alternatives = [
                 cost[row, other]
                 for other in range(cost.shape[1])
@@ -951,6 +1152,7 @@ class HybridSortTracker:
                 track,
                 appearances[detection_index],
                 timestamp_s,
+                detections[detection_index, :4],
             )
             if confirmations < self.cfg.hybridsort_reappearance_confirmations:
                 self.metrics["appearance_reappearance_deferred"] += 1
@@ -969,6 +1171,7 @@ class HybridSortTracker:
             committed_detections.add(detection_index)
             held_detections.discard(detection_index)
             self._reappearance_votes.pop(track.track_id, None)
+            self._recovery_hold_started.pop(track.track_id, None)
 
         for track_index in track_indices:
             track_id = self.tracks[track_index].track_id
@@ -978,16 +1181,22 @@ class HybridSortTracker:
             index for index in detection_indices
             if index not in committed_detections
         ]
-        return matched, held_detections, remaining
+        return matched, held_detections, remaining + skipped_detections
 
     def _record_reappearance_vote(
         self,
         track: HybridTrack,
         descriptor: np.ndarray | None,
         timestamp_s: float | None,
+        detection_bbox_xyxy: np.ndarray,
     ) -> int:
         current = normalize_descriptor(descriptor)
-        if current is None:
+        current_bbox = np.asarray(detection_bbox_xyxy, dtype=float).reshape(-1)
+        if (
+            current is None
+            or current_bbox.size < 4
+            or not np.all(np.isfinite(current_bbox[:4]))
+        ):
             self._reappearance_votes.pop(track.track_id, None)
             return 0
         event_ts = float(
@@ -1000,21 +1209,47 @@ class HybridSortTracker:
             )
         )
         previous = self._reappearance_votes.get(track.track_id)
+        if (self.cfg.hybridsort_causal_association_enabled and previous is not None
+                and event_ts <= previous[2] + 1e-9):
+            # A duplicate packet cannot be evidence for a second confirmation.
+            return previous[1]
         count = 1
         if previous is not None:
-            previous_descriptor, previous_count, previous_ts = previous
+            (
+                previous_descriptor,
+                previous_count,
+                previous_ts,
+                previous_bbox,
+            ) = previous
             continuity = appearance_similarity(previous_descriptor, current)
+            candidate_iou = float(iou_matrix(
+                previous_bbox[None, :4], current_bbox[None, :4]
+            )[0, 0])
+            previous_center = 0.5 * (previous_bbox[:2] + previous_bbox[2:4])
+            current_center = 0.5 * (current_bbox[:2] + current_bbox[2:4])
+            reference_size = np.maximum(previous_bbox[2:4] - previous_bbox[:2], 1.0)
+            normalized_motion = float(
+                np.linalg.norm(current_center - previous_center)
+                / max(np.linalg.norm(reference_size), 1.0)
+            )
+            same_candidate = (
+                candidate_iou + 1e-9 >= self.cfg.track_min_iou
+                or normalized_motion <= 0.50
+            )
             if (
                 continuity is not None
                 and continuity + 1e-9
                 >= self.cfg.hybridsort_reappearance_min_similarity
+                and same_candidate
                 and event_ts >= previous_ts - 1e-9
                 and event_ts - previous_ts
                 <= self.cfg.hybridsort_reappearance_confirmation_window_s + 1e-9
             ):
                 count = previous_count + 1
+            elif not same_candidate:
+                self.metrics["appearance_reappearance_candidate_resets"] += 1
         self._reappearance_votes[track.track_id] = (
-            current.copy(), count, event_ts
+            current.copy(), count, event_ts, current_bbox[:4].copy()
         )
         return count
 
@@ -1105,6 +1340,12 @@ class HybridSortTracker:
             track.confirmed = True
         track.last_raw_observation = detection.copy()
         track.current_appearance = normalize_descriptor(appearance)
+        if trusted_observation and track.current_appearance is not None and self.cfg.appearance_backend == "torchscript":
+            agreement = gallery_similarity(track.appearance_gallery, track.current_appearance)
+            if agreement is None or agreement >= self.cfg.hybridsort_appearance_update_min_similarity:
+                track.appearance_gallery.append(track.current_appearance.copy())
+                while len(track.appearance_gallery) > self.cfg.appearance_gallery_size:
+                    track.appearance_gallery.popleft()
         track.last_update_trusted = trusted_observation
         if trusted_observation:
             track.last_observation = detection.copy()
@@ -1252,6 +1493,8 @@ class HybridSortTracker:
             current_appearance=normalize_descriptor(appearance),
         )
         self._next_id += 1
+        if track.appearance is not None and self.cfg.appearance_backend == "torchscript":
+            track.appearance_gallery.append(track.appearance.copy())
         self.tracks.append(track)
         self.metrics["tracks_created"] += 1
         self._record_event(
