@@ -35,6 +35,10 @@ class PersonDetector:
             # inference, without initializing a second model or dummy batch.
             self.model.add_callback("on_predict_start", self._configure_cpu)
 
+    @property
+    def _cuda(self) -> bool:
+        return str(self.cfg.device).split(":", 1)[0].lower() == "cuda"
+
     def _configure_cpu(self, _predictor) -> None:
         if torch.get_num_threads() != self.cfg.cpu_threads:
             torch.set_num_threads(self.cfg.cpu_threads)
@@ -53,6 +57,8 @@ class PersonDetector:
             conf=self.cfg.conf_threshold,
             classes=[self.cfg.person_class_id],
             device=self.cfg.device,
+            quantize=16 if self._cuda and self.cfg.detector_fp16 else None,
+            compile=self.cfg.detector_compile if self._cuda else False,
             verbose=False,
         )
         detections = []

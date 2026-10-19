@@ -35,6 +35,7 @@ from evaluate_thresholds import _score
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frames", type=int, default=300)
+    parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
@@ -54,9 +55,11 @@ def main() -> None:
     parser.add_argument("--capture-detections", type=Path,
                         help="Save compact detection/packet metadata for offline regression replay")
     args = parser.parse_args()
+    if args.stride < 1:
+        parser.error("--stride must be >= 1")
     cfg = build_effective_config(
         device="cpu",
-        stride=1,
+        stride=args.stride,
         async_ingest=False,
         fusion_output_time_policy="event",
         profile=args.tracking_profile,

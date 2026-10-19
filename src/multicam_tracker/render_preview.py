@@ -183,6 +183,8 @@ def render_video(
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
     local_tracker: str | None = None,
     expected_people: int | None = None,
+    detector_fp16: bool = False,
+    detector_compile: bool = False,
     gif: Path | None = None,
     gif_fps: int = 10,
 ) -> Path:
@@ -216,6 +218,8 @@ def render_video(
     )
     if expected_people is not None:
         cfg.fusion_fixed_population_size = expected_people
+    cfg.detector_fp16 = detector_fp16
+    cfg.detector_compile = detector_compile
     if model_name is not None:
         cfg.model_name = model_name
     available = sorted(p.name for p in cfg.scene_dir.glob("camera_*") if p.is_dir())

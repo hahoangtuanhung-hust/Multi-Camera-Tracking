@@ -113,6 +113,8 @@ def render_on_t4(
     cameras: list[str] | None = None,
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
     expected_people: int | None = None,
+    detector_fp16: bool = False,
+    detector_compile: bool = False,
 ) -> dict[str, object]:
     """Run detection/tracking on T4 and persist a validated MP4."""
     import time
@@ -166,6 +168,8 @@ def render_on_t4(
         cameras=cameras,
         tracking_profile=tracking_profile,
         expected_people=expected_people,
+        detector_fp16=detector_fp16,
+        detector_compile=detector_compile,
     )
     elapsed_s = time.perf_counter() - started
 
@@ -208,9 +212,12 @@ def evaluate_on_t4(
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
     expected_people: int | None = None,
     seed: int = 0,
+    detector_fp16: bool = False,
+    detector_compile: bool = False,
 ) -> dict[str, object]:
     """Run the full tracker on CUDA and return world-plane MOT metrics."""
     import json
+    import resource
     import time
 
     import numpy as np
@@ -232,7 +239,7 @@ def evaluate_on_t4(
         evaluate_mot_slices,
         identity_trajectory_diagnostics,
     )
-    from multicam_tracker.reporting import build_run_metadata, configure_determinism
+    from multicam_tracker.reporting import build_run_metadata, configure_determinism, committed_stream_hashes
     from multicam_tracker.stage_diagnostics import (
         PipelineStageDiagnostics,
         load_bbox_ground_truth,
@@ -283,6 +290,8 @@ def evaluate_on_t4(
     )
     if expected_people is not None:
         cfg.fusion_fixed_population_size = expected_people
+    cfg.detector_fp16 = detector_fp16
+    cfg.detector_compile = detector_compile
     cfg.model_name = str(model_path)
     available = sorted(
         path.name for path in cfg.scene_dir.glob("camera_*") if path.is_dir()
@@ -320,8 +329,22 @@ def evaluate_on_t4(
     public_affinity_not_output = 0
     last_pipeline_metrics: dict[str, object] = {}
     identity_committer = IdentityCommitBuffer(cfg.fusion_identity_commit_delay_s)
+    pipeline_tick_latencies_s: list[float] = []
+    torch.cuda.reset_peak_memory_stats()
+
+    def timed_ticks(iterator):
+        iterator = iter(iterator)
+        while True:
+            tick_started = time.perf_counter()
+            try:
+                tick = next(iterator)
+            except StopIteration:
+                return
+            pipeline_tick_latencies_s.append(time.perf_counter() - tick_started)
+            yield tick
+
     started = time.perf_counter()
-    for tick in run_pipeline(cfg, max_frames=max_frames):
+    for tick in timed_ticks(run_pipeline(cfg, max_frames=max_frames)):
         stage_diagnostics.update(tick)
         append_committed_frames(
             identity_committer.push_tick(tick), predictions, source_maps
@@ -346,6 +369,7 @@ def evaluate_on_t4(
                 flush=True,
             )
     append_committed_frames(identity_committer.flush(), predictions, source_maps)
+    last_pipeline_metrics.update(identity_committer.final_pipeline_metrics)
     last_pipeline_metrics.update(identity_committer.metrics)
     elapsed_s = time.perf_counter() - started
     if not predictions:
@@ -439,6 +463,7 @@ def evaluate_on_t4(
         "global_appearance_conflicts",
         "global_appearance_conflicts_deferred",
         "global_ids_protected_from_local_takeover",
+        "appearance_takeover_immediate_reconnects_blocked",
         "retained_occluded_global_tracks",
         "retained_appearance_prototypes",
         "appearance_prototype_bytes",
@@ -455,6 +480,7 @@ def evaluate_on_t4(
         "local_appearance_reappearance_matches",
         "local_appearance_reappearance_deferred",
         "local_appearance_reappearance_ambiguous",
+        "local_appearance_reappearance_candidate_resets",
         "retained_occluded_local_tracks",
         "peak_retained_local_tracks",
         "trajectory_smoothing_accepted",
@@ -464,6 +490,10 @@ def evaluate_on_t4(
         "identity_commit_frames_committed",
         "identity_commit_unresolved_hypotheses_dropped",
         "identity_commit_duplicate_hypotheses_collapsed",
+        "identity_commit_intentionally_rejected_hypotheses",
+        "identity_commit_backfilled_hypotheses",
+        "terminal_bindings_accepted",
+        "terminal_binding_defer_attempts",
     )
     switch_gaps = [event[2] - event[1] for event in metrics["switch_events"]]
     metrics.update({
@@ -473,6 +503,15 @@ def evaluate_on_t4(
         "evaluated_ticks": len(predictions),
         "elapsed_s": elapsed_s,
         "ticks_per_s": len(predictions) / max(elapsed_s, 1e-9),
+        "pipeline_tick_latency_ms": {
+            "p50": float(np.percentile(pipeline_tick_latencies_s, 50) * 1000.0),
+            "p95": float(np.percentile(pipeline_tick_latencies_s, 95) * 1000.0),
+            "max": float(max(pipeline_tick_latencies_s) * 1000.0),
+        },
+        "gpu_peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+        "gpu_peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        "process_peak_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        / 1024.0,
         "gpu": torch.cuda.get_device_name(0),
         "cameras": cfg.cameras,
         "tracking_profile": tracking_profile,
@@ -485,6 +524,7 @@ def evaluate_on_t4(
         },
         **metric_slices,
         "identity_diagnostics": identity_diagnostics,
+        "identity_lifecycle": identity_committer.lifecycle_report,
         "switch_diagnostics": switch_diagnostics,
         "identity_error_taxonomy": error_taxonomy,
         "stage_diagnostics": stage_report,
@@ -507,6 +547,7 @@ def evaluate_on_t4(
             )
         },
         "run_metadata": build_run_metadata(cfg, seed=seed),
+        **committed_stream_hashes(predictions, source_maps),
     })
 
     output_dir = Path(REMOTE_OUTPUT_DIR)
@@ -557,6 +598,8 @@ def main(
     tracking_profile: str = DEFAULT_TRACKING_PROFILE,
     expected_people: int = -1,
     seed: int = 0,
+    detector_fp16: bool = False,
+    detector_compile: bool = False,
 ) -> None:
     """Optionally upload inputs, then render MP4 or evaluate MOT metrics."""
     if upload:
@@ -593,6 +636,8 @@ def main(
             tracking_profile=tracking_profile,
             expected_people=expected_people_override,
             seed=seed,
+            detector_fp16=detector_fp16,
+            detector_compile=detector_compile,
         )
         local_metrics.parent.mkdir(parents=True, exist_ok=True)
         serializable = {
@@ -625,6 +670,8 @@ def main(
         cameras=selected_cameras or None,
         tracking_profile=tracking_profile,
         expected_people=expected_people_override,
+        detector_fp16=detector_fp16,
+        detector_compile=detector_compile,
     )
 
     local_out.parent.mkdir(parents=True, exist_ok=True)
