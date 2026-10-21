@@ -1,0 +1,29 @@
+.git
+.gitignore
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+
+# Runtime inputs are mounted by Compose, not copied into the image.
+data
+*.pt
+
+# Generated media, metrics, profiles, and local experiments.
+docker-output
+outputs
+scratch
+*.mp4
+*.gif
+*.rrd
+*.json
+*.prof
+*.profile.txt
+*.pdf
+
+# Editor and OS metadata.
+.idea
+.vscode
+.DS_Store
+Thumbs.db

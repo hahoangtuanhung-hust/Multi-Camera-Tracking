@@ -25,6 +25,7 @@ CC-BY-4.0) — the same scenery NVIDIA uses to demo MV3DT.*
 
 - [Why this exists](#why-this-exists)
 - [Quickstart](#quickstart)
+- [Docker](#docker)
 - [The live viewer](#the-live-viewer)
 - [Architecture](#architecture)
 - [Pipeline deep dive](#pipeline-deep-dive)
@@ -158,6 +159,62 @@ The evaluation worker has a six-hour timeout, uses `stride=1`, prints progress
 every 250 processed ticks, and keeps an additional JSON copy in the Modal
 Volume under `outputs/`. Use `--upload` again only when the scene or model has
 changed.
+
+## Docker
+
+The image contains the application and locked Python dependencies. Dataset
+videos, YOLO weights, and generated outputs stay outside the image and are
+mounted by `compose.yaml`.
+
+Build the default CPU image once from the repository root:
+
+```bash
+docker compose build
+```
+
+The CPU image avoids downloading the multi-gigabyte CUDA runtime. To build a
+CUDA-capable image instead, set the build variant explicitly (PowerShell):
+
+```powershell
+$env:TORCH_VARIANT = "cuda"
+docker compose build
+Remove-Item Env:TORCH_VARIANT
+```
+
+Evaluate 300 frames on CPU:
+
+```bash
+docker compose run --rm tracker evaluate \
+  --device cpu --max-frames 300 \
+  --profile identity-v1-drift-guard \
+  --cameras camera_0001 camera_0007 camera_0008 camera_0010 \
+  --identity-events /app/outputs/identity-events-300.jsonl
+```
+
+Render a headless preview into `docker-output/preview.mp4`:
+
+```bash
+docker compose run --rm tracker render-preview \
+  --device cpu --seconds 20 \
+  --profile identity-v1-drift-guard \
+  --cameras camera_0001 camera_0007 camera_0008 camera_0010 \
+  --out /app/outputs/preview.mp4
+```
+
+The live Rerun GUI is not launched inside the headless container. Record a
+session instead and open it on the host:
+
+```bash
+docker compose run --rm tracker demo \
+  --device cpu --max-frames 300 --no-async-ingest \
+  --save /app/outputs/session.rrd
+```
+
+The Compose mounts require `data/custom/` and `yolo26n.pt` to exist on the
+host. Run `uv run download-data` first when the dataset is missing. Outputs
+appear under `docker-output/`. Set `CPU_THREADS`, `DOCKER_UID`, `DOCKER_GID`,
+or `TORCH_VARIANT` before `docker compose build/run` when host-specific
+overrides are needed.
 
 ## The live viewer
 

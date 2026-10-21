@@ -1,0 +1,19 @@
+services:
+  tracker:
+    image: multicam-tracker:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: ${DOCKER_UID:-1000}
+        GID: ${DOCKER_GID:-1000}
+        TORCH_VARIANT: ${TORCH_VARIANT:-cpu}
+    init: true
+    environment:
+      OMP_NUM_THREADS: ${CPU_THREADS:-4}
+      MKL_NUM_THREADS: ${CPU_THREADS:-4}
+    volumes:
+      - ./data:/app/data:ro
+      - ./yolo26n.pt:/app/yolo26n.pt:ro
+      - ./docker-output:/app/outputs
+    command: ["evaluate", "--help"]
